@@ -1,0 +1,211 @@
+"""Core guidance computation: run potentials, backprop, apply gradient.
+
+Public API: compute_potential_guidance()
+
+Three apply_mode strategies:
+
+token_translation (preferred, stable):
+    Atom gradients are averaged per residue/token, then broadcast back so every
+    atom in a residue receives the same rigid translation.  This is the mode that
+    most closely mirrors RFdiffusion1's frame-based guidance and avoids internal
+    distortions within residues.
+
+atom (direct all-atom):
+    Raw atom-level gradients are applied after masking and clipping.  This allows
+    per-atom distortions (e.g. sidechain repositioning) but is less stable.
+    Use conservative guide_scale (0.05-0.1) and guide_clip_rms (0.005-0.01).
+
+hybrid (blend):
+    guidance = token_component + atom_guidance_fraction * (atom_grad - token_component)
+    atom_guidance_fraction=0.0 → pure token_translation
+    atom_guidance_fraction=1.0 → pure atom mode (before clipping)
+    The internal_component carries within-token deformations (bond angle / torsion
+    relaxation) on top of the rigid token translation.
+"""
+from __future__ import annotations
+
+import torch
+
+from rfd3.potentials.manager import PotentialManager
+
+
+def compute_potential_guidance(
+    xyz_t: torch.Tensor,         # [D, L, 3]   current atom coordinates
+    potential_manager: PotentialManager,
+    t: float,                    # current noise level
+    T: float,                    # maximum noise level (first step)
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    apply_mode: str,
+    atom_guidance_fraction: float,
+) -> tuple[torch.Tensor, dict]:
+    """Compute a coordinate perturbation from external potentials.
+
+    Returns:
+        guidance  – [D, L, 3] tensor to add to xyz_t (same dtype/device)
+        debug_dict – populated only when PotentialManager.debug is True
+    """
+    if potential_manager.is_empty():
+        return torch.zeros_like(xyz_t), {}
+
+    masks = {
+        key: value.to(device=xyz_t.device, dtype=torch.bool)
+        if isinstance(value, torch.Tensor)
+        else value
+        for key, value in masks.items()
+    }
+    guide_atom_mask = masks["guide_atom_mask"].to(
+        device=xyz_t.device, dtype=torch.bool
+    )  # [L]
+    atom_to_token_map = metadata["atom_to_token_map"].to(
+        device=xyz_t.device, dtype=torch.long
+    )  # [L]
+    n_tokens = int(metadata.get("n_tokens", atom_to_token_map.max().item() + 1))
+
+    if atom_to_token_map.shape[0] != xyz_t.shape[1]:
+        raise ValueError(
+            "atom_to_token_map length must match xyz_t atom dimension: "
+            f"{atom_to_token_map.shape[0]} != {xyz_t.shape[1]}"
+        )
+    if guide_atom_mask.shape[0] != xyz_t.shape[1]:
+        raise ValueError(
+            "guide_atom_mask length must match xyz_t atom dimension: "
+            f"{guide_atom_mask.shape[0]} != {xyz_t.shape[1]}"
+        )
+
+    # ── 1-4: compute gradients via autograd ──────────────────────────────────
+    # torch.enable_grad() temporarily overrides any outer torch.no_grad() context.
+    # We exit the context before returning, so the sampler's grad-disabled
+    # assertions at the top of the next loop iteration still pass.
+    with torch.enable_grad():
+        xyz_for_grad = xyz_t.detach().clone().requires_grad_(True)
+        potential_value = potential_manager.compute_all_potentials(
+            xyz=xyz_for_grad,
+            masks=masks,
+            metadata=metadata,
+        )
+        if not potential_value.requires_grad:
+            return torch.zeros_like(xyz_t), {}
+        potential_value.backward()
+        if xyz_for_grad.grad is None:
+            return torch.zeros_like(xyz_t), {}
+        atom_grad = xyz_for_grad.grad.clone()  # [D, L, 3]
+
+    # ── 5: sanitize NaN / inf ────────────────────────────────────────────────
+    atom_grad = torch.nan_to_num(atom_grad, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # ── 6: zero out non-guided atoms ─────────────────────────────────────────
+    atom_grad = atom_grad * guide_atom_mask[None, :, None].to(dtype=atom_grad.dtype)
+    raw_grad_rms = _rms_over_mask(atom_grad, guide_atom_mask)
+
+    # ── 7: reduce / apply by mode ────────────────────────────────────────────
+    if apply_mode == "token_translation":
+        # Preferred stable mode: one rigid translation per residue/token.
+        # atom_grad (per-atom) → token mean → broadcast back to atoms.
+        guidance_unscaled = _token_translation(
+            atom_grad, atom_to_token_map, n_tokens, guide_atom_mask
+        )
+
+    elif apply_mode == "atom":
+        # Direct all-atom mode: raw masked gradients.
+        # Allows per-atom distortions — use smaller scale/clip defaults.
+        guidance_unscaled = atom_grad
+
+    elif apply_mode == "hybrid":
+        # token_component  = per-token rigid translation (same as token_translation)
+        # internal_component = residual after removing rigid translation,
+        #                      i.e. within-token deformations (torsion / angle changes)
+        # hybrid blends both; atom_guidance_fraction=0 → pure token_translation
+        token_component = _token_translation(
+            atom_grad, atom_to_token_map, n_tokens, guide_atom_mask
+        )
+        internal_component = atom_grad - token_component
+        guidance_unscaled = token_component + atom_guidance_fraction * internal_component
+
+    else:
+        raise ValueError(f"Unknown apply_mode: {apply_mode!r}")
+
+    # ── 8: clip by RMS over guided atoms ─────────────────────────────────────
+    if bool(guide_atom_mask.any()):
+        rms = _rms_over_mask(guidance_unscaled, guide_atom_mask)
+        if potential_manager.guide_clip_rms == 0.0:
+            guidance_unscaled = torch.zeros_like(guidance_unscaled)
+        elif rms > 1e-12:
+            clip_factor = min(1.0, float(potential_manager.guide_clip_rms) / float(rms))
+            guidance_unscaled = guidance_unscaled * clip_factor
+
+    # ── 9: scale by time-decayed guide scale ─────────────────────────────────
+    scale = potential_manager.get_guide_scale(t, T)
+    guidance = guidance_unscaled * scale
+
+    # ── debug ─────────────────────────────────────────────────────────────────
+    debug_dict: dict = {}
+    if potential_manager.debug:
+        debug_dict = {
+            "t": round(t, 4),
+            "potential_value": round(float(potential_value.detach()), 6),
+            "guide_scale": round(scale, 6),
+            "raw_atom_grad_rms": round(raw_grad_rms, 6),
+            "final_guidance_rms": round(_rms_over_mask(guidance, guide_atom_mask), 6),
+            "n_guided_atoms": int(guide_atom_mask.sum().item()),
+        }
+
+    return guidance, debug_dict
+
+
+def _token_translation(
+    atom_grad: torch.Tensor,         # [D, L, 3]
+    atom_to_token_map: torch.Tensor, # [L]   int64
+    n_tokens: int,
+    guide_atom_mask: torch.Tensor,   # [L]   bool
+) -> torch.Tensor:
+    """Per-token mean of guided atom gradients, broadcast back to atoms.
+
+    Only guided atoms (guide_atom_mask=True) contribute to the token average.
+    Tokens with no guided atoms receive a zero vector.
+    All atoms in the same token get the same vector (rigid body translation).
+    """
+    D, L, _ = atom_grad.shape
+    device, dtype = atom_grad.device, atom_grad.dtype
+
+    # Zero out non-guided atoms before averaging
+    atom_to_token_map = atom_to_token_map.to(device=device, dtype=torch.long)
+    guide_atom_mask = guide_atom_mask.to(device=device, dtype=torch.bool)
+
+    masked_grad = atom_grad * guide_atom_mask[None, :, None].to(dtype=dtype)
+
+    idx_3d = atom_to_token_map[None, :, None].expand(D, L, 3)  # [D, L, 3]
+    token_sum = torch.zeros(D, n_tokens, 3, device=device, dtype=dtype)
+    token_sum.scatter_add_(1, idx_3d, masked_grad)
+
+    # Count guided atoms per token
+    idx_1d = atom_to_token_map[None, :].expand(D, L)  # [D, L]
+    token_count = torch.zeros(D, n_tokens, device=device, dtype=dtype)
+    token_count.scatter_add_(
+        1,
+        idx_1d,
+        guide_atom_mask[None, :].to(dtype=dtype).expand(D, L),
+    )
+    token_count = token_count.clamp(min=1.0)
+
+    token_mean = token_sum / token_count[:, :, None]  # [D, I, 3]
+
+    # Broadcast: each atom gets its token's mean translation
+    token_broadcast = token_mean[:, atom_to_token_map, :]  # [D, L, 3]
+
+    # Atoms not in guide_atom_mask get zero (tokens with no guided atoms already 0)
+    token_broadcast = token_broadcast * guide_atom_mask[None, :, None].to(dtype=dtype)
+
+    return token_broadcast
+
+
+def _rms_over_mask(
+    tensor: torch.Tensor,  # [D, L, 3]
+    mask: torch.Tensor,    # [L]   bool
+) -> float:
+    mask = mask.to(device=tensor.device, dtype=torch.bool)
+    if not bool(mask.any()):
+        return 0.0
+    guided = tensor[:, mask, :]        # [D, n, 3]
+    sq_norms = guided.pow(2).sum(-1)   # [D, n]
+    return float(sq_norms.mean().sqrt())

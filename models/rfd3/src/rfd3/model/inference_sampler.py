@@ -1,7 +1,7 @@
 import inspect
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
@@ -53,6 +53,9 @@ class SampleDiffusionConfig:
 
     # Recycling
     n_recycle: int | None = None  # Override model default n_recycle for inference
+
+    # External differentiable potentials (disabled by default; no overhead when empty)
+    potentials: dict = field(default_factory=dict)
 
 
 class SampleDiffusionWithMotif(SampleDiffusionConfig):
@@ -173,6 +176,17 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised.clone(),
             is_motif_atom_with_fixed_coord=is_motif_atom_with_fixed_coord,
         )  # (D, L, 3)
+
+        # Build the potential adapter once (masks are static across steps)
+        potential_adapter = None
+        if self.potentials:
+            from rfd3.potentials.integration import build_potential_adapter
+            potential_adapter = build_potential_adapter(self.potentials, f)
+            if potential_adapter is not None:
+                ranked_logger.info(
+                    f"[potentials] enabled - mode={potential_adapter.config.apply_mode}, "
+                    f"n_potentials={len(potential_adapter.manager.potentials)}"
+                )
 
         if self.s_jitter_origin > 0.0:
             X_L[:, is_motif_atom_with_fixed_coord, :] += torch.normal(
@@ -319,6 +333,16 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             # Update the coordinates, scaled by the step size
             X_L = X_noisy_L + step_scale * d_t * delta_L
 
+            # potential guidance hook
+            # Applied after the normal sampler step, before X_L is stored.
+            # torch.enable_grad() is used internally; we exit before the next
+            # iteration so the grad-disabled assertions at the top of the loop
+            # still pass.  The returned X_L is always detached.
+            if potential_adapter is not None:
+                X_L = potential_adapter.apply(
+                    X_L, t=t_hat, T=float(noise_schedule[0])
+                )
+
             # Append the results to the trajectory (for visualization of the diffusion process)
             X_noisy_L_scaled = (
                 self.sigma_data * X_noisy_L / torch.sqrt(t_hat**2 + self.sigma_data**2)
@@ -411,6 +435,18 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised.clone(),
             is_motif_atom_with_fixed_coord=is_motif_atom_with_fixed_coord,
         )  # (D, L, 3)
+
+        # Build the potential adapter once (masks are static across steps)
+        potential_adapter = None
+        if self.potentials:
+            from rfd3.potentials.integration import build_potential_adapter
+            potential_adapter = build_potential_adapter(self.potentials, f)
+            if potential_adapter is not None:
+                ranked_logger.info(
+                    f"[potentials] enabled (symmetry sampler) - "
+                    f"mode={potential_adapter.config.apply_mode}, "
+                    f"n_potentials={len(potential_adapter.manager.potentials)}"
+                )
 
         X_noisy_L_traj = []
         X_denoised_L_traj = []
@@ -524,6 +560,12 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             # Update the coordinates, scaled by the step size
             # delta_L should be symmetric
             X_L = X_noisy_L + step_scale * d_t * delta_L
+
+            # potential guidance hook
+            if potential_adapter is not None:
+                X_L = potential_adapter.apply(
+                    X_L, t=t_hat, T=float(noise_schedule[0])
+                )
 
             # Append the results to the trajectory (for visualization of the diffusion process)
             X_noisy_L_scaled = (

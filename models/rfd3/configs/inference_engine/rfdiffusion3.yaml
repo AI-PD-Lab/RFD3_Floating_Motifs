@@ -49,6 +49,12 @@ inference_sampler:
   gamma_min: 1.0
   s_jitter_origin: 0.0  # Sigma of gaussian noise to jitter the motif offset (equivalent to ORI token Jitter)
 
+  # Floating rigid motif projection (inference-only; disabled preserves current behavior)
+  floating_motif_project: False
+  floating_motif_project_every: 1
+  floating_motif_burn_in: 0
+  floating_motif_stop_after: null
+
 # Saving args
 cleanup_guideposts: True
 cleanup_virtual_atoms: True

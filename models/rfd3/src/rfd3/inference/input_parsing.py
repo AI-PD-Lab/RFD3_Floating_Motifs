@@ -42,6 +42,9 @@ from rfd3.inference.symmetry.symmetry_utils import (
     center_symmetric_src_atom_array,
     make_symmetric_atom_array,
 )
+from rfd3.model.floating_motif_projection import (
+    annotate_floating_motif_reference_coords,
+)
 from rfd3.transforms.conditioning_base import (
     check_has_required_conditioning_annotations,
     convert_existing_annotations_to_bool,
@@ -513,6 +516,7 @@ class DesignInputSpecification(BaseModel):
         # Apply post-processing
         atom_array = self._append_ligand(atom_array, atom_array_input_annotated)
         atom_array = self._apply_symmetry(atom_array, atom_array_input_annotated)
+        atom_array = annotate_floating_motif_reference_coords(atom_array)
 
         # Apply globals to all tokens (including diffused)
         atom_array = self._set_origin(atom_array)

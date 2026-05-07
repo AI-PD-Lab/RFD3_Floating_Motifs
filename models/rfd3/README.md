@@ -53,6 +53,16 @@ Additional unnecessary (but useful!) options are added to the above command:
 - `prevalidate_inputs`: Checks that your inputs are valid before running inference. Helpful if your JSON/YAML has a number of different configs you want to debug / double check are valid before loading the checkpoints.
 - `skip_existing`: Skips any existing files that would be in the same place and have the same name as the calculation being run. If you are testing your setup multiple times, including this option is important so that you actually run RFdiffusion3. 
 
+### Floating motif projection
+
+This checkout includes an optional inference-time floating rigid motif projection. It is disabled by default. When enabled, motif residues derived from the existing contig mapping are still diffused normally at each denoising step, then each non-contiguous motif segment is independently Kabsch-aligned back to its original all-atom PDB geometry.
+
+```bash
+rfd3 design ... inference_sampler.floating_motif_project=True inference_sampler.floating_motif_project_every=5 inference_sampler.floating_motif_burn_in=20
+```
+
+`floating_motif_project_every` controls the projection interval, `floating_motif_burn_in` skips projection for the first N denoising steps, and `floating_motif_stop_after` optionally stops projection after a specific step. In this potentials-enabled checkout, the step order is normal sampler update, external potential guidance, then floating motif Kabsch projection. The projection is an inference-time approximation of floating-anchor diffusion; it does not change training or model architecture.
+
 There are various interesting ways you can use RFD3 beyond [Atom14](https://www.biorxiv.org/content/10.1101/2024.08.16.608235v4) design as it's trained on a large array of different tasks.
 For example, you can fix sequence and not structure (prediction-type task), fix the backbone and unfix the sequence (MPNN-type inverse folding) or unfix the sidechains only (PLACER/ChemNet-style):
 
@@ -138,7 +148,7 @@ All potentials support `weight` unless noted. The value is a scalar to maximize,
 | `interface_ncontacts` | `weight=1.0`, `r_0=8.0`, `d_0=2.0` | Maximizes differentiable contacts between generated binder atoms and fixed target atoms. |
 | `monomer_contacts` | `weight=1.0`, `r_0=8.0`, `d_0=2.0` | Maximizes differentiable internal contacts among selected potential atoms, using only upper-triangle pairs. |
 | `atom_pair_distance` | `weight=1.0`, `atom_i=0`, `atom_j=1`, `target_distance=8.0` | Harmonic distance restraint on two flat atom indices. |
-| `motif_distance` | `weight=1.0`, `motif_i=0`, `motif_j=1`, `target_distance=10.0` | Harmonic center-distance restraint between two contiguous motif-token blocks. Motif blocks are inferred from contig order. |
+| `motif_distance` | `weight=1.0`, `motif_i=0`, `motif_j=1`, `target_distance=10.0` | Harmonic COM-distance restraint between two contiguous motif-token blocks. Motif blocks are inferred from contig order, and guidance applies one translation to all atoms in each selected motif block. |
 | `motif_bridge` | `weight=1.0`, `motif_i=0`, `motif_j=1`, `spread_weight=1.0`, `outside_weight=1.0`, `tube_weight=0.2`, `max_radius=12.0`, `atom_filter=guide`, `include_motif_atoms=false` | Encourages generated non-motif atoms to spread evenly between two motif centers. |
 | `motif_rigid` | `weight=1.0`, `k=1.0`, `loss=pseudo_huber`, `group_mode=all`, `atom_filter=potential`, `motif_i=null`, `min_separation=0` | Preserves fixed-sequence and fixed-coordinate motif geometry by matching current motif atom-pair distances to RFD3 reference coordinates. |
 
@@ -146,7 +156,7 @@ All potentials support `weight` unless noted. The value is a scalar to maximize,
 
 ### `motif_bridge` guide
 
-`motif_bridge` complements `motif_distance`. `motif_distance` moves only the motif atoms that define the two motif centers. `motif_bridge` instead acts on selected non-motif atoms, usually generated scaffold atoms, and encourages them to occupy the region between the two motif centers.
+`motif_bridge` complements `motif_distance`. `motif_distance` computes each selected motif center from all real motif atoms and applies the same translation to every atom in that motif block, preserving the noisy internal motif geometry for the subsequent floating motif Kabsch projection. `motif_bridge` instead acts on selected non-motif atoms, usually generated scaffold atoms, and encourages them to occupy the region between the two motif centers.
 
 It projects selected atoms onto the axis from `motif_i` to `motif_j`, sorts those projected positions, and penalizes deviation from an even spacing between 0 and 1. It also penalizes atoms outside the two motif endpoints and, optionally, atoms farther than `max_radius` from the motif-motif axis.
 

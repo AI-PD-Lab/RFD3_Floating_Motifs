@@ -5,6 +5,42 @@ from hydra import compose, initialize_config_dir
 
 app = typer.Typer()
 
+FLOATING_MOTIF_FLAG_OVERRIDES = {
+    "--floating_motif_project": "inference_sampler.floating_motif_project",
+    "--floating_motif_project_every": "inference_sampler.floating_motif_project_every",
+    "--floating_motif_burn_in": "inference_sampler.floating_motif_burn_in",
+    "--floating_motif_stop_after": "inference_sampler.floating_motif_stop_after",
+}
+
+
+def _normalize_floating_motif_flags(args):
+    normalized = []
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        if arg == "--floating_motif_project":
+            normalized.append("inference_sampler.floating_motif_project=True")
+            idx += 1
+            continue
+
+        matched = False
+        for flag, override in FLOATING_MOTIF_FLAG_OVERRIDES.items():
+            if arg.startswith(f"{flag}="):
+                normalized.append(f"{override}={arg.split('=', 1)[1]}")
+                matched = True
+                break
+            if arg == flag:
+                if idx + 1 >= len(args):
+                    raise typer.BadParameter(f"{flag} requires a value")
+                normalized.append(f"{override}={args[idx + 1]}")
+                idx += 1
+                matched = True
+                break
+        if not matched:
+            normalized.append(arg)
+        idx += 1
+    return normalized
+
 
 @app.command(
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
@@ -26,6 +62,7 @@ def design(ctx: typer.Context):
     # Get all arguments
     args = ctx.params.get("args", []) + ctx.args
     args = [a for a in args if a not in ["design", "fold"]]
+    args = _normalize_floating_motif_flags(args)
 
     # Ensure we have at least a default inference_engine if not specified
     has_inference_engine = any(arg.startswith("inference_engine=") for arg in args)

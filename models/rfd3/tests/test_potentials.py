@@ -4,12 +4,11 @@ These tests are intentionally self-contained: they do NOT require a trained
 checkpoint, a full RFD3 pipeline, or any biotite/atomworks dependencies.
 They test the mathematics and masking logic of the potential system in isolation.
 """
+
 import pytest
 import torch
-
 from rfd3.potentials.config import PotentialsConfig
 from rfd3.potentials.guidance import (
-    _rms_over_mask,
     _token_translation,
     compute_potential_guidance,
 )
@@ -22,12 +21,11 @@ from rfd3.potentials.potentials import (
     BasePotential,
     BinderROG,
     InterfaceNContacts,
+    MonomerROG,
     MotifBridge,
     MotifDistance,
     MotifRigid,
-    MonomerROG,
 )
-
 
 # ─── shared helpers ──────────────────────────────────────────────────────────
 
@@ -119,13 +117,13 @@ def test_token_translation_is_mean_per_token():
     expected_tok1 = torch.tensor([5.0, 0.0, 0.0])  # mean(4,5,6)
 
     for i in range(3):
-        assert torch.allclose(result[0, i], expected_tok0, atol=1e-5), (
-            f"Atom {i} (token 0) got {result[0,i]}, expected {expected_tok0}"
-        )
+        assert torch.allclose(
+            result[0, i], expected_tok0, atol=1e-5
+        ), f"Atom {i} (token 0) got {result[0,i]}, expected {expected_tok0}"
     for i in range(3, 6):
-        assert torch.allclose(result[0, i], expected_tok1, atol=1e-5), (
-            f"Atom {i} (token 1) got {result[0,i]}, expected {expected_tok1}"
-        )
+        assert torch.allclose(
+            result[0, i], expected_tok1, atol=1e-5
+        ), f"Atom {i} (token 1) got {result[0,i]}, expected {expected_tok1}"
 
 
 # ─── test 2: fixed atoms receive exactly zero guidance ────────────────────────
@@ -161,9 +159,9 @@ def test_fixed_atoms_get_zero_guidance():
     )
 
     fixed_mask = f["is_motif_atom_with_fixed_coord"]
-    assert guidance[:, fixed_mask, :].abs().max().item() == 0.0, (
-        "Fixed atoms must receive zero guidance"
-    )
+    assert (
+        guidance[:, fixed_mask, :].abs().max().item() == 0.0
+    ), "Fixed atoms must receive zero guidance"
 
 
 # ─── test 3: virtual atoms receive zero guidance ──────────────────────────────
@@ -199,9 +197,9 @@ def test_virtual_atoms_get_zero_guidance():
     )
 
     virtual_mask = f["is_virtual"]
-    assert guidance[:, virtual_mask, :].abs().max().item() == 0.0, (
-        "Virtual atoms must receive zero guidance"
-    )
+    assert (
+        guidance[:, virtual_mask, :].abs().max().item() == 0.0
+    ), "Virtual atoms must receive zero guidance"
 
 
 @pytest.mark.fast
@@ -235,10 +233,12 @@ def test_binder_rog_decreases_rog():
     xyz = torch.randn(D, n_atoms, 3) * 10.0
     f = {
         "atom_to_token_map": torch.arange(n_atoms) % n_tokens,
-        "is_motif_atom_with_fixed_coord": torch.cat([
-            torch.ones(n_fixed, dtype=torch.bool),
-            torch.zeros(n_atoms - n_fixed, dtype=torch.bool),
-        ]),
+        "is_motif_atom_with_fixed_coord": torch.cat(
+            [
+                torch.ones(n_fixed, dtype=torch.bool),
+                torch.zeros(n_atoms - n_fixed, dtype=torch.bool),
+            ]
+        ),
         "is_virtual": torch.zeros(n_atoms, dtype=torch.bool),
         "is_ca": torch.zeros(n_atoms, dtype=torch.bool),
         "is_backbone": torch.zeros(n_atoms, dtype=torch.bool),
@@ -278,9 +278,9 @@ def test_binder_rog_decreases_rog():
 
     rog_before = rog(xyz, binder_mask)
     rog_after = rog(xyz_new, binder_mask)
-    assert rog_after < rog_before, (
-        f"ROG should decrease: {rog_before:.4f} → {rog_after:.4f}"
-    )
+    assert (
+        rog_after < rog_before
+    ), f"ROG should decrease: {rog_before:.4f} → {rog_after:.4f}"
 
 
 # ─── test 5: empty potential list gives zero guidance ────────────────────────
@@ -306,7 +306,9 @@ def test_empty_potentials_give_zero_guidance():
         atom_guidance_fraction=0.0,
     )
 
-    assert guidance.abs().max().item() == 0.0, "Empty potentials must give zero guidance"
+    assert (
+        guidance.abs().max().item() == 0.0
+    ), "Empty potentials must give zero guidance"
 
 
 # ─── test 6: atom mode preserves individual per-atom gradient ────────────────
@@ -322,18 +324,22 @@ def test_atom_mode_no_token_averaging():
     D = 1
     atom_grad = torch.zeros(D, n_atoms, 3)
     atom_grad[0, 0] = torch.tensor([1.0, 0.0, 0.0])
-    atom_grad[0, 1] = torch.tensor([3.0, 0.0, 0.0])  # deliberately different from atom 0
+    atom_grad[0, 1] = torch.tensor(
+        [3.0, 0.0, 0.0]
+    )  # deliberately different from atom 0
 
     # token_translation collapses atoms in the same token to the mean
-    token_result = _token_translation(atom_grad, atom_to_token_map, n_tokens, guide_mask)
-    assert torch.allclose(token_result[0, 0], token_result[0, 1], atol=1e-5), (
-        "token_translation must give identical vectors to atoms in the same token"
+    token_result = _token_translation(
+        atom_grad, atom_to_token_map, n_tokens, guide_mask
     )
+    assert torch.allclose(
+        token_result[0, 0], token_result[0, 1], atol=1e-5
+    ), "token_translation must give identical vectors to atoms in the same token"
 
     # atom mode preserves per-atom values
-    assert not torch.allclose(atom_grad[0, 0], atom_grad[0, 1], atol=1e-5), (
-        "atom mode should preserve distinct per-atom gradients"
-    )
+    assert not torch.allclose(
+        atom_grad[0, 0], atom_grad[0, 1], atol=1e-5
+    ), "atom mode should preserve distinct per-atom gradients"
 
 
 @pytest.mark.fast
@@ -442,19 +448,27 @@ def test_hybrid_fraction_zero_matches_token_translation():
     g_tok, _ = compute_potential_guidance(
         xyz_t=xyz,
         potential_manager=manager,
-        t=1.0, T=1.0, masks=masks, metadata=metadata,
-        apply_mode="token_translation", atom_guidance_fraction=0.0,
+        t=1.0,
+        T=1.0,
+        masks=masks,
+        metadata=metadata,
+        apply_mode="token_translation",
+        atom_guidance_fraction=0.0,
     )
     g_hyb, _ = compute_potential_guidance(
         xyz_t=xyz,
         potential_manager=manager,
-        t=1.0, T=1.0, masks=masks, metadata=metadata,
-        apply_mode="hybrid", atom_guidance_fraction=0.0,
+        t=1.0,
+        T=1.0,
+        masks=masks,
+        metadata=metadata,
+        apply_mode="hybrid",
+        atom_guidance_fraction=0.0,
     )
 
-    assert torch.allclose(g_tok, g_hyb, atol=1e-5), (
-        "hybrid(fraction=0.0) must match token_translation"
-    )
+    assert torch.allclose(
+        g_tok, g_hyb, atol=1e-5
+    ), "hybrid(fraction=0.0) must match token_translation"
 
 
 @pytest.mark.fast
@@ -482,14 +496,22 @@ def test_hybrid_fraction_one_matches_atom_mode():
     g_atom, _ = compute_potential_guidance(
         xyz_t=xyz,
         potential_manager=manager,
-        t=1.0, T=1.0, masks=masks, metadata=metadata,
-        apply_mode="atom", atom_guidance_fraction=0.0,
+        t=1.0,
+        T=1.0,
+        masks=masks,
+        metadata=metadata,
+        apply_mode="atom",
+        atom_guidance_fraction=0.0,
     )
     g_hyb, _ = compute_potential_guidance(
         xyz_t=xyz,
         potential_manager=manager,
-        t=1.0, T=1.0, masks=masks, metadata=metadata,
-        apply_mode="hybrid", atom_guidance_fraction=1.0,
+        t=1.0,
+        T=1.0,
+        masks=masks,
+        metadata=metadata,
+        apply_mode="hybrid",
+        atom_guidance_fraction=1.0,
     )
 
     assert torch.allclose(g_atom, g_hyb, atol=1e-6)
@@ -510,9 +532,9 @@ def test_guide_decay_is_monotone(decay):
     ts = [10.0, 7.0, 4.0, 1.0, 0.1]
     scales = [manager.get_guide_scale(t, T) for t in ts]
     for i in range(len(scales) - 1):
-        assert scales[i] >= scales[i + 1], (
-            f"{decay}: scale should decrease as t decreases; got {scales}"
-        )
+        assert (
+            scales[i] >= scales[i + 1]
+        ), f"{decay}: scale should decrease as t decreases; got {scales}"
 
 
 @pytest.mark.fast
@@ -535,9 +557,9 @@ def test_inverse_guide_decay_is_monotone(decay):
     ts = [10.0, 7.0, 4.0, 1.0, 0.1]
     scales = [manager.get_guide_scale(t, T) for t in ts]
     for i in range(len(scales) - 1):
-        assert scales[i] <= scales[i + 1], (
-            f"{decay}: scale should increase as t decreases; got {scales}"
-        )
+        assert (
+            scales[i] <= scales[i + 1]
+        ), f"{decay}: scale should increase as t decreases; got {scales}"
 
 
 # ─── test 9: parsing — dict and RFD1-style strings ───────────────────────────
@@ -549,8 +571,20 @@ def test_parsing_dict_and_string():
     specs_dict = [
         {"type": "binder_ROG", "weight": 2.0},
         {"type": "interface_ncontacts", "weight": 0.5, "r_0": 6.0, "d_0": 1.5},
-        {"type": "motif_distance", "weight": 1.5, "motif_i": 0, "motif_j": 1, "target_distance": 12.0},
-        {"type": "motif_bridge", "weight": 4.0, "motif_i": 0, "motif_j": 1, "max_radius": 8.0},
+        {
+            "type": "motif_distance",
+            "weight": 1.5,
+            "motif_i": 0,
+            "motif_j": 1,
+            "target_distance": 12.0,
+        },
+        {
+            "type": "motif_bridge",
+            "weight": 4.0,
+            "motif_i": 0,
+            "motif_j": 1,
+            "max_radius": 8.0,
+        },
         {
             "type": "motif_rigid",
             "weight": 3.0,
@@ -603,12 +637,14 @@ def test_parsing_dict_and_string():
 def test_per_potential_invalid_guide_decay_raises():
     """Per-potential guide_decay should be validated during parsing."""
     with pytest.raises(ValueError, match="guide_decay"):
-        parse_potentials([
-            {
-                "type": "motif_rigid",
-                "guide_decay": "pseudo_huber",
-            }
-        ])
+        parse_potentials(
+            [
+                {
+                    "type": "motif_rigid",
+                    "guide_decay": "pseudo_huber",
+                }
+            ]
+        )
 
 
 @pytest.mark.fast
@@ -647,14 +683,20 @@ def test_motif_distance_scalar_to_maximize():
         motif_j=1,
         target_distance=3.0,
     )
-    xyz = torch.tensor([[
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0],
-        [99.0, 0.0, 0.0],
-        [5.0, 0.0, 0.0],
-    ]])
+    xyz = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [99.0, 0.0, 0.0],
+                [5.0, 0.0, 0.0],
+            ]
+        ]
+    )
 
-    value = pot.compute(xyz, masks, metadata={"atom_to_token_map": f["atom_to_token_map"]})
+    value = pot.compute(
+        xyz, masks, metadata={"atom_to_token_map": f["atom_to_token_map"]}
+    )
 
     assert value.ndim == 0
     assert torch.allclose(value, torch.tensor(-8.0))
@@ -686,14 +728,21 @@ def test_motif_distance_uses_unfixed_motif_atoms():
         motif_j=1,
         target_distance=3.0,
     )
-    xyz = torch.tensor([[
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0],
-        [99.0, 0.0, 0.0],
-        [5.0, 0.0, 0.0],
-    ]], requires_grad=True)
+    xyz = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [99.0, 0.0, 0.0],
+                [5.0, 0.0, 0.0],
+            ]
+        ],
+        requires_grad=True,
+    )
 
-    value = pot.compute(xyz, masks, metadata={"atom_to_token_map": f["atom_to_token_map"]})
+    value = pot.compute(
+        xyz, masks, metadata={"atom_to_token_map": f["atom_to_token_map"]}
+    )
     value.backward()
 
     assert value.ndim == 0
@@ -727,12 +776,16 @@ def test_motif_distance_guidance_moves_toward_target_distance():
         [MotifDistance(weight=1.0, motif_i=0, motif_j=1, target_distance=3.0)],
         guide_clip_rms=1e6,
     )
-    xyz = torch.tensor([[
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0],
-        [99.0, 0.0, 0.0],
-        [5.0, 0.0, 0.0],
-    ]])
+    xyz = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [99.0, 0.0, 0.0],
+                [5.0, 0.0, 0.0],
+            ]
+        ]
+    )
     metadata = {"atom_to_token_map": f["atom_to_token_map"]}
 
     guidance, _ = compute_potential_guidance(
@@ -751,6 +804,60 @@ def test_motif_distance_guidance_moves_toward_target_distance():
     dist_after = (xyz_new[:, :2, :].mean(dim=1) - xyz_new[:, 3, :]).norm(dim=-1)
 
     assert (dist_after - 3.0).abs() < (dist_before - 3.0).abs()
+
+
+@pytest.mark.fast
+def test_motif_distance_guidance_translates_whole_motif_blocks():
+    """motif_distance guidance should move each motif as one COM translation."""
+    f = {
+        "atom_to_token_map": torch.tensor([0, 1, 2, 3, 4]),
+        "is_motif_atom_with_fixed_coord": torch.tensor([True, True, False, True, True]),
+        "is_virtual": torch.zeros(5, dtype=torch.bool),
+        "is_ca": torch.ones(5, dtype=torch.bool),
+        "is_backbone": torch.ones(5, dtype=torch.bool),
+    }
+    config = PotentialsConfig(
+        enabled=True,
+        include_atoms="CA",
+        exclude_fixed_atoms=True,
+        exclude_virtual_atoms=True,
+        guide_only_generated=True,
+        guide_scale=1.0,
+        guide_decay="constant",
+        guide_clip_rms=1e6,
+    )
+    masks = build_masks(f, config)
+    manager = _make_manager(
+        [MotifDistance(weight=1.0, motif_i=0, motif_j=1, target_distance=3.0)],
+        guide_clip_rms=1e6,
+    )
+    xyz = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 2.0, 0.0],
+                [99.0, 0.0, 0.0],
+                [7.0, 0.0, 0.0],
+                [7.0, 2.0, 0.0],
+            ]
+        ]
+    )
+
+    guidance, _ = compute_potential_guidance(
+        xyz_t=xyz,
+        potential_manager=manager,
+        t=1.0,
+        T=1.0,
+        masks=masks,
+        metadata={"atom_to_token_map": f["atom_to_token_map"]},
+        apply_mode="atom",
+        atom_guidance_fraction=0.0,
+    )
+
+    assert torch.allclose(guidance[0, 0], guidance[0, 1])
+    assert torch.allclose(guidance[0, 3], guidance[0, 4])
+    assert torch.allclose(guidance[0, 2], torch.zeros(3))
+    assert guidance[:, [0, 1, 3, 4], :].abs().sum().item() > 0.0
 
 
 @pytest.mark.fast
@@ -787,11 +894,15 @@ def test_motif_bridge_guidance_moves_scaffold_between_motifs():
         ],
         guide_clip_rms=1e6,
     )
-    xyz = torch.tensor([[
-        [0.0, 0.0, 0.0],
-        [20.0, 0.0, 0.0],
-        [10.0, 0.0, 0.0],
-    ]])
+    xyz = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [20.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+            ]
+        ]
+    )
 
     guidance, _ = compute_potential_guidance(
         xyz_t=xyz,
@@ -830,18 +941,24 @@ def test_motif_rigid_penalizes_distorted_fixed_seq_motif():
     masks = build_masks(f, config)
     metadata = {
         "atom_to_token_map": f["atom_to_token_map"],
-        "ref_pos": torch.tensor([
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ]),
+        "ref_pos": torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ]
+        ),
         "is_motif_atom_with_fixed_seq": f["is_motif_atom_with_fixed_seq"],
     }
-    xyz = torch.tensor([[
-        [0.0, 0.0, 0.0],
-        [2.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-    ]])
+    xyz = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ]
+        ]
+    )
     pot = MotifRigid(weight=2.0, loss="mse")
 
     value = pot.compute(xyz, masks, metadata)
@@ -872,21 +989,27 @@ def test_motif_rigid_guidance_reduces_distance_geometry_error():
         guide_clip_rms=1e6,
     )
     masks = build_masks(f, config)
-    ref_pos = torch.tensor([
-        [0.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-    ])
+    ref_pos = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]
+    )
     metadata = {
         "atom_to_token_map": f["atom_to_token_map"],
         "ref_pos": ref_pos,
         "is_motif_atom_with_fixed_seq": f["is_motif_atom_with_fixed_seq"],
     }
-    xyz = torch.tensor([[
-        [0.0, 0.0, 0.0],
-        [2.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-    ]])
+    xyz = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ]
+        ]
+    )
     manager = _make_manager([MotifRigid(weight=1.0, loss="mse")], guide_clip_rms=1e6)
 
     guidance, _ = compute_potential_guidance(
@@ -919,7 +1042,9 @@ def test_adapter_disabled_by_default():
     f = _make_f()
 
     # disabled flag
-    adapter = build_potential_adapter({"enabled": False, "guiding_potentials": [{"type": "monomer_ROG"}]}, f)
+    adapter = build_potential_adapter(
+        {"enabled": False, "guiding_potentials": [{"type": "monomer_ROG"}]}, f
+    )
     assert adapter is None
 
     # enabled but empty list

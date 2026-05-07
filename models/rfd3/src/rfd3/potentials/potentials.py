@@ -4,6 +4,7 @@ Each potential returns a scalar tensor that should be MAXIMIZED by gradient asce
 The guidance system backpropagates through this scalar to get per-atom coordinate
 gradients, which are then used to update the sampler trajectory.
 """
+
 from __future__ import annotations
 
 import torch
@@ -156,6 +157,12 @@ class MotifDistance(BasePotential):
     sequence or unindexed motif flags.
 
     Returns -weight * (distance - target_distance)^2.
+
+    This potential computes the center of mass of every motif block using all
+    real motif atoms. During guidance, each atom in a selected motif receives
+    the same block-level translation so the potential can move motifs without
+    distorting their internal noisy geometry; a subsequent Kabsch projection can
+    then restore the original rigid all-atom motif geometry.
     """
 
     def __init__(
@@ -171,7 +178,7 @@ class MotifDistance(BasePotential):
         self.target_distance = float(target_distance)
 
     def compute(self, xyz, masks, metadata):
-        motif_blocks = _motif_blocks(masks, metadata, xyz.device)
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
         max_idx = max(self.motif_i, self.motif_j)
         if self.motif_i < 0 or self.motif_j < 0 or max_idx >= len(motif_blocks):
             return xyz.new_zeros(())
@@ -185,6 +192,37 @@ class MotifDistance(BasePotential):
         com_b = motif_b.mean(dim=1)
         dist = (com_a - com_b).norm(dim=-1)
         return -self.weight * ((dist - self.target_distance) ** 2).mean()
+
+    def guide_atom_mask(self, masks, metadata, device):
+        motif_blocks = _motif_distance_blocks(masks, metadata, device)
+        if not motif_blocks:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        guide_mask = torch.zeros_like(motif_blocks[0], dtype=torch.bool, device=device)
+        max_idx = max(self.motif_i, self.motif_j)
+        if self.motif_i < 0 or self.motif_j < 0 or max_idx >= len(motif_blocks):
+            return guide_mask
+        guide_mask |= motif_blocks[self.motif_i]
+        guide_mask |= motif_blocks[self.motif_j]
+        return guide_mask
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        if not motif_blocks:
+            return atom_grad
+
+        transformed = torch.zeros_like(atom_grad)
+        max_idx = max(self.motif_i, self.motif_j)
+        if self.motif_i < 0 or self.motif_j < 0 or max_idx >= len(motif_blocks):
+            return transformed
+
+        for motif_idx in (self.motif_i, self.motif_j):
+            block_mask = motif_blocks[motif_idx].to(device=xyz.device, dtype=torch.bool)
+            if block_mask.sum().item() == 0:
+                continue
+            block_translation = atom_grad[:, block_mask, :].mean(dim=1, keepdim=True)
+            transformed[:, block_mask, :] = block_translation
+        return transformed
 
 
 class MotifBridge(BasePotential):
@@ -425,7 +463,9 @@ def _motif_blocks(
     if "motif_atom_mask" not in masks or "potential_atom_mask" not in masks:
         return []
 
-    atom_to_token_map = metadata["atom_to_token_map"].to(device=device, dtype=torch.long)
+    atom_to_token_map = metadata["atom_to_token_map"].to(
+        device=device, dtype=torch.long
+    )
     motif_mask = masks["motif_atom_mask"].to(device=device, dtype=torch.bool)
     potential_mask = masks["potential_atom_mask"].to(device=device, dtype=torch.bool)
     motif_atom_mask = motif_mask & potential_mask
@@ -455,6 +495,61 @@ def _motif_blocks(
         for token in token_run:
             block_mask |= atom_to_token_map == token
         atom_blocks.append(block_mask & motif_atom_mask)
+    return atom_blocks
+
+
+def _motif_distance_blocks(
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    """Return contiguous motif blocks using all real motif atoms.
+
+    Unlike the generic potential mask path, motif_distance intentionally uses
+    all non-virtual motif atoms so its guidance can translate each whole motif
+    body together before the optional Kabsch projection restores rigid geometry.
+    """
+    if "atom_to_token_map" not in metadata or "motif_atom_mask" not in masks:
+        return []
+
+    atom_to_token_map = metadata["atom_to_token_map"].to(
+        device=device, dtype=torch.long
+    )
+    motif_mask = masks["motif_atom_mask"].to(device=device, dtype=torch.bool)
+    real_mask = masks.get("real_atom_mask")
+    if real_mask is not None:
+        motif_mask = motif_mask & real_mask.to(device=device, dtype=torch.bool)
+    elif "virtual_atom_mask" in masks:
+        motif_mask = motif_mask & ~masks["virtual_atom_mask"].to(
+            device=device, dtype=torch.bool
+        )
+
+    if motif_mask.sum().item() == 0:
+        return []
+
+    motif_tokens = torch.unique(atom_to_token_map[motif_mask]).sort().values
+    if motif_tokens.numel() == 0:
+        return []
+
+    token_runs: list[list[int]] = []
+    current_run = [int(motif_tokens[0].item())]
+    previous_token = current_run[0]
+    for token_tensor in motif_tokens[1:]:
+        token = int(token_tensor.item())
+        if token == previous_token + 1:
+            current_run.append(token)
+        else:
+            token_runs.append(current_run)
+            current_run = [token]
+        previous_token = token
+    token_runs.append(current_run)
+
+    atom_blocks: list[torch.Tensor] = []
+    for token_run in token_runs:
+        block_mask = torch.zeros_like(motif_mask)
+        for token in token_run:
+            block_mask |= atom_to_token_map == token
+        atom_blocks.append(block_mask & motif_mask)
     return atom_blocks
 
 

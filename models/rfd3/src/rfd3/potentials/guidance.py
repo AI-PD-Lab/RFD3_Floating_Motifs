@@ -22,6 +22,7 @@ hybrid (blend):
     The internal_component carries within-token deformations (bond angle / torsion
     relaxation) on top of the rigid token translation.
 """
+
 from __future__ import annotations
 
 import torch
@@ -30,10 +31,10 @@ from rfd3.potentials.manager import PotentialManager
 
 
 def compute_potential_guidance(
-    xyz_t: torch.Tensor,         # [D, L, 3]   current atom coordinates
+    xyz_t: torch.Tensor,  # [D, L, 3]   current atom coordinates
     potential_manager: PotentialManager,
-    t: float,                    # current noise level
-    T: float,                    # maximum noise level (first step)
+    t: float,  # current noise level
+    T: float,  # maximum noise level (first step)
     masks: dict[str, torch.Tensor],
     metadata: dict,
     apply_mode: str,
@@ -54,7 +55,7 @@ def compute_potential_guidance(
         else value
         for key, value in masks.items()
     }
-    guide_atom_mask = masks["guide_atom_mask"].to(
+    base_guide_atom_mask = masks["guide_atom_mask"].to(
         device=xyz_t.device, dtype=torch.bool
     )  # [L]
     atom_to_token_map = metadata["atom_to_token_map"].to(
@@ -67,16 +68,17 @@ def compute_potential_guidance(
             "atom_to_token_map length must match xyz_t atom dimension: "
             f"{atom_to_token_map.shape[0]} != {xyz_t.shape[1]}"
         )
-    if guide_atom_mask.shape[0] != xyz_t.shape[1]:
+    if base_guide_atom_mask.shape[0] != xyz_t.shape[1]:
         raise ValueError(
             "guide_atom_mask length must match xyz_t atom dimension: "
-            f"{guide_atom_mask.shape[0]} != {xyz_t.shape[1]}"
+            f"{base_guide_atom_mask.shape[0]} != {xyz_t.shape[1]}"
         )
 
     total_guidance = torch.zeros_like(xyz_t)
     total_potential_value = xyz_t.new_zeros(())
     raw_grad_rms_values: list[float] = []
     potential_debug: list[dict] = []
+    guide_atom_mask = base_guide_atom_mask
 
     for potential in potential_manager.potentials:
         potential_value, atom_grad = _potential_atom_gradient(
@@ -88,6 +90,23 @@ def compute_potential_guidance(
         if atom_grad is None:
             continue
         total_potential_value = total_potential_value + potential_value.detach()
+
+        guide_atom_mask = base_guide_atom_mask
+        if hasattr(potential, "guide_atom_mask"):
+            guide_atom_mask = potential.guide_atom_mask(
+                masks=masks,
+                metadata=metadata,
+                device=xyz_t.device,
+            )
+            guide_atom_mask = guide_atom_mask.to(device=xyz_t.device, dtype=torch.bool)
+
+        if hasattr(potential, "transform_atom_gradient"):
+            atom_grad = potential.transform_atom_gradient(
+                atom_grad=atom_grad,
+                masks=masks,
+                metadata=metadata,
+                xyz=xyz_t,
+            )
 
         atom_grad = torch.nan_to_num(atom_grad, nan=0.0, posinf=0.0, neginf=0.0)
         atom_grad = atom_grad * guide_atom_mask[None, :, None].to(dtype=atom_grad.dtype)
@@ -208,10 +227,10 @@ def _apply_guidance_mode(
 
 
 def _token_translation(
-    atom_grad: torch.Tensor,         # [D, L, 3]
-    atom_to_token_map: torch.Tensor, # [L]   int64
+    atom_grad: torch.Tensor,  # [D, L, 3]
+    atom_to_token_map: torch.Tensor,  # [L]   int64
     n_tokens: int,
-    guide_atom_mask: torch.Tensor,   # [L]   bool
+    guide_atom_mask: torch.Tensor,  # [L]   bool
 ) -> torch.Tensor:
     """Per-token mean of guided atom gradients, broadcast back to atoms.
 
@@ -255,11 +274,11 @@ def _token_translation(
 
 def _rms_over_mask(
     tensor: torch.Tensor,  # [D, L, 3]
-    mask: torch.Tensor,    # [L]   bool
+    mask: torch.Tensor,  # [L]   bool
 ) -> float:
     mask = mask.to(device=tensor.device, dtype=torch.bool)
     if not bool(mask.any()):
         return 0.0
-    guided = tensor[:, mask, :]        # [D, n, 3]
-    sq_norms = guided.pow(2).sum(-1)   # [D, n]
+    guided = tensor[:, mask, :]  # [D, n, 3]
+    sq_norms = guided.pow(2).sum(-1)  # [D, n]
     return float(sq_norms.mean().sqrt())

@@ -24,7 +24,7 @@ class PotentialsConfig:
 
     # Guide scale and decay schedule
     guide_scale: float = 0.25
-    guide_decay: str = "quadratic"  # "constant" | "linear" | "quadratic" | "cubic"
+    guide_decay: str = "quadratic"
 
     # RMS clip threshold (Angstrom) — applied before scale
     guide_clip_rms: float = 0.02
@@ -52,7 +52,23 @@ class PotentialsConfig:
             raise ValueError(
                 f"apply_mode must be one of {valid_modes}, got {self.apply_mode!r}"
             )
-        valid_decays = ("constant", "linear", "quadratic", "cubic")
+        valid_decays = (
+            "constant",
+            "sqrt",
+            "linear",
+            "quadratic",
+            "cubic",
+            "quartic",
+            "exponential",
+            "cosine",
+            "inverse_sqrt",
+            "inverse_linear",
+            "inverse_quadratic",
+            "inverse_cubic",
+            "inverse_quartic",
+            "inverse_exponential",
+            "inverse_cosine",
+        )
         if self.guide_decay not in valid_decays:
             raise ValueError(
                 f"guide_decay must be one of {valid_decays}, got {self.guide_decay!r}"

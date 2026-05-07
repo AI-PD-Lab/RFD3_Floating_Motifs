@@ -1,6 +1,8 @@
 """PotentialManager: aggregates potentials and computes timestep-decayed guide scale."""
 from __future__ import annotations
 
+import math
+
 import torch
 
 from rfd3.potentials.potentials import BasePotential
@@ -11,12 +13,18 @@ class PotentialManager:
 
     Guide scale decay schedules (t and T are noise levels):
         constant   → guide_scale
+        sqrt       → guide_scale * sqrt(t / T)
         linear     → guide_scale * (t / T)
         quadratic  → guide_scale * (t / T)^2
         cubic      → guide_scale * (t / T)^3
+        quartic    → guide_scale * (t / T)^4
+        exponential→ guide_scale * normalized exp curve from 0 to 1
+        cosine     → guide_scale * half-cosine ramp from 0 to 1
+        inverse_*  → guide_scale * (1 - matching non-inverse decay)
 
-    Since t decreases from T → 0 over the diffusion trajectory, all non-constant
+    Since t decreases from T → 0 over the diffusion trajectory, non-inverse
     schedules reduce guidance as the structure converges toward a clean sample.
+    Inverse schedules increase guidance toward the end of the trajectory.
     """
 
     def __init__(
@@ -57,16 +65,58 @@ class PotentialManager:
 
     def get_guide_scale(self, t: float, T: float) -> float:
         """Return time-decayed guide scale for current noise level t."""
+        return self.get_potential_guide_scale(None, t, T)
+
+    def get_potential_guide_scale(
+        self,
+        potential: BasePotential | None,
+        t: float,
+        T: float,
+    ) -> float:
+        """Return guide scale for a potential, honoring per-potential overrides."""
+        guide_scale = float(
+            getattr(potential, "guide_scale", self.guide_scale)
+            if potential is not None
+            else self.guide_scale
+        )
+        guide_decay = (
+            getattr(potential, "guide_decay", self.guide_decay)
+            if potential is not None
+            else self.guide_decay
+        )
         if T <= 0.0:
-            return self.guide_scale
-        ratio = t / T  # in [0, 1]; 1 at first step, ~0 at last step
-        if self.guide_decay == "constant":
-            return self.guide_scale
-        elif self.guide_decay == "linear":
-            return self.guide_scale * ratio
-        elif self.guide_decay == "quadratic":
-            return self.guide_scale * (ratio**2)
-        elif self.guide_decay == "cubic":
-            return self.guide_scale * (ratio**3)
+            return guide_scale
+        ratio = max(0.0, min(1.0, t / T))  # 1 at first step, ~0 at last step
+        decay = str(guide_decay)
+        inverse = decay.startswith("inverse_")
+        if inverse:
+            decay = decay.removeprefix("inverse_")
+
+        if decay == "constant":
+            return guide_scale
+
+        if decay == "sqrt":
+            fraction = math.sqrt(ratio)
+        elif decay == "linear":
+            fraction = ratio
+        elif decay == "quadratic":
+            fraction = ratio**2
+        elif decay == "cubic":
+            fraction = ratio**3
+        elif decay == "quartic":
+            fraction = ratio**4
+        elif decay == "exponential":
+            beta = 5.0
+            fraction = (math.exp(beta * ratio) - 1.0) / (math.exp(beta) - 1.0)
+        elif decay == "cosine":
+            fraction = 0.5 - 0.5 * math.cos(math.pi * ratio)
         else:
             return self.guide_scale
+
+        if inverse:
+            fraction = 1.0 - fraction
+        return guide_scale * fraction
+
+    def get_potential_guide_clip_rms(self, potential: BasePotential) -> float:
+        """Return RMS clip threshold for a potential."""
+        return float(getattr(potential, "guide_clip_rms", self.guide_clip_rms))

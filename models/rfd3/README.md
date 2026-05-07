@@ -62,6 +62,175 @@ For example, you can fix sequence and not structure (prediction-type task), fix 
 
 For full details on how to specify inputs, see the [input specification documentation](./docs/input.md). You can also see `foundry/models/rfd3/configs/inference_engine/rfdiffusion3.yaml` for even more options.
 
+## External Potential Guidance
+
+RFD3 includes an optional differentiable potential-guidance hook for inference. Potentials return scalar values that are maximized by gradient ascent on coordinates after each sampler step. They are disabled by default and are configured under `inference_sampler.potentials`.
+
+### Minimal configuration
+
+```yaml
+inference_sampler:
+  potentials:
+    enabled: true
+    apply_mode: atom
+    guide_scale: 0.25
+    guide_decay: quadratic
+    guide_clip_rms: 0.02
+    include_atoms: real_heavy
+    guiding_potentials:
+      - type: motif_rigid
+        weight: 2.0
+        atom_filter: backbone
+      - type: binder_ROG
+        weight: 0.5
+```
+
+Potential specs can also use RFdiffusion1-style strings:
+
+```yaml
+guiding_potentials:
+  - "type:motif_rigid,weight:2.0,atom_filter:backbone,k:0.5"
+  - "type:interface_ncontacts,weight:1.0,r_0:8.0,d_0:2.0"
+```
+
+### Top-level potential options
+
+| Option | Default | Values | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | `false` | `true`, `false` | Enables the potential adapter. If false, coordinates are unchanged. |
+| `guiding_potentials` | `[]` | list of dicts or strings | Potential specifications to parse and sum. |
+| `apply_mode` | `token_translation` | `token_translation`, `atom`, `hybrid` | How raw atom gradients are applied. `token_translation` averages guided atom gradients per token, `atom` applies raw atom gradients, and `hybrid` mixes both. |
+| `atom_guidance_fraction` | `0.25` | `0.0` to `1.0` | In `hybrid`, fraction of raw atom-level residual gradient to add to token translation. |
+| `guide_scale` | `0.25` | float | Multiplier applied after clipping and decay. |
+| `guide_decay` | `quadratic` | see below | Schedule for reducing guide scale as noise level `t` decreases from `T` to 0. |
+| `guide_clip_rms` | `0.02` | float >= 0 | RMS clip threshold before scaling. `0.0` disables guidance after clipping. Very large values effectively disable clipping. |
+| `include_atoms` | `real_heavy` | `all`, `real`, `real_heavy`, `backbone`, `CA` | Atoms that may contribute to potentials and guidance masks. |
+| `exclude_fixed_atoms` | `true` | `true`, `false` | Prevent fixed-coordinate atoms from moving. |
+| `exclude_virtual_atoms` | `true` | `true`, `false` | Prevent virtual atoms from contributing or moving. |
+| `guide_only_generated` | `true` | `true`, `false` | Restrict coordinate updates to generated/diffused atoms. |
+| `debug` | `false` | `true`, `false` | Print potential value, gradient RMS, clip factor, and scale each step. |
+
+`guide_scale`, `guide_decay`, `guide_clip_rms`, `apply_mode`, and `atom_guidance_fraction` can also be set on an individual potential. Per-potential values override the top-level defaults for that one potential only. RFD3 computes each potential gradient separately, applies that potential's clip and decay, then sums the final guidance vectors.
+
+Decay schedules use `ratio = clamp(t / T, 0, 1)`. Available `guide_decay` values are:
+
+| `guide_decay` | Scale multiplier |
+| --- | --- |
+| `constant` | `1` |
+| `sqrt` | `sqrt(ratio)` |
+| `linear` | `ratio` |
+| `quadratic` | `ratio^2` |
+| `cubic` | `ratio^3` |
+| `quartic` | `ratio^4` |
+| `exponential` | `(exp(5 * ratio) - 1) / (exp(5) - 1)` |
+| `cosine` | `0.5 - 0.5 * cos(pi * ratio)` |
+
+Each non-constant schedule also has an inverse form: `inverse_sqrt`, `inverse_linear`, `inverse_quadratic`, `inverse_cubic`, `inverse_quartic`, `inverse_exponential`, and `inverse_cosine`. Inverse decays use `1 - decay(ratio)`, so the guide scale starts near zero at high noise and becomes stronger as reverse diffusion progresses.
+
+### Registered potentials
+
+All potentials support `weight` unless noted. The value is a scalar to maximize, so attractive or preserving restraints return negative penalties.
+
+| Type | Variables | What it does |
+| --- | --- | --- |
+| `binder_ROG` | `weight=1.0` | Minimizes radius of gyration of generated non-fixed binder atoms selected by `binder_atom_mask`. |
+| `monomer_ROG` | `weight=1.0` | Minimizes radius of gyration over `potential_atom_mask`. |
+| `interface_ncontacts` | `weight=1.0`, `r_0=8.0`, `d_0=2.0` | Maximizes differentiable contacts between generated binder atoms and fixed target atoms. |
+| `monomer_contacts` | `weight=1.0`, `r_0=8.0`, `d_0=2.0` | Maximizes differentiable internal contacts among selected potential atoms, using only upper-triangle pairs. |
+| `atom_pair_distance` | `weight=1.0`, `atom_i=0`, `atom_j=1`, `target_distance=8.0` | Harmonic distance restraint on two flat atom indices. |
+| `motif_distance` | `weight=1.0`, `motif_i=0`, `motif_j=1`, `target_distance=10.0` | Harmonic center-distance restraint between two contiguous motif-token blocks. Motif blocks are inferred from contig order. |
+| `motif_bridge` | `weight=1.0`, `motif_i=0`, `motif_j=1`, `spread_weight=1.0`, `outside_weight=1.0`, `tube_weight=0.2`, `max_radius=12.0`, `atom_filter=guide`, `include_motif_atoms=false` | Encourages generated non-motif atoms to spread evenly between two motif centers. |
+| `motif_rigid` | `weight=1.0`, `k=1.0`, `loss=pseudo_huber`, `group_mode=all`, `atom_filter=potential`, `motif_i=null`, `min_separation=0` | Preserves fixed-sequence and fixed-coordinate motif geometry by matching current motif atom-pair distances to RFD3 reference coordinates. |
+
+`interface_ncontacts` and `monomer_contacts` use the soft contact function `1 / (1 + ((distance - d_0) / r_0)^6)`.
+
+### `motif_bridge` guide
+
+`motif_bridge` complements `motif_distance`. `motif_distance` moves only the motif atoms that define the two motif centers. `motif_bridge` instead acts on selected non-motif atoms, usually generated scaffold atoms, and encourages them to occupy the region between the two motif centers.
+
+It projects selected atoms onto the axis from `motif_i` to `motif_j`, sorts those projected positions, and penalizes deviation from an even spacing between 0 and 1. It also penalizes atoms outside the two motif endpoints and, optionally, atoms farther than `max_radius` from the motif-motif axis.
+
+`motif_bridge` variables:
+
+| Variable | Default | Values | Meaning |
+| --- | --- | --- | --- |
+| `weight` | `1.0` | float | Overall strength of the bridge-shaping restraint. |
+| `motif_i`, `motif_j` | `0`, `1` | integers | Contiguous motif-token block indices used as the bridge endpoints. |
+| `spread_weight` | `1.0` | float | Strength for evenly spacing selected atoms along the motif-motif axis. |
+| `outside_weight` | `1.0` | float | Strength for keeping selected atoms between the two motif centers rather than beyond them. |
+| `tube_weight` | `0.2` | float | Strength for keeping selected atoms near the inter-motif region. Set to `0.0` to disable. |
+| `max_radius` | `12.0` | float >= 0 | Allowed distance from the motif-motif axis before the tube penalty applies. |
+| `atom_filter` | `guide` | `guide`, `potential`, `binder`, `generated`, `real`, `backbone`, `CA`, `all` | Which atoms are spread between motifs. `guide` follows the final movable-atom mask. |
+| `include_motif_atoms` | `false` | `true`, `false` | If false, motif atoms are excluded so the potential acts only on non-motif bridge/scaffold atoms. |
+
+### `motif_rigid` guide
+
+`motif_rigid` is intended for conserving the secondary and tertiary structure of motifs defined in the contigs, especially motifs with fixed sequence but diffused coordinates. It uses `ref_pos` for fixed-sequence motif atoms and `motif_pos` for fixed-coordinate motif atoms when available. The default `group_mode=all` compares all motif atoms in one pairwise distance matrix, preserving both within-block geometry and distances between separate motif blocks. Use `group_mode=blocks` to preserve each contiguous motif block independently.
+
+`motif_rigid` variables:
+
+| Variable | Default | Values | Meaning |
+| --- | --- | --- | --- |
+| `weight` | `1.0` | float | Strength of the motif geometry restraint. |
+| `k` | `1.0` | float > 0 | Pseudo-Huber transition scale in Angstroms; smaller values are stricter near the reference. |
+| `loss` | `pseudo_huber` | `pseudo_huber`, `mse`, `l1` | Pair-distance loss. `pseudo_huber` is robust but still strict near zero error. `mse` is strongest against outliers. |
+| `group_mode` | `all` | `all`, `blocks` | `all` preserves inter-motif tertiary distances; `blocks` preserves each motif block internally. |
+| `atom_filter` | `potential` | `potential`, `all`, `backbone`, `CA`, `real` | Potential-specific atom subset. `potential` follows top-level `include_atoms`; `backbone` is usually a good strict-but-stable motif setting. |
+| `motif_i` | `null` | integer or null | With `group_mode=blocks`, restrain only one contiguous motif block by index. |
+| `min_separation` | `0` | integer >= 0 | Ignore atom pairs whose selected-atom index separation is smaller than this value. |
+
+Example fixed-sequence motif conservation:
+
+```yaml
+inference_sampler:
+  potentials:
+    enabled: true
+    apply_mode: atom
+    guide_scale: 0.2
+    guide_decay: inverse_cosine
+    guide_clip_rms: 0.03
+    include_atoms: real_heavy
+    guiding_potentials:
+      - type: motif_distance
+        weight: 50.0
+        guide_scale: 0.5
+        guide_decay: inverse_linear
+        guide_clip_rms: 0.05
+        motif_i: 0
+        motif_j: 1
+        target_distance: 50.0
+      - type: motif_bridge
+        weight: 5.0
+        guide_scale: 0.5
+        guide_decay: inverse_linear
+        guide_clip_rms: 0.05
+        motif_i: 0
+        motif_j: 1
+        spread_weight: 1.0
+        outside_weight: 1.0
+        tube_weight: 0.2
+        max_radius: 12.0
+        atom_filter: guide
+      - type: motif_rigid
+        weight: 1000.0
+        guide_scale: 1.0
+        guide_decay: inverse_cosine
+        guide_clip_rms: 0.05
+        atom_filter: backbone
+        k: 0.25
+        loss: pseudo_huber
+        group_mode: all
+```
+
+Equivalent string spec:
+
+```yaml
+guiding_potentials:
+  - "type:motif_distance,weight:50.0,guide_scale:0.5,guide_decay:inverse_linear,guide_clip_rms:0.05,motif_i:0,motif_j:1,target_distance:50.0"
+  - "type:motif_bridge,weight:5.0,guide_scale:0.5,guide_decay:inverse_linear,guide_clip_rms:0.05,motif_i:0,motif_j:1,spread_weight:1.0,outside_weight:1.0,tube_weight:0.2,max_radius:12.0,atom_filter:guide"
+  - "type:motif_rigid,weight:1000.0,guide_scale:1.0,guide_decay:inverse_cosine,guide_clip_rms:0.05,atom_filter:backbone,k:0.25,loss:pseudo_huber,group_mode:all"
+```
+
 ## Further example JSONs for different applications
 Additional examples are broken up by use case. If you have cloned the
 repository, matching `.json` files are in `foundry/models/rfd3/docs/examples`

@@ -22,7 +22,9 @@ from rfd3.potentials.potentials import (
     BasePotential,
     BinderROG,
     InterfaceNContacts,
+    MotifBridge,
     MotifDistance,
+    MotifRigid,
     MonomerROG,
 )
 
@@ -369,6 +371,51 @@ def test_atom_mode_uses_raw_atom_gradients():
     assert torch.allclose(guidance, coeff, atol=1e-6)
 
 
+@pytest.mark.fast
+def test_per_potential_guidance_overrides_are_applied_separately():
+    """Each potential may override guide_scale and guide_clip_rms independently."""
+    f = _make_f(n_atoms=2, n_tokens=2, n_fixed=0, n_virtual=0)
+    config = PotentialsConfig(
+        enabled=True,
+        include_atoms="real",
+        exclude_fixed_atoms=False,
+        exclude_virtual_atoms=False,
+        guide_only_generated=False,
+        guide_scale=99.0,
+        guide_decay="constant",
+        guide_clip_rms=1e6,
+    )
+    masks = build_masks(f, config)
+    coeff_x = torch.tensor([[[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]])
+    coeff_y = torch.tensor([[[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]])
+    pot_x = LinearPotential(coeff_x)
+    pot_y = LinearPotential(coeff_y)
+    pot_x.guide_scale = 2.0
+    pot_y.guide_scale = 0.5
+    pot_x.guide_clip_rms = 1e6
+    pot_y.guide_clip_rms = 1e6
+    manager = _make_manager(
+        [pot_x, pot_y],
+        guide_scale=99.0,
+        guide_decay="constant",
+        guide_clip_rms=1e6,
+    )
+
+    guidance, _ = compute_potential_guidance(
+        xyz_t=torch.zeros(1, 2, 3),
+        potential_manager=manager,
+        t=1.0,
+        T=1.0,
+        masks=masks,
+        metadata={"atom_to_token_map": f["atom_to_token_map"]},
+        apply_mode="atom",
+        atom_guidance_fraction=0.0,
+    )
+
+    expected = coeff_x * 2.0 + coeff_y * 0.5
+    assert torch.allclose(guidance, expected, atol=1e-6)
+
+
 # ─── test 7: hybrid(fraction=0) matches token_translation ────────────────────
 
 
@@ -452,7 +499,10 @@ def test_hybrid_fraction_one_matches_atom_mode():
 
 
 @pytest.mark.fast
-@pytest.mark.parametrize("decay", ["linear", "quadratic", "cubic"])
+@pytest.mark.parametrize(
+    "decay",
+    ["sqrt", "linear", "quadratic", "cubic", "quartic", "exponential", "cosine"],
+)
 def test_guide_decay_is_monotone(decay):
     """Scale should decrease as t decreases from T (non-constant decays)."""
     manager = _make_manager([], guide_scale=1.0, guide_decay=decay)
@@ -462,6 +512,31 @@ def test_guide_decay_is_monotone(decay):
     for i in range(len(scales) - 1):
         assert scales[i] >= scales[i + 1], (
             f"{decay}: scale should decrease as t decreases; got {scales}"
+        )
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize(
+    "decay",
+    [
+        "inverse_sqrt",
+        "inverse_linear",
+        "inverse_quadratic",
+        "inverse_cubic",
+        "inverse_quartic",
+        "inverse_exponential",
+        "inverse_cosine",
+    ],
+)
+def test_inverse_guide_decay_is_monotone(decay):
+    """Inverse schedules should strengthen as t decreases from T."""
+    manager = _make_manager([], guide_scale=1.0, guide_decay=decay)
+    T = 10.0
+    ts = [10.0, 7.0, 4.0, 1.0, 0.1]
+    scales = [manager.get_guide_scale(t, T) for t in ts]
+    for i in range(len(scales) - 1):
+        assert scales[i] <= scales[i + 1], (
+            f"{decay}: scale should increase as t decreases; got {scales}"
         )
 
 
@@ -475,6 +550,16 @@ def test_parsing_dict_and_string():
         {"type": "binder_ROG", "weight": 2.0},
         {"type": "interface_ncontacts", "weight": 0.5, "r_0": 6.0, "d_0": 1.5},
         {"type": "motif_distance", "weight": 1.5, "motif_i": 0, "motif_j": 1, "target_distance": 12.0},
+        {"type": "motif_bridge", "weight": 4.0, "motif_i": 0, "motif_j": 1, "max_radius": 8.0},
+        {
+            "type": "motif_rigid",
+            "weight": 3.0,
+            "k": 0.5,
+            "loss": "mse",
+            "guide_scale": 2.0,
+            "guide_decay": "inverse_linear",
+            "guide_clip_rms": 0.01,
+        },
     ]
     pots_dict = parse_potentials(specs_dict)
     assert isinstance(pots_dict[0], BinderROG)
@@ -483,11 +568,20 @@ def test_parsing_dict_and_string():
     assert pots_dict[1].r_0 == 6.0
     assert isinstance(pots_dict[2], MotifDistance)
     assert pots_dict[2].target_distance == 12.0
+    assert isinstance(pots_dict[3], MotifBridge)
+    assert pots_dict[3].max_radius == 8.0
+    assert isinstance(pots_dict[4], MotifRigid)
+    assert pots_dict[4].k == 0.5
+    assert pots_dict[4].guide_scale == 2.0
+    assert pots_dict[4].guide_decay == "inverse_linear"
+    assert pots_dict[4].guide_clip_rms == 0.01
 
     specs_str = [
         "type:binder_ROG,weight:2.0",
         "type:interface_ncontacts,weight:0.5,r_0:6.0,d_0:1.5",
         "type:motif_distance,weight:1.5,motif_i:0,motif_j:1,target_distance:12.0",
+        "type:motif_bridge,weight:4.0,motif_i:0,motif_j:1,max_radius:8.0",
+        "type:motif_rigid,weight:3.0,k:0.5,loss:mse,guide_scale:2.0,guide_decay:inverse_linear,guide_clip_rms:0.01",
     ]
     pots_str = parse_potentials(specs_str)
     assert isinstance(pots_str[0], BinderROG)
@@ -496,6 +590,25 @@ def test_parsing_dict_and_string():
     assert pots_str[1].r_0 == 6.0
     assert isinstance(pots_str[2], MotifDistance)
     assert pots_str[2].target_distance == 12.0
+    assert isinstance(pots_str[3], MotifBridge)
+    assert pots_str[3].max_radius == 8.0
+    assert isinstance(pots_str[4], MotifRigid)
+    assert pots_str[4].loss == "mse"
+    assert pots_str[4].guide_scale == 2.0
+    assert pots_str[4].guide_decay == "inverse_linear"
+    assert pots_str[4].guide_clip_rms == 0.01
+
+
+@pytest.mark.fast
+def test_per_potential_invalid_guide_decay_raises():
+    """Per-potential guide_decay should be validated during parsing."""
+    with pytest.raises(ValueError, match="guide_decay"):
+        parse_potentials([
+            {
+                "type": "motif_rigid",
+                "guide_decay": "pseudo_huber",
+            }
+        ])
 
 
 @pytest.mark.fast
@@ -548,6 +661,48 @@ def test_motif_distance_scalar_to_maximize():
 
 
 @pytest.mark.fast
+def test_motif_distance_uses_unfixed_motif_atoms():
+    """motif_distance must still work when motif atoms are diffused coordinates."""
+    f = {
+        "atom_to_token_map": torch.tensor([0, 1, 2, 3]),
+        "is_motif_atom_with_fixed_coord": torch.zeros(4, dtype=torch.bool),
+        "is_motif_atom_with_fixed_seq": torch.tensor([True, True, False, True]),
+        "is_motif_atom_unindexed": torch.zeros(4, dtype=torch.bool),
+        "is_virtual": torch.zeros(4, dtype=torch.bool),
+        "is_ca": torch.ones(4, dtype=torch.bool),
+        "is_backbone": torch.zeros(4, dtype=torch.bool),
+    }
+    config = PotentialsConfig(
+        enabled=True,
+        include_atoms="CA",
+        exclude_fixed_atoms=True,
+        exclude_virtual_atoms=True,
+        guide_only_generated=True,
+    )
+    masks = build_masks(f, config)
+    pot = MotifDistance(
+        weight=2.0,
+        motif_i=0,
+        motif_j=1,
+        target_distance=3.0,
+    )
+    xyz = torch.tensor([[
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [99.0, 0.0, 0.0],
+        [5.0, 0.0, 0.0],
+    ]], requires_grad=True)
+
+    value = pot.compute(xyz, masks, metadata={"atom_to_token_map": f["atom_to_token_map"]})
+    value.backward()
+
+    assert value.ndim == 0
+    assert torch.allclose(value.detach(), torch.tensor(-8.0))
+    assert xyz.grad is not None
+    assert xyz.grad.abs().sum().item() > 0.0
+
+
+@pytest.mark.fast
 def test_motif_distance_guidance_moves_toward_target_distance():
     """A small motif_distance guidance step should reduce the distance error."""
     f = {
@@ -596,6 +751,163 @@ def test_motif_distance_guidance_moves_toward_target_distance():
     dist_after = (xyz_new[:, :2, :].mean(dim=1) - xyz_new[:, 3, :]).norm(dim=-1)
 
     assert (dist_after - 3.0).abs() < (dist_before - 3.0).abs()
+
+
+@pytest.mark.fast
+def test_motif_bridge_guidance_moves_scaffold_between_motifs():
+    """motif_bridge should move generated non-motif atoms toward the motif span."""
+    f = {
+        "atom_to_token_map": torch.tensor([0, 1, 2]),
+        "is_motif_atom_with_fixed_coord": torch.tensor([True, False, True]),
+        "is_virtual": torch.zeros(3, dtype=torch.bool),
+        "is_ca": torch.ones(3, dtype=torch.bool),
+        "is_backbone": torch.ones(3, dtype=torch.bool),
+    }
+    config = PotentialsConfig(
+        enabled=True,
+        include_atoms="CA",
+        exclude_fixed_atoms=True,
+        exclude_virtual_atoms=True,
+        guide_only_generated=True,
+        guide_scale=1.0,
+        guide_decay="constant",
+        guide_clip_rms=1e6,
+    )
+    masks = build_masks(f, config)
+    manager = _make_manager(
+        [
+            MotifBridge(
+                weight=1.0,
+                motif_i=0,
+                motif_j=1,
+                spread_weight=1.0,
+                outside_weight=1.0,
+                tube_weight=0.0,
+            )
+        ],
+        guide_clip_rms=1e6,
+    )
+    xyz = torch.tensor([[
+        [0.0, 0.0, 0.0],
+        [20.0, 0.0, 0.0],
+        [10.0, 0.0, 0.0],
+    ]])
+
+    guidance, _ = compute_potential_guidance(
+        xyz_t=xyz,
+        potential_manager=manager,
+        t=1.0,
+        T=1.0,
+        masks=masks,
+        metadata={"atom_to_token_map": f["atom_to_token_map"]},
+        apply_mode="atom",
+        atom_guidance_fraction=0.0,
+    )
+    xyz_new = xyz + 0.1 * guidance
+
+    assert xyz_new[0, 1, 0] < xyz[0, 1, 0]
+    assert guidance[:, f["is_motif_atom_with_fixed_coord"], :].abs().max().item() == 0.0
+
+
+@pytest.mark.fast
+def test_motif_rigid_penalizes_distorted_fixed_seq_motif():
+    """motif_rigid compares current motif distances to ref_pos distances."""
+    f = {
+        "atom_to_token_map": torch.tensor([0, 1, 2]),
+        "is_motif_atom_with_fixed_coord": torch.zeros(3, dtype=torch.bool),
+        "is_motif_atom_with_fixed_seq": torch.ones(3, dtype=torch.bool),
+        "is_virtual": torch.zeros(3, dtype=torch.bool),
+        "is_ca": torch.ones(3, dtype=torch.bool),
+        "is_backbone": torch.ones(3, dtype=torch.bool),
+    }
+    config = PotentialsConfig(
+        enabled=True,
+        include_atoms="CA",
+        exclude_fixed_atoms=True,
+        exclude_virtual_atoms=True,
+        guide_only_generated=True,
+    )
+    masks = build_masks(f, config)
+    metadata = {
+        "atom_to_token_map": f["atom_to_token_map"],
+        "ref_pos": torch.tensor([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]),
+        "is_motif_atom_with_fixed_seq": f["is_motif_atom_with_fixed_seq"],
+    }
+    xyz = torch.tensor([[
+        [0.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ]])
+    pot = MotifRigid(weight=2.0, loss="mse")
+
+    value = pot.compute(xyz, masks, metadata)
+
+    assert value.ndim == 0
+    assert value.item() < 0.0
+
+
+@pytest.mark.fast
+def test_motif_rigid_guidance_reduces_distance_geometry_error():
+    """A small motif_rigid step should move distorted motif distances toward ref_pos."""
+    f = {
+        "atom_to_token_map": torch.tensor([0, 1, 2]),
+        "is_motif_atom_with_fixed_coord": torch.zeros(3, dtype=torch.bool),
+        "is_motif_atom_with_fixed_seq": torch.ones(3, dtype=torch.bool),
+        "is_virtual": torch.zeros(3, dtype=torch.bool),
+        "is_ca": torch.ones(3, dtype=torch.bool),
+        "is_backbone": torch.ones(3, dtype=torch.bool),
+    }
+    config = PotentialsConfig(
+        enabled=True,
+        include_atoms="CA",
+        exclude_fixed_atoms=True,
+        exclude_virtual_atoms=True,
+        guide_only_generated=True,
+        guide_scale=1.0,
+        guide_decay="constant",
+        guide_clip_rms=1e6,
+    )
+    masks = build_masks(f, config)
+    ref_pos = torch.tensor([
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ])
+    metadata = {
+        "atom_to_token_map": f["atom_to_token_map"],
+        "ref_pos": ref_pos,
+        "is_motif_atom_with_fixed_seq": f["is_motif_atom_with_fixed_seq"],
+    }
+    xyz = torch.tensor([[
+        [0.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ]])
+    manager = _make_manager([MotifRigid(weight=1.0, loss="mse")], guide_clip_rms=1e6)
+
+    guidance, _ = compute_potential_guidance(
+        xyz_t=xyz,
+        potential_manager=manager,
+        t=1.0,
+        T=1.0,
+        masks=masks,
+        metadata=metadata,
+        apply_mode="atom",
+        atom_guidance_fraction=0.0,
+    )
+    xyz_new = xyz + 0.1 * guidance
+
+    def geometry_error(coords):
+        dcur = torch.cdist(coords, coords)
+        dref = torch.cdist(ref_pos[None, :, :], ref_pos[None, :, :])
+        upper = torch.triu(torch.ones(3, 3, dtype=torch.bool), diagonal=1)
+        return (dcur[:, upper] - dref[:, upper]).pow(2).mean()
+
+    assert geometry_error(xyz_new) < geometry_error(xyz)
 
 
 # ─── test 10: build_potential_adapter returns None when disabled ───────────────

@@ -73,84 +73,138 @@ def compute_potential_guidance(
             f"{guide_atom_mask.shape[0]} != {xyz_t.shape[1]}"
         )
 
-    # ── 1-4: compute gradients via autograd ──────────────────────────────────
-    # torch.enable_grad() temporarily overrides any outer torch.no_grad() context.
-    # We exit the context before returning, so the sampler's grad-disabled
-    # assertions at the top of the next loop iteration still pass.
-    with torch.enable_grad():
-        xyz_for_grad = xyz_t.detach().clone().requires_grad_(True)
-        potential_value = potential_manager.compute_all_potentials(
-            xyz=xyz_for_grad,
+    total_guidance = torch.zeros_like(xyz_t)
+    total_potential_value = xyz_t.new_zeros(())
+    raw_grad_rms_values: list[float] = []
+    potential_debug: list[dict] = []
+
+    for potential in potential_manager.potentials:
+        potential_value, atom_grad = _potential_atom_gradient(
+            potential=potential,
+            xyz_t=xyz_t,
             masks=masks,
             metadata=metadata,
         )
-        if not potential_value.requires_grad:
-            return torch.zeros_like(xyz_t), {}
-        potential_value.backward()
-        if xyz_for_grad.grad is None:
-            return torch.zeros_like(xyz_t), {}
-        atom_grad = xyz_for_grad.grad.clone()  # [D, L, 3]
+        if atom_grad is None:
+            continue
+        total_potential_value = total_potential_value + potential_value.detach()
 
-    # ── 5: sanitize NaN / inf ────────────────────────────────────────────────
-    atom_grad = torch.nan_to_num(atom_grad, nan=0.0, posinf=0.0, neginf=0.0)
+        atom_grad = torch.nan_to_num(atom_grad, nan=0.0, posinf=0.0, neginf=0.0)
+        atom_grad = atom_grad * guide_atom_mask[None, :, None].to(dtype=atom_grad.dtype)
+        raw_grad_rms = _rms_over_mask(atom_grad, guide_atom_mask)
+        raw_grad_rms_values.append(raw_grad_rms)
 
-    # ── 6: zero out non-guided atoms ─────────────────────────────────────────
-    atom_grad = atom_grad * guide_atom_mask[None, :, None].to(dtype=atom_grad.dtype)
-    raw_grad_rms = _rms_over_mask(atom_grad, guide_atom_mask)
-
-    # ── 7: reduce / apply by mode ────────────────────────────────────────────
-    if apply_mode == "token_translation":
-        # Preferred stable mode: one rigid translation per residue/token.
-        # atom_grad (per-atom) → token mean → broadcast back to atoms.
-        guidance_unscaled = _token_translation(
-            atom_grad, atom_to_token_map, n_tokens, guide_atom_mask
+        potential_apply_mode = getattr(potential, "apply_mode", apply_mode)
+        potential_atom_fraction = float(
+            getattr(potential, "atom_guidance_fraction", atom_guidance_fraction)
+        )
+        guidance_unscaled = _apply_guidance_mode(
+            atom_grad=atom_grad,
+            atom_to_token_map=atom_to_token_map,
+            n_tokens=n_tokens,
+            guide_atom_mask=guide_atom_mask,
+            apply_mode=potential_apply_mode,
+            atom_guidance_fraction=potential_atom_fraction,
         )
 
-    elif apply_mode == "atom":
-        # Direct all-atom mode: raw masked gradients.
-        # Allows per-atom distortions — use smaller scale/clip defaults.
-        guidance_unscaled = atom_grad
+        clip_factor = 1.0
+        clip_rms = potential_manager.get_potential_guide_clip_rms(potential)
+        if bool(guide_atom_mask.any()):
+            rms = _rms_over_mask(guidance_unscaled, guide_atom_mask)
+            if clip_rms == 0.0:
+                clip_factor = 0.0
+                guidance_unscaled = torch.zeros_like(guidance_unscaled)
+            elif rms > 1e-12:
+                clip_factor = min(1.0, clip_rms / float(rms))
+                guidance_unscaled = guidance_unscaled * clip_factor
 
-    elif apply_mode == "hybrid":
-        # token_component  = per-token rigid translation (same as token_translation)
-        # internal_component = residual after removing rigid translation,
-        #                      i.e. within-token deformations (torsion / angle changes)
-        # hybrid blends both; atom_guidance_fraction=0 → pure token_translation
-        token_component = _token_translation(
-            atom_grad, atom_to_token_map, n_tokens, guide_atom_mask
-        )
-        internal_component = atom_grad - token_component
-        guidance_unscaled = token_component + atom_guidance_fraction * internal_component
+        scale = potential_manager.get_potential_guide_scale(potential, t, T)
+        guidance = guidance_unscaled * scale
+        total_guidance = total_guidance + guidance
 
-    else:
-        raise ValueError(f"Unknown apply_mode: {apply_mode!r}")
+        if potential_manager.debug:
+            potential_debug.append(
+                {
+                    "type": type(potential).__name__,
+                    "value": round(float(potential_value.detach()), 6),
+                    "guide_scale": round(scale, 6),
+                    "guide_decay": getattr(
+                        potential, "guide_decay", potential_manager.guide_decay
+                    ),
+                    "guide_clip_rms": round(clip_rms, 6),
+                    "clip_factor": round(clip_factor, 6),
+                    "apply_mode": potential_apply_mode,
+                    "raw_atom_grad_rms": round(raw_grad_rms, 6),
+                    "final_guidance_rms": round(
+                        _rms_over_mask(guidance, guide_atom_mask), 6
+                    ),
+                }
+            )
 
-    # ── 8: clip by RMS over guided atoms ─────────────────────────────────────
-    if bool(guide_atom_mask.any()):
-        rms = _rms_over_mask(guidance_unscaled, guide_atom_mask)
-        if potential_manager.guide_clip_rms == 0.0:
-            guidance_unscaled = torch.zeros_like(guidance_unscaled)
-        elif rms > 1e-12:
-            clip_factor = min(1.0, float(potential_manager.guide_clip_rms) / float(rms))
-            guidance_unscaled = guidance_unscaled * clip_factor
-
-    # ── 9: scale by time-decayed guide scale ─────────────────────────────────
-    scale = potential_manager.get_guide_scale(t, T)
-    guidance = guidance_unscaled * scale
+    guidance = total_guidance
 
     # ── debug ─────────────────────────────────────────────────────────────────
     debug_dict: dict = {}
     if potential_manager.debug:
         debug_dict = {
             "t": round(t, 4),
-            "potential_value": round(float(potential_value.detach()), 6),
-            "guide_scale": round(scale, 6),
-            "raw_atom_grad_rms": round(raw_grad_rms, 6),
+            "potential_value": round(float(total_potential_value), 6),
+            "raw_atom_grad_rms": round(max(raw_grad_rms_values, default=0.0), 6),
             "final_guidance_rms": round(_rms_over_mask(guidance, guide_atom_mask), 6),
             "n_guided_atoms": int(guide_atom_mask.sum().item()),
+            "potentials": potential_debug,
         }
 
     return guidance, debug_dict
+
+
+def _potential_atom_gradient(
+    potential,
+    xyz_t: torch.Tensor,
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Compute one potential and return its atom-level gradient."""
+    with torch.enable_grad():
+        xyz_for_grad = xyz_t.detach().clone().requires_grad_(True)
+        potential_value = potential.compute(
+            xyz=xyz_for_grad,
+            masks=masks,
+            metadata=metadata,
+        )
+        if not potential_value.requires_grad:
+            return potential_value, None
+        potential_value.backward()
+        if xyz_for_grad.grad is None:
+            return potential_value, None
+        return potential_value, xyz_for_grad.grad.clone()
+
+
+def _apply_guidance_mode(
+    atom_grad: torch.Tensor,
+    atom_to_token_map: torch.Tensor,
+    n_tokens: int,
+    guide_atom_mask: torch.Tensor,
+    apply_mode: str,
+    atom_guidance_fraction: float,
+) -> torch.Tensor:
+    """Reduce raw atom gradients according to the configured application mode."""
+    if apply_mode == "token_translation":
+        return _token_translation(
+            atom_grad, atom_to_token_map, n_tokens, guide_atom_mask
+        )
+
+    if apply_mode == "atom":
+        return atom_grad
+
+    if apply_mode == "hybrid":
+        token_component = _token_translation(
+            atom_grad, atom_to_token_map, n_tokens, guide_atom_mask
+        )
+        internal_component = atom_grad - token_component
+        return token_component + atom_guidance_fraction * internal_component
+
+    raise ValueError(f"Unknown apply_mode: {apply_mode!r}")
 
 
 def _token_translation(

@@ -7,6 +7,8 @@ RFD3 atom representation is atom14 + CCD atoms, where:
   - No explicit hydrogen atoms in atom14 (all non-virtual atoms are heavy atoms)
   - is_motif_atom_with_fixed_coord  → fixed-coordinate atoms (motif / target chain)
   - ~is_motif_atom_with_fixed_coord → generated/diffused atoms (binder / de novo chain)
+  - motif atoms are atoms with any motif conditioning: fixed coord, fixed seq,
+    unindexed, or an explicit is_motif_atom feature when present.
 
 Binder / target split:
   Generated atoms ≈ binder  (not fixed, not virtual)
@@ -34,6 +36,9 @@ def build_masks(f: dict, config: PotentialsConfig) -> dict[str, torch.Tensor]:
 
     is_virtual = _get_bool_feature(f, "is_virtual", L, device)
     is_fixed = _as_bool_tensor(fixed_source, L, device)
+    is_fixed_seq = _get_bool_feature(f, "is_motif_atom_with_fixed_seq", L, device)
+    is_unindexed = _get_bool_feature(f, "is_motif_atom_unindexed", L, device)
+    explicit_motif = _get_bool_feature(f, "is_motif_atom", L, device)
     is_backbone = _get_bool_feature(f, "is_backbone", L, device)
     is_ca = _get_bool_feature(f, "is_ca", L, device)
     is_hydrogen = _infer_hydrogen_mask(f, L, device)
@@ -42,6 +47,7 @@ def build_masks(f: dict, config: PotentialsConfig) -> dict[str, torch.Tensor]:
     virtual_atom_mask = is_virtual
     fixed_atom_mask = is_fixed
     generated_atom_mask = ~is_fixed
+    motif_atom_mask = is_fixed | is_fixed_seq | is_unindexed | explicit_motif
 
     # Base selection from include_atoms
     include = config.include_atoms
@@ -84,8 +90,11 @@ def build_masks(f: dict, config: PotentialsConfig) -> dict[str, torch.Tensor]:
         "real_atom_mask": real_atom_mask,
         "virtual_atom_mask": virtual_atom_mask,
         "fixed_atom_mask": fixed_atom_mask,
+        "fixed_seq_atom_mask": is_fixed_seq,
         "generated_atom_mask": generated_atom_mask,
         "diffused_atom_mask": generated_atom_mask,  # alias
+        "unindexed_motif_atom_mask": is_unindexed,
+        "motif_atom_mask": motif_atom_mask,
         "binder_atom_mask": binder_atom_mask,
         "target_atom_mask": target_atom_mask,
         # Ligand mask is a placeholder; RFD3 does not expose a separate ligand flag

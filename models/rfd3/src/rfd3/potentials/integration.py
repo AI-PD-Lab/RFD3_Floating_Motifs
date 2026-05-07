@@ -8,6 +8,7 @@ real_atom_mask    ← ~f["is_virtual"]           shape [L]  bool
 virtual_atom_mask ← f["is_virtual"]            shape [L]  bool
 fixed_atom_mask   ← f["is_motif_atom_with_fixed_coord"]   shape [L]  bool
 generated_mask    ← ~f["is_motif_atom_with_fixed_coord"]  shape [L]  bool
+motif_mask       ← any motif conditioning, not only fixed coordinates
 backbone_mask     ← f["is_backbone"]           shape [L]  bool
 ca_mask           ← f["is_ca"]                 shape [L]  bool
 binder_mask       ← generated_mask & real_mask (generated non-virtual atoms)
@@ -48,12 +49,14 @@ class RFD3PotentialAdapter:
         # Build masks once (they depend only on f, which is static across steps)
         self.masks = build_masks(f, config)
 
-        # Only atom_to_token_map is needed at guidance time (token reduction)
         atom_to_token_map = f["atom_to_token_map"]
         self.metadata: dict = {
             "atom_to_token_map": atom_to_token_map,
             "n_tokens": int(atom_to_token_map.max().item()) + 1,
         }
+        for key in ("ref_pos", "motif_pos", "is_motif_atom_with_fixed_seq"):
+            if key in f:
+                self.metadata[key] = f[key]
 
         potentials = parse_potentials(config.guiding_potentials)
         self.manager = PotentialManager(
@@ -129,10 +132,14 @@ class RFD3PotentialAdapter:
     @staticmethod
     def extract_metadata(f: dict) -> dict:
         atom_to_token_map = f["atom_to_token_map"]
-        return {
+        metadata = {
             "atom_to_token_map": atom_to_token_map,
             "n_tokens": int(atom_to_token_map.max().item()) + 1,
         }
+        for key in ("ref_pos", "motif_pos", "is_motif_atom_with_fixed_seq"):
+            if key in f:
+                metadata[key] = f[key]
+        return metadata
 
     @staticmethod
     def add_guidance_to_xyz_next(

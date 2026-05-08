@@ -201,7 +201,12 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
         if self.potentials:
             from rfd3.potentials.integration import build_potential_adapter
 
-            potential_adapter = build_potential_adapter(self.potentials, f)
+            potential_adapter = build_potential_adapter(
+                self.potentials,
+                f,
+                input_pos=coord_atom_lvl_to_be_noised,
+                floating_motif_refs=floating_motif_refs,
+            )
             if potential_adapter is not None:
                 ranked_logger.info(
                     f"[potentials] enabled - mode={potential_adapter.config.apply_mode}, "
@@ -359,7 +364,12 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             # iteration so the grad-disabled assertions at the top of the loop
             # still pass.  The returned X_L is always detached.
             if potential_adapter is not None:
-                X_L = potential_adapter.apply(X_L, t=t_hat, T=float(noise_schedule[0]))
+                X_L = potential_adapter.apply(
+                    X_L,
+                    t=t_hat,
+                    T=float(noise_schedule[0]),
+                    step_idx=step_num,
+                )
             if should_project_floating_motifs(
                 step_num,
                 enabled=self.floating_motif_project,
@@ -475,7 +485,12 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
         if self.potentials:
             from rfd3.potentials.integration import build_potential_adapter
 
-            potential_adapter = build_potential_adapter(self.potentials, f)
+            potential_adapter = build_potential_adapter(
+                self.potentials,
+                f,
+                input_pos=coord_atom_lvl_to_be_noised,
+                floating_motif_refs=floating_motif_refs,
+            )
             if potential_adapter is not None:
                 ranked_logger.info(
                     f"[potentials] enabled (symmetry sampler) - "
@@ -598,7 +613,12 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
 
             # potential guidance hook
             if potential_adapter is not None:
-                X_L = potential_adapter.apply(X_L, t=t_hat, T=float(noise_schedule[0]))
+                X_L = potential_adapter.apply(
+                    X_L,
+                    t=t_hat,
+                    T=float(noise_schedule[0]),
+                    step_idx=step_num,
+                )
             if should_project_floating_motifs(
                 step_num,
                 enabled=self.floating_motif_project,

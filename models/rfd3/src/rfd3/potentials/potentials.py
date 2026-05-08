@@ -225,6 +225,519 @@ class MotifDistance(BasePotential):
         return transformed
 
 
+class MotifInternalRotation(BasePotential):
+    """Bias one motif block toward a target rigid rotation from its input-PDB pose.
+
+    Zero angles reproduce the input-PDB motif orientation. The target is defined
+    around the motif COM, so this potential affects internal rigid rotation
+    without prescribing motif translation. The guidance is rigidized to pure
+    rotation, so all atoms in the motif move as one body.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_i: int = 0,
+        angle_x: float = 0.0,
+        angle_y: float = 0.0,
+        angle_z: float = 0.0,
+    ):
+        super().__init__(weight)
+        self.motif_i = int(motif_i)
+        self.angle_x = float(angle_x)
+        self.angle_y = float(angle_y)
+        self.angle_z = float(angle_z)
+
+    def compute(self, xyz, masks, metadata):
+        block_mask = _single_motif_block_mask(
+            self.motif_i,
+            masks=masks,
+            metadata=metadata,
+            device=xyz.device,
+        )
+        if block_mask is None:
+            return xyz.new_zeros(())
+
+        current_xyz, ref_xyz = _motif_block_current_and_reference_xyz(
+            xyz, masks, metadata, block_mask
+        )
+        if current_xyz is None or ref_xyz is None or ref_xyz.shape[0] < 3:
+            return xyz.new_zeros(())
+
+        ref_centered = ref_xyz - ref_xyz.mean(dim=0, keepdim=True)
+        current_centered = current_xyz - current_xyz.mean(dim=1, keepdim=True)
+        target_rotation = _euler_rotation_matrix_deg(
+            self.angle_x,
+            self.angle_y,
+            self.angle_z,
+            device=xyz.device,
+            dtype=xyz.dtype,
+        )
+        target_xyz = _apply_row_rotation(ref_centered, target_rotation)
+        diff = current_centered - target_xyz.unsqueeze(0)
+        return -self.weight * diff.pow(2).sum(dim=-1).mean()
+
+    def guide_atom_mask(self, masks, metadata, device):
+        block_mask = _single_motif_block_mask(
+            self.motif_i,
+            masks=masks,
+            metadata=metadata,
+            device=device,
+        )
+        if block_mask is None:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        return block_mask
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        block_mask = _single_motif_block_mask(
+            self.motif_i,
+            masks=masks,
+            metadata=metadata,
+            device=xyz.device,
+        )
+        if block_mask is None or block_mask.sum().item() < 3:
+            return torch.zeros_like(atom_grad)
+
+        transformed = torch.zeros_like(atom_grad)
+        transformed[:, block_mask, :] = _project_gradient_to_rigid_body(
+            atom_grad[:, block_mask, :],
+            xyz[:, block_mask, :],
+            allow_translation=False,
+            allow_rotation=True,
+        )
+        return transformed
+
+
+class MotifRelativePose(BasePotential):
+    """Bias a motif-pair plane relative to the input-PDB origin.
+
+    RFD3 recenters inference coordinates before initialization, so the origin is
+    the input protein/motif COM in that centered coordinate system. This
+    potential uses the origin plus the two motif COMs as a three-point angular
+    pose. Zero angles reproduce the input-PDB motif COM rays from the origin;
+    nonzero Euler angles rotate that reference triangle/plane around the origin.
+
+    The loss compares normalized directions of the non-degenerate triangle edges
+    (origin→motif_i, origin→motif_j, motif_i→motif_j), so it controls angular
+    pose without directly caring about motif distance from the origin or
+    inter-motif distance. If one motif COM sits exactly at the origin, the
+    remaining nonzero edge directions still provide guidance. Guidance is
+    rigidized to pure block translations.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_i: int = 0,
+        motif_j: int = 1,
+        angle_x: float = 0.0,
+        angle_y: float = 0.0,
+        angle_z: float = 0.0,
+    ):
+        super().__init__(weight)
+        self.motif_i = int(motif_i)
+        self.motif_j = int(motif_j)
+        self.angle_x = float(angle_x)
+        self.angle_y = float(angle_y)
+        self.angle_z = float(angle_z)
+        self.skip_reason: str | None = None
+        self.skip_detail: dict | None = None
+
+    def compute(self, xyz, masks, metadata):
+        self.skip_reason = None
+        self.skip_detail = None
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        self.skip_detail = {
+            "motif_i": self.motif_i,
+            "motif_j": self.motif_j,
+            "n_motif_blocks": len(motif_blocks),
+            "has_floating_motif_reference_pos": "floating_motif_reference_pos"
+            in metadata,
+            "has_input_pos": "input_pos" in metadata,
+            "has_motif_pos": "motif_pos" in metadata,
+            "has_ref_pos": "ref_pos" in metadata,
+        }
+        block_i = (
+            motif_blocks[self.motif_i]
+            if 0 <= self.motif_i < len(motif_blocks)
+            else None
+        )
+        block_j = (
+            motif_blocks[self.motif_j]
+            if 0 <= self.motif_j < len(motif_blocks)
+            else None
+        )
+        if block_i is None or block_j is None:
+            self.skip_reason = "motif_block_missing"
+            return xyz.new_zeros(())
+
+        cur_com_i = _motif_block_current_com(xyz, block_i)
+        cur_com_j = _motif_block_current_com(xyz, block_j)
+        ref_com_i = _motif_block_reference_com(xyz, masks, metadata, block_i)
+        ref_com_j = _motif_block_reference_com(xyz, masks, metadata, block_j)
+        if (
+            cur_com_i is None
+            or cur_com_j is None
+            or ref_com_i is None
+            or ref_com_j is None
+        ):
+            self.skip_reason = "motif_com_or_reference_missing"
+            self.skip_detail.update(
+                {
+                    "has_current_com_i": cur_com_i is not None,
+                    "has_current_com_j": cur_com_j is not None,
+                    "has_reference_com_i": ref_com_i is not None,
+                    "has_reference_com_j": ref_com_j is not None,
+                }
+            )
+            return xyz.new_zeros(())
+
+        target_rotation = _euler_rotation_matrix_deg(
+            self.angle_x,
+            self.angle_y,
+            self.angle_z,
+            device=xyz.device,
+            dtype=xyz.dtype,
+        )
+        ref_edges = torch.stack(
+            [
+                ref_com_i,
+                ref_com_j,
+                ref_com_j - ref_com_i,
+            ],
+            dim=0,
+        )
+        target_edges = _apply_row_rotation(ref_edges, target_rotation)
+        target_norm = target_edges.norm(dim=-1)
+
+        cur_edges = torch.stack(
+            [
+                cur_com_i,
+                cur_com_j,
+                cur_com_j - cur_com_i,
+            ],
+            dim=1,
+        )
+        cur_norm = cur_edges.norm(dim=-1)
+        valid = (target_norm[None, :] > 1e-6) & (cur_norm > 1e-6)
+        if not bool(valid.any()):
+            self.skip_reason = "all_pose_triangle_edges_degenerate"
+            self.skip_detail.update(
+                {
+                    "target_edge_norms": _rounded_float_list(target_norm),
+                    "current_edge_norm_min": _rounded_float_list(
+                        cur_norm.amin(dim=0)
+                    ),
+                    "current_edge_norm_max": _rounded_float_list(
+                        cur_norm.amax(dim=0)
+                    ),
+                }
+            )
+            return xyz.new_zeros(())
+
+        target_dirs = target_edges / target_norm.clamp_min(1e-6)[:, None]
+        cur_dirs = cur_edges / cur_norm.clamp_min(1e-6)[..., None]
+        diff = cur_dirs - target_dirs.unsqueeze(0)
+        loss = diff.pow(2).sum(dim=-1)
+        valid_weight = valid.to(dtype=xyz.dtype)
+        return -self.weight * (loss * valid_weight).sum() / valid_weight.sum()
+
+    def guide_atom_mask(self, masks, metadata, device):
+        block_i = _single_motif_block_mask(
+            self.motif_i,
+            masks=masks,
+            metadata=metadata,
+            device=device,
+        )
+        block_j = _single_motif_block_mask(
+            self.motif_j,
+            masks=masks,
+            metadata=metadata,
+            device=device,
+        )
+        if block_i is None or block_j is None:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        return block_i | block_j
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        block_i = _single_motif_block_mask(
+            self.motif_i,
+            masks=masks,
+            metadata=metadata,
+            device=xyz.device,
+        )
+        block_j = _single_motif_block_mask(
+            self.motif_j,
+            masks=masks,
+            metadata=metadata,
+            device=xyz.device,
+        )
+        if block_i is None or block_j is None:
+            return torch.zeros_like(atom_grad)
+
+        transformed = torch.zeros_like(atom_grad)
+        for block_mask in (block_i, block_j):
+            if block_mask.sum().item() == 0:
+                continue
+            transformed[:, block_mask, :] = _project_gradient_to_rigid_body(
+                atom_grad[:, block_mask, :],
+                xyz[:, block_mask, :],
+                allow_translation=True,
+                allow_rotation=False,
+            )
+        return transformed
+
+
+class MotifRigidBodyPose(BasePotential):
+    """Frame-invariant rigid-body pose control for two motif blocks.
+
+    This potential treats motif_i and motif_j as rigid bodies.  It fits the
+    current motif_i atom cloud to its input reference with Kabsch, uses that fit
+    as a local body frame, and compares three vectors in that local frame:
+
+    - motif_i -> motif_j, controlling relative motif placement
+    - protein/selected COM -> motif_i, controlling motif_i placement to origin
+    - protein/selected COM -> motif_j, controlling motif_j placement to origin
+
+    Because all comparisons are made in motif_i's local reference frame, the
+    potential is invariant to RFD3's per-step global recentering and random
+    rotation.  Gradients are projected back onto rigid-body translation and
+    rotation fields for both selected motif blocks.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_i: int = 0,
+        motif_j: int = 1,
+        angle_x: float = 0.0,
+        angle_y: float = 0.0,
+        angle_z: float = 0.0,
+        pair_weight: float = 1.0,
+        origin_weight: float = 1.0,
+        distance_weight: float = 0.0,
+        origin_atom_filter: str = "real",
+        eps: float = 1e-6,
+    ):
+        super().__init__(weight)
+        self.motif_i = int(motif_i)
+        self.motif_j = int(motif_j)
+        self.angle_x = float(angle_x)
+        self.angle_y = float(angle_y)
+        self.angle_z = float(angle_z)
+        self.pair_weight = float(pair_weight)
+        self.origin_weight = float(origin_weight)
+        self.distance_weight = float(distance_weight)
+        self.origin_atom_filter = origin_atom_filter
+        self.eps = float(eps)
+        self.skip_reason: str | None = None
+        self.skip_detail: dict | None = None
+
+    def compute(self, xyz, masks, metadata):
+        self.skip_reason = None
+        self.skip_detail = None
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        self.skip_detail = {
+            "motif_i": self.motif_i,
+            "motif_j": self.motif_j,
+            "n_motif_blocks": len(motif_blocks),
+            "has_floating_motif_reference_pos": "floating_motif_reference_pos"
+            in metadata,
+            "has_input_pos": "input_pos" in metadata,
+            "has_motif_pos": "motif_pos" in metadata,
+            "has_ref_pos": "ref_pos" in metadata,
+            "origin_atom_filter": self.origin_atom_filter,
+        }
+
+        max_idx = max(self.motif_i, self.motif_j)
+        if self.motif_i < 0 or self.motif_j < 0 or max_idx >= len(motif_blocks):
+            self.skip_reason = "motif_block_missing"
+            return xyz.new_zeros(())
+
+        block_i = motif_blocks[self.motif_i]
+        block_j = motif_blocks[self.motif_j]
+        current_i, ref_i = _motif_block_current_and_reference_xyz(
+            xyz, masks, metadata, block_i
+        )
+        current_j, ref_j = _motif_block_current_and_reference_xyz(
+            xyz, masks, metadata, block_j
+        )
+        if (
+            current_i is None
+            or ref_i is None
+            or current_j is None
+            or ref_j is None
+            or ref_i.shape[0] < 3
+            or ref_j.shape[0] < 1
+        ):
+            self.skip_reason = "motif_reference_missing_or_too_small"
+            self.skip_detail.update(
+                {
+                    "n_reference_atoms_i": 0 if ref_i is None else int(ref_i.shape[0]),
+                    "n_reference_atoms_j": 0 if ref_j is None else int(ref_j.shape[0]),
+                }
+            )
+            return xyz.new_zeros(())
+
+        current_com_i = current_i.mean(dim=1)
+        current_com_j = current_j.mean(dim=1)
+        ref_com_i = ref_i.mean(dim=0)
+        ref_com_j = ref_j.mean(dim=0)
+
+        origin_mask = _pose_origin_atom_mask(
+            self.origin_atom_filter, masks, xyz.device
+        )
+        current_origin = _masked_current_com(xyz, origin_mask)
+        ref_origin = _masked_reference_com(xyz, masks, metadata, origin_mask)
+        if current_origin is None or ref_origin is None:
+            self.skip_reason = "origin_reference_missing"
+            self.skip_detail.update(
+                {
+                    "has_current_origin": current_origin is not None,
+                    "has_reference_origin": ref_origin is not None,
+                }
+            )
+            return xyz.new_zeros(())
+
+        ref_to_current = _kabsch_ref_to_current_rotation(ref_i, current_i, self.eps)
+        if ref_to_current is None:
+            self.skip_reason = "motif_i_frame_degenerate"
+            self.skip_detail.update(
+                {
+                    "n_reference_atoms_i": int(ref_i.shape[0]),
+                    "reference_i_centered_norm": round(
+                        float(
+                            (ref_i - ref_i.mean(dim=0, keepdim=True))
+                            .pow(2)
+                            .sum()
+                            .detach()
+                            .cpu()
+                        ),
+                        6,
+                    ),
+                    "current_i_centered_norm_min": _rounded_float_list(
+                        (current_i - current_i.mean(dim=1, keepdim=True))
+                        .pow(2)
+                        .sum(dim=(-2, -1))
+                        .amin(dim=0)
+                        .unsqueeze(0)
+                    ),
+                }
+            )
+            return xyz.new_zeros(())
+
+        target_rotation = _euler_rotation_matrix_deg(
+            self.angle_x,
+            self.angle_y,
+            self.angle_z,
+            device=xyz.device,
+            dtype=xyz.dtype,
+        )
+
+        current_vectors = torch.stack(
+            [
+                current_com_j - current_com_i,
+                current_com_i - current_origin,
+                current_com_j - current_origin,
+            ],
+            dim=1,
+        )
+        current_local = _apply_batch_row_rotation(
+            current_vectors,
+            ref_to_current,
+        )
+        target_vectors = torch.stack(
+            [
+                ref_com_j - ref_com_i,
+                ref_com_i - ref_origin,
+                ref_com_j - ref_origin,
+            ],
+            dim=0,
+        )
+        target_vectors = _apply_row_rotation(target_vectors, target_rotation)
+
+        direction_loss, valid = _pose_direction_loss(
+            current_local,
+            target_vectors,
+            xyz.dtype,
+            self.eps,
+        )
+        if not bool(valid.any()):
+            self.skip_reason = "all_pose_vectors_degenerate"
+            self.skip_detail.update(
+                {
+                    "target_vector_norms": _rounded_float_list(
+                        target_vectors.norm(dim=-1)
+                    ),
+                    "current_vector_norm_min": _rounded_float_list(
+                        current_local.norm(dim=-1).amin(dim=0)
+                    ),
+                    "current_vector_norm_max": _rounded_float_list(
+                        current_local.norm(dim=-1).amax(dim=0)
+                    ),
+                }
+            )
+            return xyz.new_zeros(())
+
+        weights = torch.tensor(
+            [self.pair_weight, self.origin_weight, self.origin_weight],
+            device=xyz.device,
+            dtype=xyz.dtype,
+        )
+        valid_weight = valid.to(dtype=xyz.dtype) * weights[None, :]
+        loss = (direction_loss * valid_weight).sum() / valid_weight.sum().clamp_min(
+            self.eps
+        )
+
+        if self.distance_weight > 0.0:
+            distance_loss = _pose_distance_loss(
+                current_local,
+                target_vectors,
+                valid,
+                self.eps,
+            )
+            loss = loss + self.distance_weight * distance_loss
+
+        return -self.weight * loss
+
+    def guide_atom_mask(self, masks, metadata, device):
+        motif_blocks = _motif_distance_blocks(masks, metadata, device)
+        if not motif_blocks:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        guide_mask = torch.zeros_like(motif_blocks[0], dtype=torch.bool, device=device)
+        max_idx = max(self.motif_i, self.motif_j)
+        if self.motif_i < 0 or self.motif_j < 0 or max_idx >= len(motif_blocks):
+            return guide_mask
+        guide_mask |= motif_blocks[self.motif_i]
+        guide_mask |= motif_blocks[self.motif_j]
+        return guide_mask
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        if not motif_blocks:
+            return torch.zeros_like(atom_grad)
+
+        transformed = torch.zeros_like(atom_grad)
+        max_idx = max(self.motif_i, self.motif_j)
+        if self.motif_i < 0 or self.motif_j < 0 or max_idx >= len(motif_blocks):
+            return transformed
+
+        for motif_idx in (self.motif_i, self.motif_j):
+            block_mask = motif_blocks[motif_idx].to(device=xyz.device, dtype=torch.bool)
+            if block_mask.sum().item() < 2:
+                continue
+            transformed[:, block_mask, :] = _project_gradient_to_rigid_body(
+                atom_grad[:, block_mask, :],
+                xyz[:, block_mask, :],
+                allow_translation=True,
+                allow_rotation=True,
+            )
+        return transformed
+
+
 class MotifBridge(BasePotential):
     """Spread generated non-motif atoms between two motif blocks.
 
@@ -607,6 +1120,121 @@ def _motif_reference_xyz(
     return ref_xyz
 
 
+def _motif_input_reference_xyz(
+    xyz: torch.Tensor,
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+) -> torch.Tensor:
+    """Reference coordinates from the input PDB for inference-time motif controls.
+
+    ``floating_motif_reference_pos`` is saved by input parsing before standard
+    inference zeroes non-fixed-coordinate atoms.  ``input_pos`` and ``motif_pos``
+    are useful fallbacks, but can already be zero-filled for floating motifs.
+    ``ref_pos`` is only a final fallback for fixed-sequence atoms.
+    """
+    device = xyz.device
+    dtype = xyz.dtype
+    ref_xyz = torch.full_like(xyz[0], float("nan"))
+
+    motif_mask = masks.get("motif_atom_mask")
+
+    floating_reference_pos = metadata.get("floating_motif_reference_pos")
+    if floating_reference_pos is not None:
+        floating_reference_pos = (
+            floating_reference_pos[0]
+            if floating_reference_pos.ndim == 3
+            else floating_reference_pos
+        )
+        floating_reference_pos = floating_reference_pos.to(device=device, dtype=dtype)
+        floating_valid = torch.isfinite(floating_reference_pos).all(dim=-1)
+        if motif_mask is not None:
+            floating_valid = floating_valid & motif_mask.to(
+                device=device, dtype=torch.bool
+            )
+        ref_xyz[floating_valid] = floating_reference_pos[floating_valid]
+
+    input_pos = metadata.get("input_pos")
+    if input_pos is not None:
+        input_pos = input_pos[0] if input_pos.ndim == 3 else input_pos
+        input_pos = input_pos.to(device=device, dtype=dtype)
+        input_valid = torch.isfinite(input_pos).all(dim=-1)
+        if motif_mask is not None:
+            input_valid = input_valid & motif_mask.to(device=device, dtype=torch.bool)
+        missing_reference = ~torch.isfinite(ref_xyz).all(dim=-1)
+        input_valid = input_valid & missing_reference
+        ref_xyz[input_valid] = input_pos[input_valid]
+
+    motif_pos = metadata.get("motif_pos")
+    if motif_pos is not None:
+        motif_pos = motif_pos.to(device=device, dtype=dtype)
+        motif_valid = torch.isfinite(motif_pos).all(dim=-1)
+        if motif_mask is not None:
+            motif_valid = motif_valid & motif_mask.to(device=device, dtype=torch.bool)
+        missing_reference = ~torch.isfinite(ref_xyz).all(dim=-1)
+        motif_valid = motif_valid & missing_reference
+        ref_xyz[motif_valid] = motif_pos[motif_valid]
+
+    ref_pos = metadata.get("ref_pos")
+    if ref_pos is not None:
+        ref_pos = ref_pos.to(device=device, dtype=dtype)
+        ref_valid = torch.isfinite(ref_pos).all(dim=-1)
+        if motif_pos is not None:
+            ref_valid = ref_valid & _fixed_seq_mask(metadata, masks, device)
+        missing_reference = ~torch.isfinite(ref_xyz).all(dim=-1)
+        ref_valid = ref_valid & missing_reference
+        ref_xyz[ref_valid] = ref_pos[ref_valid]
+
+    return ref_xyz
+
+
+def _all_input_reference_xyz(
+    xyz: torch.Tensor,
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+) -> torch.Tensor:
+    device = xyz.device
+    dtype = xyz.dtype
+    ref_xyz = torch.full_like(xyz[0], float("nan"))
+
+    floating_reference_pos = metadata.get("floating_motif_reference_pos")
+    if floating_reference_pos is not None:
+        floating_reference_pos = (
+            floating_reference_pos[0]
+            if floating_reference_pos.ndim == 3
+            else floating_reference_pos
+        )
+        floating_reference_pos = floating_reference_pos.to(device=device, dtype=dtype)
+        floating_valid = torch.isfinite(floating_reference_pos).all(dim=-1)
+        ref_xyz[floating_valid] = floating_reference_pos[floating_valid]
+
+    input_pos = metadata.get("input_pos")
+    if input_pos is not None:
+        input_pos = input_pos[0] if input_pos.ndim == 3 else input_pos
+        input_pos = input_pos.to(device=device, dtype=dtype)
+        input_valid = torch.isfinite(input_pos).all(dim=-1)
+        missing_reference = ~torch.isfinite(ref_xyz).all(dim=-1)
+        input_valid = input_valid & missing_reference
+        ref_xyz[input_valid] = input_pos[input_valid]
+
+    motif_pos = metadata.get("motif_pos")
+    if motif_pos is not None:
+        motif_pos = motif_pos.to(device=device, dtype=dtype)
+        motif_valid = torch.isfinite(motif_pos).all(dim=-1)
+        missing_reference = ~torch.isfinite(ref_xyz).all(dim=-1)
+        motif_valid = motif_valid & missing_reference
+        ref_xyz[motif_valid] = motif_pos[motif_valid]
+
+    ref_pos = metadata.get("ref_pos")
+    if ref_pos is not None:
+        ref_pos = ref_pos.to(device=device, dtype=dtype)
+        ref_valid = torch.isfinite(ref_pos).all(dim=-1)
+        missing_reference = ~torch.isfinite(ref_xyz).all(dim=-1)
+        ref_valid = ref_valid & missing_reference
+        ref_xyz[ref_valid] = ref_pos[ref_valid]
+
+    return ref_xyz
+
+
 def _fixed_seq_mask(
     metadata: dict,
     masks: dict[str, torch.Tensor],
@@ -693,6 +1321,284 @@ def _bridge_atom_mask(
     return masks[key].to(device=device, dtype=torch.bool)
 
 
+def _single_motif_block_mask(
+    motif_i: int,
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    device: torch.device,
+) -> torch.Tensor | None:
+    motif_blocks = _motif_distance_blocks(masks, metadata, device)
+    if motif_i < 0 or motif_i >= len(motif_blocks):
+        return None
+    return motif_blocks[motif_i]
+
+
+def _motif_block_current_and_reference_xyz(
+    xyz: torch.Tensor,
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    block_mask: torch.Tensor,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    idx = torch.where(block_mask)[0]
+    if idx.numel() == 0:
+        return None, None
+
+    current_xyz = xyz[:, idx, :]
+    ref_xyz = _motif_input_reference_xyz(xyz, masks, metadata)[idx]
+    valid = torch.isfinite(ref_xyz).all(dim=-1)
+    if valid.sum().item() == 0:
+        return None, None
+    return current_xyz[:, valid, :], ref_xyz[valid]
+
+
+def _motif_block_current_com(
+    xyz: torch.Tensor,
+    block_mask: torch.Tensor,
+) -> torch.Tensor | None:
+    block_xyz = xyz[:, block_mask, :]
+    if block_xyz.shape[1] == 0:
+        return None
+    finite = torch.isfinite(block_xyz).all(dim=-1)
+    if not bool(finite.any()):
+        return None
+    weights = finite.to(dtype=xyz.dtype)
+    denom = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+    return (block_xyz * weights[..., None]).sum(dim=1) / denom
+
+
+def _motif_block_reference_com(
+    xyz: torch.Tensor,
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    block_mask: torch.Tensor,
+) -> torch.Tensor | None:
+    ref_xyz = _motif_input_reference_xyz(xyz, masks, metadata)[block_mask]
+    if ref_xyz.shape[0] == 0:
+        return None
+    finite = torch.isfinite(ref_xyz).all(dim=-1)
+    if finite.sum().item() == 0:
+        return None
+    return ref_xyz[finite].mean(dim=0)
+
+
+def _pose_origin_atom_mask(
+    atom_filter: str,
+    masks: dict[str, torch.Tensor],
+    device: torch.device,
+) -> torch.Tensor:
+    if atom_filter == "real":
+        key = "real_atom_mask"
+    elif atom_filter == "potential":
+        key = "potential_atom_mask"
+    elif atom_filter == "guide":
+        key = "guide_atom_mask"
+    elif atom_filter == "motif":
+        key = "motif_atom_mask"
+    elif atom_filter == "all":
+        any_mask = next(iter(masks.values()))
+        return torch.ones_like(any_mask, dtype=torch.bool, device=device)
+    else:
+        raise ValueError(
+            "motif_rigid_body_pose origin_atom_filter must be one of "
+            "'real', 'potential', 'guide', 'motif', or 'all'"
+        )
+    if key not in masks:
+        raise ValueError(
+            "motif_rigid_body_pose requires "
+            f"{key} in masks for origin_atom_filter={atom_filter!r}"
+        )
+    return masks[key].to(device=device, dtype=torch.bool)
+
+
+def _masked_current_com(
+    xyz: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor | None:
+    selected = xyz[:, mask, :]
+    if selected.shape[1] == 0:
+        return None
+    finite = torch.isfinite(selected).all(dim=-1)
+    if not bool(finite.any()):
+        return None
+    weights = finite.to(dtype=xyz.dtype)
+    denom = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+    return (selected * weights[..., None]).sum(dim=1) / denom
+
+
+def _masked_reference_com(
+    xyz: torch.Tensor,
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    mask: torch.Tensor,
+) -> torch.Tensor | None:
+    ref_xyz = _all_input_reference_xyz(xyz, masks, metadata)[mask]
+    if ref_xyz.shape[0] == 0:
+        return None
+    finite = torch.isfinite(ref_xyz).all(dim=-1)
+    if finite.sum().item() == 0:
+        return None
+    return ref_xyz[finite].mean(dim=0)
+
+
+def _kabsch_ref_to_current_rotation(
+    ref_xyz: torch.Tensor,
+    current_xyz: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor | None:
+    if ref_xyz.shape[0] < 3 or current_xyz.shape[1] < 3:
+        return None
+
+    device_type = current_xyz.device.type
+    with torch.autocast(device_type=device_type, enabled=False):
+        ref = ref_xyz.unsqueeze(0).expand(current_xyz.shape[0], -1, -1).float()
+        cur = current_xyz.float()
+        ref_centered = ref - ref.mean(dim=1, keepdim=True)
+        cur_centered = cur - cur.mean(dim=1, keepdim=True)
+        if not bool((ref_centered.pow(2).sum(dim=(-2, -1)) > eps).all()):
+            return None
+
+        covariance = ref_centered.transpose(-1, -2) @ cur_centered
+        eye = torch.eye(3, device=current_xyz.device, dtype=torch.float32)
+        covariance = covariance + eps * eye.unsqueeze(0)
+        U, _, Vh = torch.linalg.svd(covariance)
+        rotation = U @ Vh
+        det = torch.linalg.det(rotation)
+        if bool((det < 0).any()):
+            U_fixed = U.clone()
+            U_fixed[det < 0, :, -1] *= -1
+            rotation = U_fixed @ Vh
+    return rotation.to(dtype=current_xyz.dtype)
+
+
+def _euler_rotation_matrix_deg(
+    angle_x: float,
+    angle_y: float,
+    angle_z: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    ax = torch.deg2rad(torch.tensor(angle_x, device=device, dtype=dtype))
+    ay = torch.deg2rad(torch.tensor(angle_y, device=device, dtype=dtype))
+    az = torch.deg2rad(torch.tensor(angle_z, device=device, dtype=dtype))
+    one = torch.tensor(1.0, device=device, dtype=dtype)
+    zero = torch.tensor(0.0, device=device, dtype=dtype)
+
+    cx, sx = torch.cos(ax), torch.sin(ax)
+    cy, sy = torch.cos(ay), torch.sin(ay)
+    cz, sz = torch.cos(az), torch.sin(az)
+
+    rx = torch.stack(
+        [
+            torch.stack([one, zero, zero]),
+            torch.stack([zero, cx, -sx]),
+            torch.stack([zero, sx, cx]),
+        ]
+    )
+    ry = torch.stack(
+        [
+            torch.stack([cy, zero, sy]),
+            torch.stack([zero, one, zero]),
+            torch.stack([-sy, zero, cy]),
+        ]
+    )
+    rz = torch.stack(
+        [
+            torch.stack([cz, -sz, zero]),
+            torch.stack([sz, cz, zero]),
+            torch.stack([zero, zero, one]),
+        ]
+    )
+    return rz @ ry @ rx
+
+
+def _apply_row_rotation(points: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
+    return points @ rotation.transpose(-1, -2)
+
+
+def _apply_batch_row_rotation(
+    points: torch.Tensor,
+    rotation: torch.Tensor,
+) -> torch.Tensor:
+    return torch.matmul(points, rotation.transpose(-1, -2))
+
+
+def _pose_direction_loss(
+    current_vectors: torch.Tensor,
+    target_vectors: torch.Tensor,
+    dtype: torch.dtype,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    current_norm = current_vectors.norm(dim=-1)
+    target_norm = target_vectors.norm(dim=-1)
+    valid = (current_norm > eps) & (target_norm[None, :] > eps)
+    current_dirs = current_vectors / current_norm.clamp_min(eps)[..., None]
+    target_dirs = target_vectors / target_norm.clamp_min(eps)[:, None]
+    loss = (current_dirs - target_dirs.unsqueeze(0)).pow(2).sum(dim=-1)
+    return loss.to(dtype=dtype), valid
+
+
+def _pose_distance_loss(
+    current_vectors: torch.Tensor,
+    target_vectors: torch.Tensor,
+    valid: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    current_norm = current_vectors.norm(dim=-1)
+    target_norm = target_vectors.norm(dim=-1)
+    scale = target_norm.clamp_min(eps)[None, :]
+    loss = ((current_norm - target_norm[None, :]) / scale).pow(2)
+    valid_weight = valid.to(dtype=current_vectors.dtype)
+    return (loss * valid_weight).sum() / valid_weight.sum().clamp_min(eps)
+
+
+def _rounded_float_list(values: torch.Tensor) -> list[float]:
+    return [round(float(value), 6) for value in values.detach().cpu().flatten()]
+
+
+def _normalize_vectors(vectors: torch.Tensor, eps: float = 1e-6) -> torch.Tensor | None:
+    norms = vectors.norm(dim=-1, keepdim=True)
+    if not bool((norms > eps).all()):
+        return None
+    return vectors / norms
+
+
+def _project_gradient_to_rigid_body(
+    atom_grad: torch.Tensor,
+    xyz_block: torch.Tensor,
+    allow_translation: bool,
+    allow_rotation: bool,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    transformed = torch.zeros_like(atom_grad)
+    if atom_grad.shape[1] == 0:
+        return transformed
+
+    centered = xyz_block - xyz_block.mean(dim=1, keepdim=True)
+    residual = atom_grad
+    if allow_translation:
+        translation = atom_grad.mean(dim=1, keepdim=True)
+        transformed = transformed + translation
+        residual = atom_grad - translation
+
+    if allow_rotation and atom_grad.shape[1] >= 2:
+        device_type = xyz_block.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            eye = torch.eye(3, device=xyz_block.device, dtype=torch.float32).unsqueeze(0)
+            centered32 = centered.float()
+            residual32 = residual.float()
+            sq_norm = centered32.pow(2).sum(dim=-1)[..., None, None]
+            outer = centered32[:, :, :, None] * centered32[:, :, None, :]
+            system = (sq_norm * eye[:, None, :, :] - outer).sum(dim=1) + eps * eye
+            rhs = torch.cross(centered32, residual32, dim=-1).sum(dim=1)
+            omega = torch.linalg.solve(system, rhs.unsqueeze(-1)).squeeze(-1)
+            rotation_field = torch.cross(
+                omega.unsqueeze(1).expand_as(centered32), centered32, dim=-1
+            ).to(dtype=atom_grad.dtype)
+        transformed = transformed + rotation_field
+
+    return transformed
+
+
 def _distance_loss(diff: torch.Tensor, k: float, loss: str) -> torch.Tensor:
     if loss == "mse":
         return diff.pow(2).mean()
@@ -720,6 +1626,11 @@ POTENTIAL_REGISTRY: dict[str, type[BasePotential]] = {
     "monomer_contacts": MonomerContacts,
     "atom_pair_distance": AtomPairDistance,
     "motif_distance": MotifDistance,
+    "motif_internal_rotation": MotifInternalRotation,
+    "motif_relative_pose": MotifRelativePose,
+    "rigid_pose": MotifRelativePose,
+    "motif_rigid_body_pose": MotifRigidBodyPose,
+    "rigid_body_pose": MotifRigidBodyPose,
     "motif_bridge": MotifBridge,
     "motif_rigid": MotifRigid,
 }

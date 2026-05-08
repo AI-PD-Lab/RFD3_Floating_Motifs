@@ -43,6 +43,7 @@ from rfd3.inference.symmetry.symmetry_utils import (
     make_symmetric_atom_array,
 )
 from rfd3.model.floating_motif_projection import (
+    FLOATING_MOTIF_REFERENCE_ANNOTATIONS,
     annotate_floating_motif_reference_coords,
 )
 from rfd3.transforms.conditioning_base import (
@@ -71,6 +72,28 @@ from foundry.utils.ddp import RankedLogger
 logging.basicConfig(level=logging.DEBUG)
 
 logger = RankedLogger(__name__, rank_zero_only=True)
+
+
+def _shift_floating_motif_reference_coords(atom_array, shift):
+    if shift is None or not all(
+        annotation in atom_array.get_annotation_categories()
+        for annotation in FLOATING_MOTIF_REFERENCE_ANNOTATIONS
+    ):
+        return atom_array
+
+    shift = np.asarray(shift, dtype=np.float32)
+    for axis, annotation in enumerate(FLOATING_MOTIF_REFERENCE_ANNOTATIONS):
+        values = atom_array.get_annotation(annotation).astype(np.float32, copy=True)
+        values -= shift[axis]
+        atom_array.set_annotation(annotation, values)
+    return atom_array
+
+
+def _infer_uniform_coordinate_shift(before, after):
+    finite = np.isfinite(before).all(axis=-1) & np.isfinite(after).all(axis=-1)
+    if not np.any(finite):
+        return None
+    return np.median(before[finite] - after[finite], axis=0)
 
 
 #################################################################################
@@ -761,15 +784,27 @@ class DesignInputSpecification(BaseModel):
                     "Partial diffusion with symmetry: skipping COM centering to preserve chain spacing"
                 )
             else:
+                coord_before_origin = atom_array.coord.copy()
                 atom_array = set_com(
                     atom_array, ori_token=None, infer_ori_strategy="com"
                 )
+                atom_array = _shift_floating_motif_reference_coords(
+                    atom_array,
+                    _infer_uniform_coordinate_shift(
+                        coord_before_origin, atom_array.coord
+                    ),
+                )
         else:
             # Standard: set ori token, zero out diffused atoms
+            coord_before_origin = atom_array.coord.copy()
             atom_array = set_com(
                 atom_array,
                 ori_token=self.ori_token,
                 infer_ori_strategy=self.infer_ori_strategy,
+            )
+            atom_array = _shift_floating_motif_reference_coords(
+                atom_array,
+                _infer_uniform_coordinate_shift(coord_before_origin, atom_array.coord),
             )
             # Diffused atoms are always initialized at origin during regular diffusion (all information removed)
             atom_array.coord[

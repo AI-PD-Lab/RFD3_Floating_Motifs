@@ -88,6 +88,20 @@ def compute_potential_guidance(
             metadata=metadata,
         )
         if atom_grad is None:
+            if potential_manager.debug:
+                skipped_debug = {
+                    "type": type(potential).__name__,
+                    "value": round(float(potential_value.detach()), 6),
+                    "skipped": True,
+                    "reason": getattr(
+                        potential, "skip_reason", "no_coordinate_gradient"
+                    )
+                    or "no_coordinate_gradient",
+                }
+                skip_detail = getattr(potential, "skip_detail", None)
+                if skip_detail is not None:
+                    skipped_debug["detail"] = skip_detail
+                potential_debug.append(skipped_debug)
             continue
         total_potential_value = total_potential_value + potential_value.detach()
 

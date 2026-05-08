@@ -123,6 +123,42 @@ def compute_potential_guidance(
             )
 
         atom_grad = torch.nan_to_num(atom_grad, nan=0.0, posinf=0.0, neginf=0.0)
+        if hasattr(potential, "instance_guide_masks"):
+            instance_masks = potential.instance_guide_masks(
+                masks=masks,
+                metadata=metadata,
+                device=xyz_t.device,
+            )
+        else:
+            instance_masks = None
+        if instance_masks:
+            guidance, instance_debug = _apply_instance_guidance(
+                atom_grad=atom_grad,
+                instance_masks=instance_masks,
+                base_guide_atom_mask=base_guide_atom_mask,
+                atom_to_token_map=atom_to_token_map,
+                n_tokens=n_tokens,
+                potential=potential,
+                potential_manager=potential_manager,
+                t=t,
+                T=T,
+                apply_mode=apply_mode,
+                atom_guidance_fraction=atom_guidance_fraction,
+            )
+            total_guidance = total_guidance + guidance
+            raw_grad_rms_values.extend(
+                item["raw_atom_grad_rms"] for item in instance_debug
+            )
+            if potential_manager.debug:
+                potential_debug.append(
+                    {
+                        "type": type(potential).__name__,
+                        "value": round(float(potential_value.detach()), 6),
+                        "instances": instance_debug,
+                    }
+                )
+            continue
+
         atom_grad = atom_grad * guide_atom_mask[None, :, None].to(dtype=atom_grad.dtype)
         raw_grad_rms = _rms_over_mask(atom_grad, guide_atom_mask)
         raw_grad_rms_values.append(raw_grad_rms)
@@ -189,6 +225,83 @@ def compute_potential_guidance(
         }
 
     return guidance, debug_dict
+
+
+def _apply_instance_guidance(
+    atom_grad: torch.Tensor,
+    instance_masks: list[torch.Tensor],
+    base_guide_atom_mask: torch.Tensor,
+    atom_to_token_map: torch.Tensor,
+    n_tokens: int,
+    potential,
+    potential_manager: PotentialManager,
+    t: float,
+    T: float,
+    apply_mode: str,
+    atom_guidance_fraction: float,
+) -> tuple[torch.Tensor, list[dict]]:
+    """Apply one potential as independent masked instances.
+
+    The scalar potential may be computed as a sum, but each instance gets its
+    own mask, guidance-mode reduction, clipping, and scale application.  This is
+    important for hetero pseudo-symmetry where motif instances are independent.
+    """
+
+    total_guidance = torch.zeros_like(atom_grad)
+    debug_items: list[dict] = []
+    potential_apply_mode = getattr(potential, "apply_mode", apply_mode)
+    potential_atom_fraction = float(
+        getattr(potential, "atom_guidance_fraction", atom_guidance_fraction)
+    )
+    clip_rms = potential_manager.get_potential_guide_clip_rms(potential)
+    scale = potential_manager.get_potential_guide_scale(potential, t, T)
+
+    for instance_idx, instance_mask in enumerate(instance_masks):
+        instance_mask = instance_mask.to(
+            device=atom_grad.device, dtype=torch.bool
+        ) & base_guide_atom_mask
+        if not bool(instance_mask.any()):
+            continue
+        instance_grad = atom_grad * instance_mask[None, :, None].to(
+            dtype=atom_grad.dtype
+        )
+        raw_grad_rms = _rms_over_mask(instance_grad, instance_mask)
+        guidance_unscaled = _apply_guidance_mode(
+            atom_grad=instance_grad,
+            atom_to_token_map=atom_to_token_map,
+            n_tokens=n_tokens,
+            guide_atom_mask=instance_mask,
+            apply_mode=potential_apply_mode,
+            atom_guidance_fraction=potential_atom_fraction,
+        )
+
+        clip_factor = 1.0
+        rms = _rms_over_mask(guidance_unscaled, instance_mask)
+        if clip_rms == 0.0:
+            clip_factor = 0.0
+            guidance_unscaled = torch.zeros_like(guidance_unscaled)
+        elif rms > 1e-12:
+            clip_factor = min(1.0, clip_rms / float(rms))
+            guidance_unscaled = guidance_unscaled * clip_factor
+
+        guidance = guidance_unscaled * scale
+        total_guidance = total_guidance + guidance
+        debug_items.append(
+            {
+                "instance": instance_idx,
+                "n_guided_atoms": int(instance_mask.sum().item()),
+                "guide_scale": round(scale, 6),
+                "guide_clip_rms": round(clip_rms, 6),
+                "clip_factor": round(clip_factor, 6),
+                "apply_mode": potential_apply_mode,
+                "raw_atom_grad_rms": round(raw_grad_rms, 6),
+                "final_guidance_rms": round(
+                    _rms_over_mask(guidance, instance_mask), 6
+                ),
+            }
+        )
+
+    return total_guidance, debug_items
 
 
 def _potential_atom_gradient(

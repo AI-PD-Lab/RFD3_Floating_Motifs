@@ -381,13 +381,15 @@ def ensure_inference_sampler_matches_design_spec(
             has_symmetry = "symmetry" in item and item.get("symmetry") is not None
         has_symmetry_specification.append(has_symmetry)
     if any(has_symmetry_specification):
+        symmetry_sampler_kinds = {"symmetry", "hetero_symmetry"}
         if (
             inference_sampler is None
-            or inference_sampler.get("kind", "default") != "symmetry"
+            or inference_sampler.get("kind", "default") not in symmetry_sampler_kinds
         ):
             raise ValueError(
-                "You requested for symmetric designs, but inference sampler is not set to symmetry. "
-                "Please add inference_sampler.kind='symmetry' to your command."
+                "You requested symmetric designs, but inference sampler is not set "
+                "to a symmetry-aware kind. Please add inference_sampler.kind='symmetry' "
+                "or inference_sampler.kind='hetero_symmetry' to your command."
             )
 
 

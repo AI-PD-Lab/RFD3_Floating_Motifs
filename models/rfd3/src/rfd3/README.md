@@ -1,0 +1,185 @@
+# RFD3 Local Changes
+
+## Hetero Pseudo-Symmetry Inference
+
+Added a new sampler kind:
+
+```yaml
+inference_sampler:
+  kind: hetero_symmetry
+```
+
+This mode still uses the existing symmetry input/initialization path, so the
+oligomer is built with the normal RFD3 symmetry machinery before diffusion.  It
+then disables full monomer-copy symmetry after initialization.
+
+Supported post-initialization modes:
+
+```yaml
+inference_sampler:
+  hetero_post_init_symmetry: interface_only      # default
+  # or
+  hetero_post_init_symmetry: initialization_only
+```
+
+`initialization_only` performs no post-init symmetry operation.  Potentials and
+floating motif Kabsch projection still run if configured.
+
+`interface_only` builds per-step masks from current coordinates using simple
+inter-chain distance contacts, then projects only oligomer-interface atoms and
+optionally soft support atoms toward the normal symmetric projection.  Mask
+priority is:
+
+1. motif atoms
+2. motif-contact exclusion atoms
+3. oligomer-interface atoms
+4. support atoms
+5. free atoms
+
+Motif atoms and motif-contact atoms are never overwritten by hetero projection.
+
+Important config fields:
+
+```yaml
+inference_sampler:
+  hetero_projection_enabled: true
+  hetero_projection_hard: false
+  hetero_projection_weight: 1.0
+  hetero_projection_start_step: 0
+  hetero_projection_stop_after: null
+  hetero_projection_schedule: constant          # constant | linear_decay
+  hetero_interface_distance_cutoff: 8.0
+  hetero_interface_sequence_buffer: 2
+  hetero_interface_include_sidechains: true
+  hetero_motif_contact_exclusion_enabled: true
+  hetero_motif_contact_distance_cutoff: 8.0
+  hetero_motif_contact_sequence_buffer: 1
+  hetero_support_enabled: true
+  hetero_support_distance_cutoff: 12.0
+  hetero_support_weight: 0.3
+  hetero_support_sequence_buffer: 2
+  hetero_debug: false
+  hetero_require_per_copy_floating_motifs: true
+```
+
+When `floating_motif_project: true`, hetero mode validates that a single
+floating motif reference is not silently reused across multiple symmetry copies.
+Provide independently defined motif references per copy, or set
+`hetero_require_per_copy_floating_motifs: false` to bypass that validation.
+
+Implementation files:
+
+- `model/inference_sampler.py`
+- `inference/symmetry/hetero_pseudo.py`
+- `utils/inference.py`
+- `testing/test_hetero_pseudo_symmetry.py`
+
+## Normal Symmetry Compatibility
+
+Normal symmetry remains available as:
+
+```yaml
+inference_sampler:
+  kind: symmetry
+```
+
+It still performs full homomeric symmetry projection.  The sampler now also
+projects full symmetry after potential guidance and before floating motif Kabsch
+projection, matching the requested order while preserving the existing
+pre-update denoised symmetry projection.
+
+Optional cutoff:
+
+```yaml
+inference_sampler:
+  full_symmetry_stop_after: null
+```
+
+When set, full symmetry projection stops after that denoising step.  This cutoff
+is independent from `floating_motif_stop_after`.
+
+## Verification Notes
+
+Syntax checks passed for the changed Python files with `python -m py_compile`.
+
+The focused pytest file could not be collected in the current shell because the
+available Python environment does not have `torch` installed:
+
+```text
+ModuleNotFoundError: No module named 'torch'
+```
+
+## Symmetry-Aware Potentials
+
+Added new potential registry names that evaluate motif restraints per symmetric
+subunit instead of treating the full oligomer as one monomer.  These use
+`sym_transform_id`/`sym_entity_id` metadata from the inference feature dict and
+fall back to the old all-motif behavior when symmetry metadata is absent.
+
+By default, active subunit/motif instances are **summed**, not averaged.  This
+means hetero pseudo-symmetry gets one real potential contribution per motif
+instance, so different motifs are not diluted into an oligomer-wide mean.  Set
+`reduction: mean` explicitly only when you want the old averaged scaling.
+
+Symmetry-aware potentials also expose per-instance guidance masks.  During
+guidance, each active motif/subunit instance is masked, reduced, clipped, and
+scaled separately before the instance guidance tensors are added together.  This
+keeps hetero pseudo-symmetry motifs from sharing one oligomer-wide clipping or
+application step.
+
+For hetero pseudo-symmetry motifs that are listed as unsymmetrized motifs, the
+motif blocks may not carry a symmetry transform id.  In that case the
+symmetry-aware potentials assign those motif blocks to subunits by contig/block
+order, so C5 with five independent motif blocks is treated as one motif instance
+per subunit.
+
+New potential names:
+
+- `symmetry_motif_distance`
+- `symmetry_motif_bridge`
+- `symmetry_single_motif_bridge`
+- `symmetry_motif_center_distance`
+- `symmetry_motif_radial_position`
+- `symmetry_motif_radial_orientation`
+- `symmetry_motif_com_distance`
+- `symmetry_motif_com_radial_position`
+- `symmetry_motif_com_radial_orientation`
+
+`symmetry_motif_distance` accepts either the old pair style:
+
+```yaml
+{type: symmetry_motif_distance, motif_i: 0, motif_j: 1, target_distance: 10.0}
+```
+
+or multiple local motif pairs in one potential:
+
+```yaml
+{type: symmetry_motif_distance, motif_pairs: [[0, 1], [1, 2]], target_distances: [10.0, 14.0], reduction: sum}
+```
+
+`symmetry_motif_bridge` is the two-motif bridge version.  It runs one bridge
+instance per subunit using local motif indices:
+
+```yaml
+{type: symmetry_motif_bridge, motif_i: 0, motif_j: 1, max_radius: 12.0, reduction: sum}
+```
+
+`symmetry_single_motif_bridge` is for a single local motif.  It distributes the
+selected movable atoms in each subunit toward/around that motif, using an even
+radial distribution out to `max_radius`:
+
+```yaml
+{type: symmetry_single_motif_bridge, motif_i: 0, max_radius: 12.0, reduction: sum}
+```
+
+The symmetry-center variants use the origin/axis by default:
+
+```yaml
+{type: symmetry_motif_center_distance, target_distance: 20.0, center_type: axis, axis: [0, 0, 1]}
+```
+
+The COM variants use the current protein COM instead of the symmetry center:
+
+```yaml
+{type: symmetry_motif_com_distance, target_distance: 20.0, origin_atom_filter: real}
+```

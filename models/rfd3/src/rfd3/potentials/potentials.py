@@ -855,6 +855,171 @@ class MotifBridge(BasePotential):
         return -self.weight * total_loss
 
 
+class SymmetryAwareMotifBridge(BasePotential):
+    """Run motif_bridge independently per symmetry subunit.
+
+    This is the two-motif bridge: selected non-motif atoms in each subunit are
+    spread between local motif_i and motif_j for that same subunit.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_i: int = 0,
+        motif_j: int = 1,
+        spread_weight: float = 1.0,
+        outside_weight: float = 1.0,
+        tube_weight: float = 0.2,
+        max_radius: float = 12.0,
+        atom_filter: str = "guide",
+        include_motif_atoms: bool = False,
+        eps: float = 1e-6,
+        reduction: str = "sum",
+    ):
+        super().__init__(weight)
+        if max_radius < 0.0:
+            raise ValueError("symmetry_motif_bridge max_radius must be non-negative")
+        self.motif_i = int(motif_i)
+        self.motif_j = int(motif_j)
+        self.spread_weight = float(spread_weight)
+        self.outside_weight = float(outside_weight)
+        self.tube_weight = float(tube_weight)
+        self.max_radius = float(max_radius)
+        self.atom_filter = atom_filter
+        self.include_motif_atoms = bool(include_motif_atoms)
+        self.eps = float(eps)
+        self.reduction = _validate_symmetry_reduction(reduction)
+
+    def compute(self, xyz, masks, metadata):
+        subunits = _symmetry_subunit_motif_blocks(masks, metadata, xyz.device)
+        bridge_masks = _symmetry_subunit_bridge_masks(
+            masks,
+            metadata,
+            xyz.device,
+            self.atom_filter,
+            self.include_motif_atoms,
+        )
+        total_loss = xyz.new_zeros(())
+        n_active = 0
+        for subunit_idx, local_blocks in enumerate(subunits):
+            if self.motif_i >= len(local_blocks) or self.motif_j >= len(local_blocks):
+                continue
+            if subunit_idx >= len(bridge_masks):
+                continue
+            loss = _two_motif_bridge_loss(
+                xyz,
+                local_blocks[self.motif_i],
+                local_blocks[self.motif_j],
+                bridge_masks[subunit_idx],
+                self,
+            )
+            if loss is None:
+                continue
+            total_loss = total_loss + loss
+            n_active += 1
+        if n_active == 0:
+            return xyz.new_zeros(())
+        return _weighted_symmetry_loss(self.weight, total_loss, n_active, self.reduction)
+
+    def guide_atom_mask(self, masks, metadata, device):
+        return _symmetry_aware_bridge_guide_mask(
+            masks,
+            metadata,
+            device,
+            self.atom_filter,
+            self.include_motif_atoms,
+        )
+
+    def instance_guide_masks(self, masks, metadata, device):
+        return _symmetry_subunit_bridge_masks(
+            masks,
+            metadata,
+            device,
+            self.atom_filter,
+            self.include_motif_atoms,
+        )
+
+
+class SymmetryAwareSingleMotifBridge(BasePotential):
+    """Distribute selected atoms toward one local motif per symmetry subunit.
+
+    The selected non-motif atoms in each subunit are sorted by distance to the
+    local motif COM and encouraged to occupy an even radial distribution from
+    the motif center out to ``max_radius``.  This gives a one-motif bridge-like
+    scaffold packing term when there is no second motif endpoint.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_i: int = 0,
+        spread_weight: float = 1.0,
+        outside_weight: float = 1.0,
+        max_radius: float = 12.0,
+        atom_filter: str = "guide",
+        include_motif_atoms: bool = False,
+        eps: float = 1e-6,
+        reduction: str = "sum",
+    ):
+        super().__init__(weight)
+        if max_radius <= 0.0:
+            raise ValueError("symmetry_single_motif_bridge max_radius must be positive")
+        self.motif_i = int(motif_i)
+        self.spread_weight = float(spread_weight)
+        self.outside_weight = float(outside_weight)
+        self.max_radius = float(max_radius)
+        self.atom_filter = atom_filter
+        self.include_motif_atoms = bool(include_motif_atoms)
+        self.eps = float(eps)
+        self.reduction = _validate_symmetry_reduction(reduction)
+
+    def compute(self, xyz, masks, metadata):
+        subunits = _symmetry_subunit_motif_blocks(masks, metadata, xyz.device)
+        bridge_masks = _symmetry_subunit_bridge_masks(
+            masks,
+            metadata,
+            xyz.device,
+            self.atom_filter,
+            self.include_motif_atoms,
+        )
+        total_loss = xyz.new_zeros(())
+        n_active = 0
+        for subunit_idx, local_blocks in enumerate(subunits):
+            if self.motif_i >= len(local_blocks) or subunit_idx >= len(bridge_masks):
+                continue
+            loss = _single_motif_bridge_loss(
+                xyz,
+                local_blocks[self.motif_i],
+                bridge_masks[subunit_idx],
+                self,
+            )
+            if loss is None:
+                continue
+            total_loss = total_loss + loss
+            n_active += 1
+        if n_active == 0:
+            return xyz.new_zeros(())
+        return _weighted_symmetry_loss(self.weight, total_loss, n_active, self.reduction)
+
+    def guide_atom_mask(self, masks, metadata, device):
+        return _symmetry_aware_bridge_guide_mask(
+            masks,
+            metadata,
+            device,
+            self.atom_filter,
+            self.include_motif_atoms,
+        )
+
+    def instance_guide_masks(self, masks, metadata, device):
+        return _symmetry_subunit_bridge_masks(
+            masks,
+            metadata,
+            device,
+            self.atom_filter,
+            self.include_motif_atoms,
+        )
+
+
 class MotifRigid(BasePotential):
     """Preserve motif geometry against RFD3 reference coordinates.
 
@@ -1460,6 +1625,741 @@ class MotifRadialOrientationPotential(BasePotential):
                 allow_rotation=True,
             )
         return transformed
+
+
+class SymmetryAwareMotifDistance(BasePotential):
+    """Run motif-distance restraints independently inside each symmetry copy.
+
+    ``motif_pairs`` is a list of local motif block index pairs, e.g.
+    ``[[0, 1], [1, 2]]``.  Each pair is evaluated separately for every
+    symmetric subunit using motif blocks that belong to that subunit.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_pairs: list | None = None,
+        motif_i: int = 0,
+        motif_j: int = 1,
+        target_distance: float = 10.0,
+        target_distances: list | None = None,
+        reduction: str = "sum",
+    ):
+        super().__init__(weight)
+        self.motif_pairs = (
+            [tuple(int(x) for x in pair[:2]) for pair in motif_pairs]
+            if motif_pairs is not None
+            else [(int(motif_i), int(motif_j))]
+        )
+        self.target_distance = float(target_distance)
+        self.target_distances = (
+            [float(x) for x in target_distances]
+            if target_distances is not None
+            else []
+        )
+        self.reduction = _validate_symmetry_reduction(reduction)
+
+    def _target_distance(self, pair_idx: int) -> float:
+        if pair_idx < len(self.target_distances):
+            return self.target_distances[pair_idx]
+        return self.target_distance
+
+    def compute(self, xyz, masks, metadata):
+        subunits = _symmetry_subunit_motif_blocks(masks, metadata, xyz.device)
+        total_loss = xyz.new_zeros(())
+        n_active = 0
+        for local_blocks in subunits:
+            for pair_idx, (motif_i, motif_j) in enumerate(self.motif_pairs):
+                if motif_i >= len(local_blocks) or motif_j >= len(local_blocks):
+                    continue
+                motif_a = xyz[:, local_blocks[motif_i], :]
+                motif_b = xyz[:, local_blocks[motif_j], :]
+                if motif_a.shape[1] == 0 or motif_b.shape[1] == 0:
+                    continue
+                dist = (motif_a.mean(dim=1) - motif_b.mean(dim=1)).norm(dim=-1)
+                target = self._target_distance(pair_idx)
+                total_loss = total_loss + ((dist - target) ** 2).mean()
+                n_active += 1
+        if n_active == 0:
+            return xyz.new_zeros(())
+        return _weighted_symmetry_loss(self.weight, total_loss, n_active, self.reduction)
+
+    def guide_atom_mask(self, masks, metadata, device):
+        return _symmetry_aware_selected_motif_mask(
+            masks, metadata, device, self.motif_pairs
+        )
+
+    def instance_guide_masks(self, masks, metadata, device):
+        return _symmetry_aware_pair_instance_masks(
+            masks, metadata, device, self.motif_pairs
+        )
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        selected_blocks = _symmetry_aware_selected_blocks(
+            masks, metadata, xyz.device, self.motif_pairs
+        )
+        return _rigidize_blocks_translation(atom_grad, selected_blocks)
+
+
+class SymmetryAwareMotifCenterDistance(BasePotential):
+    """Distance from each subunit motif to the symmetry center/axis."""
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        target_distances: list | None = None,
+        target_distance: float = 10.0,
+        center: list | None = None,
+        center_type: str = "axis",
+        axis: list | None = None,
+        reduction: str = "sum",
+    ):
+        super().__init__(weight)
+        self.target_distances = (
+            [float(x) for x in target_distances]
+            if target_distances is not None
+            else []
+        )
+        self.target_distance = float(target_distance)
+        self.center = [float(x) for x in center] if center is not None else [0.0, 0.0, 0.0]
+        self.center_type = center_type
+        self.axis = [float(x) for x in axis] if axis is not None else [0.0, 0.0, 1.0]
+        self.reduction = _validate_symmetry_reduction(reduction)
+
+    def _target_distance(self, motif_i: int) -> float:
+        if motif_i < len(self.target_distances):
+            return self.target_distances[motif_i]
+        return self.target_distance
+
+    def compute(self, xyz, masks, metadata):
+        return _symmetry_aware_center_distance_compute(
+            self,
+            xyz,
+            masks,
+            metadata,
+            center_kind="symmetry",
+        )
+
+    def guide_atom_mask(self, masks, metadata, device):
+        return _symmetry_aware_all_motif_mask(masks, metadata, device)
+
+    def instance_guide_masks(self, masks, metadata, device):
+        return _symmetry_aware_all_blocks(masks, metadata, device)
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        return _rigidize_blocks_translation(
+            atom_grad, _symmetry_aware_all_blocks(masks, metadata, xyz.device)
+        )
+
+
+class SymmetryAwareMotifCOMDistance(SymmetryAwareMotifCenterDistance):
+    """Distance from each subunit motif to the current protein COM."""
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        target_distances: list | None = None,
+        target_distance: float = 10.0,
+        origin_atom_filter: str = "real",
+        reduction: str = "sum",
+    ):
+        super().__init__(
+            weight=weight,
+            target_distances=target_distances,
+            target_distance=target_distance,
+            center_type="point",
+            reduction=reduction,
+        )
+        self.origin_atom_filter = origin_atom_filter
+
+    def compute(self, xyz, masks, metadata):
+        return _symmetry_aware_center_distance_compute(
+            self,
+            xyz,
+            masks,
+            metadata,
+            center_kind="com",
+        )
+
+
+class SymmetryAwareMotifRadialPosition(BasePotential):
+    """Keep each motif's radial position relative to the symmetry center/axis."""
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_offsets: list | None = None,
+        center: list | None = None,
+        center_type: str = "axis",
+        axis: list | None = None,
+        eps: float = 1e-6,
+        reduction: str = "sum",
+    ):
+        super().__init__(weight)
+        self.motif_offsets = list(motif_offsets) if motif_offsets is not None else []
+        self.center = [float(x) for x in center] if center is not None else [0.0, 0.0, 0.0]
+        self.center_type = center_type
+        self.axis = [float(x) for x in axis] if axis is not None else [0.0, 0.0, 1.0]
+        self.eps = float(eps)
+        self.reduction = _validate_symmetry_reduction(reduction)
+
+    def _offset_matrix(self, motif_i: int, device: torch.device, dtype: torch.dtype):
+        if motif_i < len(self.motif_offsets):
+            angles = self.motif_offsets[motif_i]
+            if hasattr(angles, "__len__") and len(angles) >= 3:
+                return _euler_rotation_matrix_deg(
+                    float(angles[0]),
+                    float(angles[1]),
+                    float(angles[2]),
+                    device=device,
+                    dtype=dtype,
+                )
+        return torch.eye(3, device=device, dtype=dtype)
+
+    def compute(self, xyz, masks, metadata):
+        return _symmetry_aware_radial_position_compute(
+            self, xyz, masks, metadata, center_kind="symmetry"
+        )
+
+    def guide_atom_mask(self, masks, metadata, device):
+        return _symmetry_aware_all_motif_mask(masks, metadata, device)
+
+    def instance_guide_masks(self, masks, metadata, device):
+        return _symmetry_aware_all_blocks(masks, metadata, device)
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        return _rigidize_blocks_translation(
+            atom_grad, _symmetry_aware_all_blocks(masks, metadata, xyz.device)
+        )
+
+
+class SymmetryAwareMotifCOMRadialPosition(SymmetryAwareMotifRadialPosition):
+    """Keep each motif's radial position relative to the protein COM."""
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_offsets: list | None = None,
+        origin_atom_filter: str = "real",
+        eps: float = 1e-6,
+        reduction: str = "sum",
+    ):
+        super().__init__(
+            weight=weight,
+            motif_offsets=motif_offsets,
+            center_type="point",
+            eps=eps,
+            reduction=reduction,
+        )
+        self.origin_atom_filter = origin_atom_filter
+
+    def compute(self, xyz, masks, metadata):
+        return _symmetry_aware_radial_position_compute(
+            self, xyz, masks, metadata, center_kind="com"
+        )
+
+
+class SymmetryAwareMotifRadialOrientation(MotifRadialOrientationPotential):
+    """Run radial-orientation restraints per symmetry copy around symmetry center."""
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_offsets: list | None = None,
+        motif_axis_weights: list | None = None,
+        center: list | None = None,
+        center_type: str = "axis",
+        axis: list | None = None,
+        eps: float = 1e-6,
+        reduction: str = "sum",
+    ):
+        super().__init__(
+            weight=weight,
+            motif_offsets=motif_offsets,
+            motif_axis_weights=motif_axis_weights,
+            origin_atom_filter="real",
+            eps=eps,
+        )
+        self.center = [float(x) for x in center] if center is not None else [0.0, 0.0, 0.0]
+        self.center_type = center_type
+        self.axis = [float(x) for x in axis] if axis is not None else [0.0, 0.0, 1.0]
+        self.reduction = _validate_symmetry_reduction(reduction)
+
+    def compute(self, xyz, masks, metadata):
+        return _symmetry_aware_radial_orientation_compute(
+            self, xyz, masks, metadata, center_kind="symmetry"
+        )
+
+    def guide_atom_mask(self, masks, metadata, device):
+        return _symmetry_aware_all_motif_mask(masks, metadata, device)
+
+    def instance_guide_masks(self, masks, metadata, device):
+        return _symmetry_aware_all_blocks(masks, metadata, device)
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        return _rigidize_blocks_rotation(
+            atom_grad, _symmetry_aware_all_blocks(masks, metadata, xyz.device), xyz
+        )
+
+
+class SymmetryAwareMotifCOMRadialOrientation(SymmetryAwareMotifRadialOrientation):
+    """Run radial-orientation restraints per symmetry copy around protein COM."""
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_offsets: list | None = None,
+        motif_axis_weights: list | None = None,
+        origin_atom_filter: str = "real",
+        eps: float = 1e-6,
+        reduction: str = "sum",
+    ):
+        super().__init__(
+            weight=weight,
+            motif_offsets=motif_offsets,
+            motif_axis_weights=motif_axis_weights,
+            center_type="point",
+            eps=eps,
+            reduction=reduction,
+        )
+        self.origin_atom_filter = origin_atom_filter
+
+    def compute(self, xyz, masks, metadata):
+        return _symmetry_aware_radial_orientation_compute(
+            self, xyz, masks, metadata, center_kind="com"
+        )
+
+
+def _symmetry_subunit_motif_blocks(
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    device: torch.device,
+) -> list[list[torch.Tensor]]:
+    motif_blocks = _motif_distance_blocks(masks, metadata, device)
+    if not motif_blocks:
+        return []
+    if "sym_transform_id" not in metadata:
+        return [motif_blocks]
+
+    sym_transform_id = metadata["sym_transform_id"].to(device=device, dtype=torch.long)
+    sym_entity_id = metadata.get("sym_entity_id")
+    if sym_entity_id is not None:
+        sym_entity_id = sym_entity_id.to(device=device, dtype=torch.long)
+        valid_sym = sym_entity_id != -1
+    else:
+        valid_sym = torch.ones_like(sym_transform_id, dtype=torch.bool)
+    valid_sym = valid_sym & (sym_transform_id != -1)
+
+    transform_ids = torch.unique(sym_transform_id[valid_sym]).sort().values
+    subunits: list[list[torch.Tensor]] = [[] for _ in transform_ids.tolist()]
+    assigned_blocks = [False] * len(motif_blocks)
+    for subunit_idx, transform_id in enumerate(transform_ids):
+        subunit_atom_mask = valid_sym & (sym_transform_id == transform_id)
+        for block_idx, block_mask in enumerate(motif_blocks):
+            local_block = block_mask & subunit_atom_mask
+            if local_block.any():
+                subunits[subunit_idx].append(local_block)
+                assigned_blocks[block_idx] = True
+
+    # Hetero pseudo-symmetry can append independent unsymmetrized motifs with
+    # FIXED_TRANSFORM_ID.  They are still intended to act as one motif instance
+    # per subunit, so assign transform-less motif blocks by contig order instead
+    # of dropping them from symmetry-aware potentials.
+    if subunits:
+        unassigned = [
+            block_mask
+            for block_idx, block_mask in enumerate(motif_blocks)
+            if not assigned_blocks[block_idx]
+        ]
+        if unassigned:
+            for block_idx, block_mask in enumerate(unassigned):
+                subunits[block_idx % len(subunits)].append(block_mask)
+    subunits = [subunit for subunit in subunits if subunit]
+    return subunits if subunits else [motif_blocks]
+
+
+def _validate_symmetry_reduction(reduction: str) -> str:
+    valid = ("sum", "mean")
+    if reduction not in valid:
+        raise ValueError(f"symmetry-aware potential reduction must be one of {valid}")
+    return reduction
+
+
+def _weighted_symmetry_loss(
+    weight: float,
+    total_loss: torch.Tensor,
+    n_active: int,
+    reduction: str,
+) -> torch.Tensor:
+    if reduction == "mean":
+        total_loss = total_loss / max(int(n_active), 1)
+    return -weight * total_loss
+
+
+def _symmetry_aware_selected_blocks(
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    device: torch.device,
+    motif_pairs: list[tuple[int, int]],
+) -> list[torch.Tensor]:
+    selected = []
+    for local_blocks in _symmetry_subunit_motif_blocks(masks, metadata, device):
+        for motif_i, motif_j in motif_pairs:
+            for motif_idx in (motif_i, motif_j):
+                if 0 <= motif_idx < len(local_blocks):
+                    selected.append(local_blocks[motif_idx])
+    return selected
+
+
+def _symmetry_aware_selected_motif_mask(
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    device: torch.device,
+    motif_pairs: list[tuple[int, int]],
+) -> torch.Tensor:
+    any_mask = next(iter(masks.values()))
+    guide_mask = torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+    for block_mask in _symmetry_aware_selected_blocks(
+        masks, metadata, device, motif_pairs
+    ):
+        guide_mask |= block_mask
+    return guide_mask
+
+
+def _symmetry_aware_pair_instance_masks(
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    device: torch.device,
+    motif_pairs: list[tuple[int, int]],
+) -> list[torch.Tensor]:
+    instance_masks = []
+    for local_blocks in _symmetry_subunit_motif_blocks(masks, metadata, device):
+        for motif_i, motif_j in motif_pairs:
+            any_mask = next(iter(masks.values()))
+            instance_mask = torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+            if 0 <= motif_i < len(local_blocks):
+                instance_mask |= local_blocks[motif_i]
+            if 0 <= motif_j < len(local_blocks):
+                instance_mask |= local_blocks[motif_j]
+            if instance_mask.any():
+                instance_masks.append(instance_mask)
+    return instance_masks
+
+
+def _symmetry_aware_all_blocks(
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    blocks = []
+    for local_blocks in _symmetry_subunit_motif_blocks(masks, metadata, device):
+        blocks.extend(local_blocks)
+    return blocks
+
+
+def _symmetry_aware_all_motif_mask(
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    device: torch.device,
+) -> torch.Tensor:
+    any_mask = next(iter(masks.values()))
+    guide_mask = torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+    for block_mask in _symmetry_aware_all_blocks(masks, metadata, device):
+        guide_mask |= block_mask
+    return guide_mask
+
+
+def _symmetry_subunit_atom_masks(
+    metadata: dict,
+    base_mask: torch.Tensor,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    base_mask = base_mask.to(device=device, dtype=torch.bool)
+    if "sym_transform_id" not in metadata:
+        return [base_mask]
+    sym_transform_id = metadata["sym_transform_id"].to(device=device, dtype=torch.long)
+    sym_entity_id = metadata.get("sym_entity_id")
+    if sym_entity_id is not None:
+        sym_entity_id = sym_entity_id.to(device=device, dtype=torch.long)
+        valid_sym = sym_entity_id != -1
+    else:
+        valid_sym = torch.ones_like(sym_transform_id, dtype=torch.bool)
+    valid_sym = valid_sym & (sym_transform_id != -1)
+    subunit_masks = []
+    for transform_id in torch.unique(sym_transform_id[valid_sym]).sort().values:
+        subunit_mask = base_mask & valid_sym & (sym_transform_id == transform_id)
+        if subunit_mask.any():
+            subunit_masks.append(subunit_mask)
+    return subunit_masks if subunit_masks else [base_mask]
+
+
+def _symmetry_subunit_bridge_masks(
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    device: torch.device,
+    atom_filter: str,
+    include_motif_atoms: bool,
+) -> list[torch.Tensor]:
+    bridge_mask = _bridge_atom_mask(atom_filter=atom_filter, masks=masks, device=device)
+    if not include_motif_atoms:
+        bridge_mask = bridge_mask & ~masks["motif_atom_mask"].to(
+            device=device, dtype=torch.bool
+        )
+    return _symmetry_subunit_atom_masks(metadata, bridge_mask, device)
+
+
+def _symmetry_aware_bridge_guide_mask(
+    masks: dict[str, torch.Tensor],
+    metadata: dict,
+    device: torch.device,
+    atom_filter: str,
+    include_motif_atoms: bool,
+) -> torch.Tensor:
+    any_mask = next(iter(masks.values()))
+    guide_mask = torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+    for bridge_mask in _symmetry_subunit_bridge_masks(
+        masks, metadata, device, atom_filter, include_motif_atoms
+    ):
+        guide_mask |= bridge_mask
+    return guide_mask
+
+
+def _two_motif_bridge_loss(
+    xyz: torch.Tensor,
+    motif_i_mask: torch.Tensor,
+    motif_j_mask: torch.Tensor,
+    bridge_mask: torch.Tensor,
+    obj,
+) -> torch.Tensor | None:
+    motif_a = xyz[:, motif_i_mask, :]
+    motif_b = xyz[:, motif_j_mask, :]
+    if motif_a.shape[1] == 0 or motif_b.shape[1] == 0 or bridge_mask.sum().item() < 1:
+        return None
+
+    bridge_xyz = xyz[:, bridge_mask, :]
+    com_a = motif_a.mean(dim=1)
+    com_b = motif_b.mean(dim=1)
+    axis = com_b - com_a
+    axis_len = axis.norm(dim=-1).clamp(min=obj.eps)
+    axis_unit = axis / axis_len[:, None]
+
+    rel = bridge_xyz - com_a[:, None, :]
+    alpha = (rel * axis_unit[:, None, :]).sum(dim=-1) / axis_len[:, None]
+
+    sorted_alpha = torch.sort(alpha, dim=-1).values
+    if sorted_alpha.shape[-1] == 1:
+        target_alpha = sorted_alpha.new_full(sorted_alpha.shape, 0.5)
+    else:
+        target_alpha = torch.linspace(
+            0.0,
+            1.0,
+            sorted_alpha.shape[-1],
+            device=xyz.device,
+            dtype=xyz.dtype,
+        )
+        target_alpha = target_alpha[None, :].expand_as(sorted_alpha)
+
+    spread_loss = (sorted_alpha - target_alpha).pow(2).mean()
+    outside_loss = (
+        torch.relu(-alpha).pow(2) + torch.relu(alpha - 1.0).pow(2)
+    ).mean()
+    projected = com_a[:, None, :] + alpha[:, :, None] * axis[:, None, :]
+    radial_dist = (bridge_xyz - projected).norm(dim=-1)
+    tube_loss = torch.relu(radial_dist - obj.max_radius).pow(2).mean()
+    return (
+        obj.spread_weight * spread_loss
+        + obj.outside_weight * outside_loss
+        + obj.tube_weight * tube_loss
+    )
+
+
+def _single_motif_bridge_loss(
+    xyz: torch.Tensor,
+    motif_mask: torch.Tensor,
+    bridge_mask: torch.Tensor,
+    obj,
+) -> torch.Tensor | None:
+    motif_xyz = xyz[:, motif_mask, :]
+    if motif_xyz.shape[1] == 0 or bridge_mask.sum().item() < 1:
+        return None
+    bridge_xyz = xyz[:, bridge_mask, :]
+    motif_com = motif_xyz.mean(dim=1)
+    dist = (bridge_xyz - motif_com[:, None, :]).norm(dim=-1)
+    radius_fraction = dist / max(obj.max_radius, obj.eps)
+    sorted_fraction = torch.sort(radius_fraction, dim=-1).values
+    if sorted_fraction.shape[-1] == 1:
+        target_fraction = sorted_fraction.new_full(sorted_fraction.shape, 0.5)
+    else:
+        target_fraction = torch.linspace(
+            0.0,
+            1.0,
+            sorted_fraction.shape[-1],
+            device=xyz.device,
+            dtype=xyz.dtype,
+        )
+        target_fraction = target_fraction[None, :].expand_as(sorted_fraction)
+    spread_loss = (sorted_fraction - target_fraction).pow(2).mean()
+    outside_loss = torch.relu(radius_fraction - 1.0).pow(2).mean()
+    return obj.spread_weight * spread_loss + obj.outside_weight * outside_loss
+
+
+def _rigidize_blocks_translation(atom_grad, blocks):
+    transformed = torch.zeros_like(atom_grad)
+    for block_mask in blocks:
+        if block_mask.sum().item() == 0:
+            continue
+        block_translation = atom_grad[:, block_mask, :].mean(dim=1, keepdim=True)
+        transformed[:, block_mask, :] = block_translation
+    return transformed
+
+
+def _rigidize_blocks_rotation(atom_grad, blocks, xyz):
+    transformed = torch.zeros_like(atom_grad)
+    for block_mask in blocks:
+        if block_mask.sum().item() < 3:
+            continue
+        transformed[:, block_mask, :] = _project_gradient_to_rigid_body(
+            atom_grad[:, block_mask, :],
+            xyz[:, block_mask, :],
+            allow_translation=False,
+            allow_rotation=True,
+        )
+    return transformed
+
+
+def _center_tensor(obj, xyz, masks, metadata, center_kind: str):
+    if center_kind == "com":
+        origin_mask = _pose_origin_atom_mask(obj.origin_atom_filter, masks, xyz.device)
+        center = _masked_current_com(xyz, origin_mask)
+        return None if center is None else center.detach()
+    center = torch.tensor(obj.center, device=xyz.device, dtype=xyz.dtype)
+    return center.unsqueeze(0).expand(xyz.shape[0], -1)
+
+
+def _reference_center_tensor(obj, xyz, masks, metadata, center_kind: str):
+    if center_kind == "com":
+        origin_mask = _pose_origin_atom_mask(obj.origin_atom_filter, masks, xyz.device)
+        ref_center = _masked_reference_com(xyz, masks, metadata, origin_mask)
+        if ref_center is not None:
+            return ref_center
+    return torch.tensor(obj.center, device=xyz.device, dtype=xyz.dtype)
+
+
+def _axis_tensor(obj, xyz):
+    axis = torch.tensor(obj.axis, device=xyz.device, dtype=xyz.dtype)
+    return axis / axis.norm().clamp_min(getattr(obj, "eps", 1e-6))
+
+
+def _center_vector(points, center, obj, xyz):
+    vector = points - center
+    if getattr(obj, "center_type", "point") == "axis":
+        axis = _axis_tensor(obj, xyz)
+        vector = vector - (vector * axis).sum(dim=-1, keepdim=True) * axis
+    return vector
+
+
+def _symmetry_aware_center_distance_compute(obj, xyz, masks, metadata, center_kind):
+    subunits = _symmetry_subunit_motif_blocks(masks, metadata, xyz.device)
+    if not subunits:
+        return xyz.new_zeros(())
+    center = _center_tensor(obj, xyz, masks, metadata, center_kind)
+    if center is None:
+        return xyz.new_zeros(())
+    total_loss = xyz.new_zeros(())
+    n_active = 0
+    for local_blocks in subunits:
+        for motif_i, block_mask in enumerate(local_blocks):
+            motif_com = _motif_block_current_com(xyz, block_mask)
+            if motif_com is None:
+                continue
+            vector = _center_vector(motif_com, center, obj, xyz)
+            dist = vector.norm(dim=-1)
+            total_loss = total_loss + ((dist - obj._target_distance(motif_i)) ** 2).mean()
+            n_active += 1
+    if n_active == 0:
+        return xyz.new_zeros(())
+    return _weighted_symmetry_loss(obj.weight, total_loss, n_active, obj.reduction)
+
+
+def _symmetry_aware_radial_position_compute(obj, xyz, masks, metadata, center_kind):
+    subunits = _symmetry_subunit_motif_blocks(masks, metadata, xyz.device)
+    if not subunits:
+        return xyz.new_zeros(())
+    center = _center_tensor(obj, xyz, masks, metadata, center_kind)
+    ref_center = _reference_center_tensor(obj, xyz, masks, metadata, center_kind)
+    if center is None or ref_center is None:
+        return xyz.new_zeros(())
+
+    total_loss = xyz.new_zeros(())
+    n_active = 0
+    for local_blocks in subunits:
+        for motif_i, block_mask in enumerate(local_blocks):
+            ref_com = _motif_block_reference_com(xyz, masks, metadata, block_mask)
+            cur_com = _motif_block_current_com(xyz, block_mask)
+            if ref_com is None or cur_com is None:
+                continue
+            ref_vec = _center_vector(ref_com.unsqueeze(0), ref_center.unsqueeze(0), obj, xyz).squeeze(0)
+            if ref_vec.norm() < obj.eps:
+                continue
+            ref_dir = ref_vec / ref_vec.norm().clamp_min(obj.eps)
+            R_offset = obj._offset_matrix(motif_i, xyz.device, xyz.dtype)
+            target_dir = _apply_row_rotation(ref_dir.unsqueeze(0), R_offset).squeeze(0)
+            target_dir = (target_dir / target_dir.norm().clamp_min(obj.eps)).detach()
+
+            cur_vec = _center_vector(cur_com, center, obj, xyz)
+            cur_dir = cur_vec / cur_vec.norm(dim=-1, keepdim=True).clamp_min(obj.eps)
+            total_loss = total_loss + (cur_dir - target_dir.unsqueeze(0)).pow(2).sum(dim=-1).mean()
+            n_active += 1
+    if n_active == 0:
+        return xyz.new_zeros(())
+    return _weighted_symmetry_loss(obj.weight, total_loss, n_active, obj.reduction)
+
+
+def _symmetry_aware_radial_orientation_compute(obj, xyz, masks, metadata, center_kind):
+    subunits = _symmetry_subunit_motif_blocks(masks, metadata, xyz.device)
+    if not subunits:
+        return xyz.new_zeros(())
+    center = _center_tensor(obj, xyz, masks, metadata, center_kind)
+    ref_center = _reference_center_tensor(obj, xyz, masks, metadata, center_kind)
+    if center is None or ref_center is None:
+        return xyz.new_zeros(())
+
+    total_loss = xyz.new_zeros(())
+    n_active = 0
+    for local_blocks in subunits:
+        for motif_i, block_mask in enumerate(local_blocks):
+            current_xyz_i, ref_xyz_i = _motif_block_current_and_reference_xyz(
+                xyz, masks, metadata, block_mask
+            )
+            if current_xyz_i is None or ref_xyz_i is None or ref_xyz_i.shape[0] < 3:
+                continue
+            ref_com = ref_xyz_i.mean(dim=0)
+            cur_com = current_xyz_i.mean(dim=1)
+
+            ref_vec = _center_vector(ref_com.unsqueeze(0), ref_center.unsqueeze(0), obj, xyz).squeeze(0)
+            if ref_vec.norm() < obj.eps:
+                continue
+            ref_dir = ref_vec / ref_vec.norm().clamp_min(obj.eps)
+
+            cur_vec = _center_vector(cur_com, center, obj, xyz)
+            cur_dir = (cur_vec / cur_vec.norm(dim=-1, keepdim=True).clamp_min(obj.eps)).detach()
+
+            A_ref = _build_radial_frame(ref_dir, obj.eps)
+            A_cur = _build_radial_frame_batched(cur_dir, obj.eps)
+            ref_centered = ref_xyz_i - ref_com
+            R_offset = obj._offset_matrix(motif_i, xyz.device, xyz.dtype)
+            ref_local = ref_centered @ A_ref
+            ref_local_offset = ref_local @ R_offset
+            current_centered = current_xyz_i - current_xyz_i.mean(dim=1, keepdim=True)
+            current_local = current_centered @ A_cur
+            axis_w = obj._axis_weights_tensor(motif_i, xyz.device, xyz.dtype)
+            total_loss = total_loss + (
+                (current_local - ref_local_offset.unsqueeze(0)).pow(2) * axis_w
+            ).sum(dim=-1).mean()
+            n_active += 1
+    if n_active == 0:
+        return xyz.new_zeros(())
+    return _weighted_symmetry_loss(obj.weight, total_loss, n_active, obj.reduction)
 
 
 def _motif_blocks(
@@ -2184,4 +3084,13 @@ POTENTIAL_REGISTRY: dict[str, type[BasePotential]] = {
     "motif_com_distance": MotifCOMDistance,
     "motif_spherical_position": MotifSphericalPosition,
     "motif_radial_orientation": MotifRadialOrientationPotential,
+    "symmetry_motif_distance": SymmetryAwareMotifDistance,
+    "symmetry_motif_bridge": SymmetryAwareMotifBridge,
+    "symmetry_single_motif_bridge": SymmetryAwareSingleMotifBridge,
+    "symmetry_motif_center_distance": SymmetryAwareMotifCenterDistance,
+    "symmetry_motif_radial_position": SymmetryAwareMotifRadialPosition,
+    "symmetry_motif_radial_orientation": SymmetryAwareMotifRadialOrientation,
+    "symmetry_motif_com_distance": SymmetryAwareMotifCOMDistance,
+    "symmetry_motif_com_radial_position": SymmetryAwareMotifCOMRadialPosition,
+    "symmetry_motif_com_radial_orientation": SymmetryAwareMotifCOMRadialOrientation,
 }

@@ -66,7 +66,15 @@ class RFD3PotentialAdapter:
             "atom_to_token_map": atom_to_token_map,
             "n_tokens": int(atom_to_token_map.max().item()) + 1,
         }
-        for key in ("ref_pos", "motif_pos", "is_motif_atom_with_fixed_seq"):
+        for key in (
+            "ref_pos",
+            "motif_pos",
+            "is_motif_atom_with_fixed_seq",
+            "sym_entity_id",
+            "sym_transform_id",
+            "is_sym_asu",
+            "sym_transform",
+        ):
             if key in f:
                 self.metadata[key] = f[key]
         _add_floating_motif_reference_metadata(self.metadata, f)
@@ -176,7 +184,15 @@ class RFD3PotentialAdapter:
             "atom_to_token_map": atom_to_token_map,
             "n_tokens": int(atom_to_token_map.max().item()) + 1,
         }
-        for key in ("ref_pos", "motif_pos", "is_motif_atom_with_fixed_seq"):
+        for key in (
+            "ref_pos",
+            "motif_pos",
+            "is_motif_atom_with_fixed_seq",
+            "sym_entity_id",
+            "sym_transform_id",
+            "is_sym_asu",
+            "sym_transform",
+        ):
             if key in f:
                 metadata[key] = f[key]
         _add_floating_motif_reference_metadata(metadata, f)

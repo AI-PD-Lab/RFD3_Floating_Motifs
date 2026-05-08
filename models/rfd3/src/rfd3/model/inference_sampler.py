@@ -6,6 +6,10 @@ from typing import Any, Literal
 
 import torch
 from jaxtyping import Float
+from rfd3.inference.symmetry.hetero_pseudo import (
+    HeteroPseudoSymmetryConfig,
+    apply_hetero_pseudo_symmetry,
+)
 from rfd3.inference.symmetry.symmetry_utils import apply_symmetry_to_xyz_atomwise
 from rfd3.model.cfg_utils import strip_X
 from rfd3.model.floating_motif_projection import (
@@ -28,7 +32,7 @@ ranked_logger = RankedLogger(__name__, rank_zero_only=True)
 
 @dataclass(kw_only=True)
 class SampleDiffusionConfig:
-    kind: Literal["default", "symmetry"] = "default"
+    kind: Literal["default", "symmetry", "hetero_symmetry"] = "default"
 
     # Standard EDM args
     num_timesteps: int = 200
@@ -67,6 +71,36 @@ class SampleDiffusionConfig:
 
     # External differentiable potentials (disabled by default; no overhead when empty)
     potentials: dict = field(default_factory=dict)
+
+    # Normal symmetry remains true homomeric symmetry.  By default it follows
+    # the existing sym_step_frac schedule; this optional step cutoff is an
+    # explicit inference-time stop for full monomer projection.
+    full_symmetry_stop_after: int | None = None
+
+    # Hetero pseudo-symmetry: disabled unless inference_sampler.kind is
+    # "hetero_symmetry".  These top-level fields keep compatibility with the
+    # existing sampler config filtering.
+    hetero_post_init_symmetry: Literal[
+        "interface_only", "initialization_only"
+    ] = "interface_only"
+    hetero_projection_enabled: bool = True
+    hetero_projection_hard: bool = False
+    hetero_projection_weight: float = 1.0
+    hetero_projection_start_step: int = 0
+    hetero_projection_stop_after: int | None = None
+    hetero_projection_schedule: Literal["constant", "linear_decay"] = "constant"
+    hetero_interface_distance_cutoff: float = 8.0
+    hetero_interface_sequence_buffer: int = 2
+    hetero_interface_include_sidechains: bool = True
+    hetero_motif_contact_exclusion_enabled: bool = True
+    hetero_motif_contact_distance_cutoff: float = 8.0
+    hetero_motif_contact_sequence_buffer: int = 1
+    hetero_support_enabled: bool = True
+    hetero_support_distance_cutoff: float = 12.0
+    hetero_support_weight: float = 0.3
+    hetero_support_sequence_buffer: int = 2
+    hetero_debug: bool = False
+    hetero_require_per_copy_floating_motifs: bool = True
 
 
 class SampleDiffusionWithMotif(SampleDiffusionConfig):
@@ -442,6 +476,29 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
 
         return X_L
 
+    def should_apply_full_symmetry(self, step_num, c_t, gamma_min_sym):
+        if (
+            self.full_symmetry_stop_after is not None
+            and step_num > self.full_symmetry_stop_after
+        ):
+            return False
+        return c_t > gamma_min_sym
+
+    def apply_post_denoise_symmetry(self, outs, f, step_num, c_t, gamma_min_sym):
+        # Preserve the existing homomeric behavior: denoised coordinates are
+        # projected before the EDM update, and a second projection below keeps
+        # post-guidance coordinates homomeric before Kabsch motif paste.
+        if "X_L" in outs and self.should_apply_full_symmetry(
+            step_num, c_t, gamma_min_sym
+        ):
+            outs["X_L"] = self.apply_symmetry_to_X_L(outs["X_L"], f)
+        return outs
+
+    def apply_post_update_symmetry(self, X_L, f, step_num, c_t, gamma_min_sym):
+        if self.should_apply_full_symmetry(step_num, c_t, gamma_min_sym):
+            return self.apply_symmetry_to_X_L(X_L, f)
+        return X_L
+
     def sample_diffusion_like_af3(
         self,
         *,
@@ -582,10 +639,9 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                     n_recycle=self.n_recycle,
                     **initializer_outputs,
                 )
-            # apply symmetry to X_denoised_L
-            if "X_L" in outs and c_t > gamma_min_sym:
-                # outs["original_X_L"] = outs["X_L"].clone()
-                outs["X_L"] = self.apply_symmetry_to_X_L(outs["X_L"], f)
+            outs = self.apply_post_denoise_symmetry(
+                outs, f, step_num, c_t, gamma_min_sym
+            )
 
             X_denoised_L = outs["X_L"] if "X_L" in outs else outs
 
@@ -619,6 +675,9 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                     T=float(noise_schedule[0]),
                     step_idx=step_num,
                 )
+            X_L = self.apply_post_update_symmetry(
+                X_L, f, step_num, c_t, gamma_min_sym
+            )
             if should_project_floating_motifs(
                 step_num,
                 enabled=self.floating_motif_project,
@@ -666,6 +725,92 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
         )
 
 
+class SampleDiffusionWithHeteroPseudoSymmetry(SampleDiffusionWithSymmetry):
+    """Symmetric initialization with optional interface-only post-init symmetry.
+
+    This sampler intentionally bypasses full-monomer projection after
+    initialization.  Motif Kabsch projection and potentials are inherited from
+    the standard sampler order: denoise, potential guidance, hetero interface
+    projection, then floating motif Kabsch paste.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.hetero_config = HeteroPseudoSymmetryConfig(
+            post_init_symmetry=self.hetero_post_init_symmetry,
+            projection_enabled=self.hetero_projection_enabled,
+            hard=self.hetero_projection_hard,
+            weight=self.hetero_projection_weight,
+            start_step=self.hetero_projection_start_step,
+            stop_after=self.hetero_projection_stop_after,
+            schedule=self.hetero_projection_schedule,
+            interface_distance_cutoff=self.hetero_interface_distance_cutoff,
+            interface_sequence_buffer=self.hetero_interface_sequence_buffer,
+            interface_include_sidechains=self.hetero_interface_include_sidechains,
+            motif_contact_exclusion_enabled=(
+                self.hetero_motif_contact_exclusion_enabled
+            ),
+            motif_contact_distance_cutoff=(
+                self.hetero_motif_contact_distance_cutoff
+            ),
+            motif_contact_sequence_buffer=self.hetero_motif_contact_sequence_buffer,
+            support_enabled=self.hetero_support_enabled,
+            support_distance_cutoff=self.hetero_support_distance_cutoff,
+            support_weight=self.hetero_support_weight,
+            support_sequence_buffer=self.hetero_support_sequence_buffer,
+            debug=self.hetero_debug,
+        )
+        ranked_logger.info(
+            f"[hetero_symmetry] mode={self.hetero_config.post_init_symmetry} "
+            f"projection_enabled={self.hetero_config.projection_enabled} "
+            f"hard={self.hetero_config.hard} "
+            f"weight={self.hetero_config.weight:.3f} "
+            f"support_weight={self.hetero_config.support_weight:.3f}"
+        )
+
+    def apply_symmetry_to_X_L(self, X_L, f):
+        del f
+        return X_L
+
+    def apply_post_denoise_symmetry(self, outs, f, step_num, c_t, gamma_min_sym):
+        del f, step_num, c_t, gamma_min_sym
+        return outs
+
+    def apply_post_update_symmetry(self, X_L, f, step_num, c_t, gamma_min_sym):
+        del c_t, gamma_min_sym
+        X_L, debug = apply_hetero_pseudo_symmetry(
+            X_L, f, self.hetero_config, step_num
+        )
+        if self.hetero_config.debug:
+            ranked_logger.info(f"[hetero_symmetry] step={step_num} {debug}")
+        return X_L
+
+    def sample_diffusion_like_af3(self, *, f, floating_motif_refs=None, **kwargs):
+        self._validate_hetero_floating_motifs(f, floating_motif_refs)
+        return super().sample_diffusion_like_af3(
+            f=f, floating_motif_refs=floating_motif_refs, **kwargs
+        )
+
+    def _validate_hetero_floating_motifs(self, f, floating_motif_refs):
+        if (
+            not self.floating_motif_project
+            or not self.hetero_require_per_copy_floating_motifs
+            or not floating_motif_refs
+            or "sym_transform_id" not in f
+        ):
+            return
+        transform_ids = f["sym_transform_id"]
+        n_copies = int(torch.unique(transform_ids).numel())
+        if n_copies > 1 and len(floating_motif_refs) == 1:
+            raise ValueError(
+                "hetero_symmetry with floating_motif_project=True received one "
+                f"floating motif reference for {n_copies} symmetry copies. "
+                "Provide one independently defined motif per copy, or set "
+                "hetero_require_per_copy_floating_motifs=False to bypass this "
+                "validation."
+            )
+
+
 class ConditionalDiffusionSampler:
     """
     Conditional diffusion sampler, chooses at construction time which sampler to use,
@@ -677,6 +822,7 @@ class ConditionalDiffusionSampler:
     _registry = {
         "default": SampleDiffusionWithMotif,
         "symmetry": SampleDiffusionWithSymmetry,
+        "hetero_symmetry": SampleDiffusionWithHeteroPseudoSymmetry,
     }
 
     def __init__(self, kind="default", **kwargs):

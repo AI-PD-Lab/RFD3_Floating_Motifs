@@ -965,6 +965,503 @@ class MotifRigid(BasePotential):
         return -self.weight * loss / n_groups
 
 
+class MotifCOMDistance(BasePotential):
+    """Harmonic restraint on the distance of each motif center from the protein COM.
+
+    For each contig-defined motif block that has an entry in ``target_distances``,
+    the distance from the block's center of mass to the protein-wide center of mass
+    is penalised toward the specified target:
+
+        loss_i = (dist(motif_i_center, protein_COM) - target_distances[i])²
+        return  = -weight * mean_over_active_motifs(loss_i)
+
+    The protein COM is computed from atoms selected by ``origin_atom_filter`` and is
+    detached from the gradient, so the potential only moves motif atoms — it cannot
+    drag the rest of the protein.
+
+    Gradient is rigidised to pure rigid-body translation per block (all atoms in
+    the block receive the same displacement).
+
+    ``target_distances`` is a list of floats (Å), one per motif block in contig
+    order.  Blocks without an entry are not constrained.  An empty list produces
+    a zero potential.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        target_distances: list | None = None,
+        origin_atom_filter: str = "real",
+        eps: float = 1e-6,
+    ):
+        super().__init__(weight)
+        self.target_distances: list = (
+            list(target_distances) if target_distances is not None else []
+        )
+        valid_origin_filters = ("real", "potential", "guide", "motif", "all")
+        if origin_atom_filter not in valid_origin_filters:
+            raise ValueError(
+                f"motif_com_distance origin_atom_filter must be one of {valid_origin_filters}"
+            )
+        self.origin_atom_filter = origin_atom_filter
+        self.eps = float(eps)
+
+    def compute(self, xyz, masks, metadata):
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        if not motif_blocks or not self.target_distances:
+            return xyz.new_zeros(())
+
+        origin_mask = _pose_origin_atom_mask(self.origin_atom_filter, masks, xyz.device)
+        current_com = _masked_current_com(xyz, origin_mask)
+        if current_com is None:
+            return xyz.new_zeros(())
+        current_com = current_com.detach()  # [D, 3] — no gradient through protein COM
+
+        total_loss = xyz.new_zeros(())
+        n_active = 0
+
+        for motif_i, block_mask in enumerate(motif_blocks):
+            if motif_i >= len(self.target_distances):
+                break
+            target_dist = float(self.target_distances[motif_i])
+            motif_xyz = xyz[:, block_mask, :]  # [D, N, 3]
+            if motif_xyz.shape[1] == 0:
+                continue
+            motif_com = motif_xyz.mean(dim=1)  # [D, 3]
+            dist = (motif_com - current_com).norm(dim=-1)  # [D]
+            total_loss = total_loss + ((dist - target_dist) ** 2).mean()
+            n_active += 1
+
+        if n_active == 0:
+            return xyz.new_zeros(())
+        return -self.weight * total_loss / n_active
+
+    def guide_atom_mask(self, masks, metadata, device):
+        motif_blocks = _motif_distance_blocks(masks, metadata, device)
+        if not motif_blocks:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        guide_mask = torch.zeros_like(motif_blocks[0], dtype=torch.bool, device=device)
+        for motif_i, block_mask in enumerate(motif_blocks):
+            if motif_i >= len(self.target_distances):
+                break
+            guide_mask |= block_mask
+        return guide_mask
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        if not motif_blocks:
+            return atom_grad
+        transformed = torch.zeros_like(atom_grad)
+        for motif_i, block_mask in enumerate(motif_blocks):
+            if motif_i >= len(self.target_distances):
+                break
+            if block_mask.sum().item() == 0:
+                continue
+            block_translation = atom_grad[:, block_mask, :].mean(dim=1, keepdim=True)
+            transformed[:, block_mask, :] = block_translation
+        return transformed
+
+
+class MotifSphericalPosition(BasePotential):
+    """Constrain each motif's angular position on the sphere around the protein COM.
+
+    Penalises the deviation of the unit vector from the protein COM to each motif
+    center from a per-motif target direction derived from the input PDB.  The
+    radial distance (how far the motif is from the COM) is completely ignored —
+    the loss is a pure normalised-direction comparison, so it only acts on the
+    angular (spherical) position of each motif.
+
+    This potential is intentionally complementary to MotifRadialOrientationPotential:
+    - MotifSphericalPosition controls *where* each motif sits on the sphere
+      (latitude / longitude around the COM).
+    - MotifRadialOrientationPotential controls *how* each motif is oriented
+      relative to its radial direction (which way it faces outward).
+
+    The reference radial direction for motif i is:
+        r_ref_i = normalise(ref_com_i − global_ref_centre)
+    where global_ref_centre is the mean of all motif-block reference COMs (the
+    same convention as MotifRadialOrientationPotential).  A motif whose reference
+    centre coincides with this global centre is skipped.
+
+    ``motif_offsets`` is a list of [angle_x, angle_y, angle_z] Euler angles in
+    degrees, one entry per motif block (contig order).  The offset rotates the
+    reference radial *direction* in 3-D, allowing you to specify a target
+    angular position different from the input PDB.  [0, 0, 0] = preserve PDB
+    angular position (default).
+
+    Gradient is projected to pure rigid-body translation per motif block (no
+    rotation).  The protein COM is detached from the gradient graph so this
+    potential only moves motif atoms, never the rest of the protein.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_offsets: list | None = None,
+        origin_atom_filter: str = "real",
+        eps: float = 1e-6,
+    ):
+        super().__init__(weight)
+        self.motif_offsets: list = list(motif_offsets) if motif_offsets is not None else []
+        valid_origin_filters = ("real", "potential", "guide", "motif", "all")
+        if origin_atom_filter not in valid_origin_filters:
+            raise ValueError(
+                "motif_spherical_position origin_atom_filter must be one of "
+                f"{valid_origin_filters}"
+            )
+        self.origin_atom_filter = origin_atom_filter
+        self.eps = float(eps)
+
+    def _offset_matrix(
+        self,
+        motif_i: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if motif_i < len(self.motif_offsets):
+            angles = self.motif_offsets[motif_i]
+            if hasattr(angles, "__len__") and len(angles) >= 3:
+                return _euler_rotation_matrix_deg(
+                    float(angles[0]),
+                    float(angles[1]),
+                    float(angles[2]),
+                    device=device,
+                    dtype=dtype,
+                )
+        return torch.eye(3, device=device, dtype=dtype)
+
+    def compute(self, xyz, masks, metadata):
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        if not motif_blocks:
+            return xyz.new_zeros(())
+
+        origin_mask = _pose_origin_atom_mask(self.origin_atom_filter, masks, xyz.device)
+        current_com = _masked_current_com(xyz, origin_mask)
+        if current_com is None:
+            return xyz.new_zeros(())
+        current_com = current_com.detach()  # [D, 3] — no gradient through protein COM
+
+        # Reference global centre: mean of all motif-block reference COMs (same
+        # convention as MotifRadialOrientationPotential).
+        ref_centers: list[torch.Tensor | None] = []
+        for block_mask in motif_blocks:
+            ref_centers.append(_motif_block_reference_com(xyz, masks, metadata, block_mask))
+        valid_ref_centers = [c for c in ref_centers if c is not None]
+        if not valid_ref_centers:
+            return xyz.new_zeros(())
+        c_ref_global = torch.stack(valid_ref_centers, dim=0).mean(dim=0)  # [3]
+
+        total_loss = xyz.new_zeros(())
+        n_active = 0
+
+        for motif_i, block_mask in enumerate(motif_blocks):
+            ref_com_i = ref_centers[motif_i]
+            if ref_com_i is None:
+                continue
+
+            # Reference radial direction (unit vector from global centre to motif).
+            d_ref = ref_com_i - c_ref_global  # [3]
+            d_ref_norm = d_ref.norm()
+            if d_ref_norm < self.eps:
+                continue  # motif sits at global centre — degenerate, skip
+            r_ref_i = d_ref / d_ref_norm  # [3]
+
+            # Apply per-motif Euler offset to the reference direction.
+            R_offset = self._offset_matrix(motif_i, xyz.device, xyz.dtype)
+            r_target_i = _apply_row_rotation(r_ref_i.unsqueeze(0), R_offset).squeeze(0)
+            r_target_i = (r_target_i / r_target_i.norm().clamp_min(self.eps)).detach()  # [3]
+
+            # Current radial direction — normalised, so radius has no effect.
+            m_cur_i = _motif_block_current_com(xyz, block_mask)  # [D, 3]
+            if m_cur_i is None:
+                continue
+            d_cur = m_cur_i - current_com  # [D, 3]
+            d_cur_norm = d_cur.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+            r_cur_i = d_cur / d_cur_norm  # [D, 3]
+
+            # Normalised-direction loss: 0 when aligned, up to 4 when antiparallel.
+            diff = r_cur_i - r_target_i.unsqueeze(0)  # [D, 3]
+            total_loss = total_loss + diff.pow(2).sum(dim=-1).mean()
+            n_active += 1
+
+        if n_active == 0:
+            return xyz.new_zeros(())
+        return -self.weight * total_loss / n_active
+
+    def guide_atom_mask(self, masks, metadata, device):
+        motif_blocks = _motif_distance_blocks(masks, metadata, device)
+        if not motif_blocks:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        guide_mask = torch.zeros_like(motif_blocks[0], dtype=torch.bool, device=device)
+        for block_mask in motif_blocks:
+            guide_mask = guide_mask | block_mask
+        return guide_mask
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        if not motif_blocks:
+            return torch.zeros_like(atom_grad)
+        transformed = torch.zeros_like(atom_grad)
+        for block_mask in motif_blocks:
+            if block_mask.sum().item() == 0:
+                continue
+            block_translation = atom_grad[:, block_mask, :].mean(dim=1, keepdim=True)
+            transformed[:, block_mask, :] = block_translation
+        return transformed
+
+
+class MotifRadialOrientationPotential(BasePotential):
+    """Bias each motif's rotation to preserve its input-PDB radial orientation.
+
+    Each contig-defined motif block is treated as a rigid body. The potential
+    biases the rotational pose of each motif relative to the direction from
+    the current protein center of mass (COM) to the motif's own center — the
+    motif's *radial orientation*.
+
+    Intuition: if a face of a motif points outward from the midpoint of all
+    motifs in the input PDB, it will continue to point outward during
+    diffusion, regardless of where on a conceptual sphere around the protein
+    COM the motif is placed or how far it is from the COM.
+
+    Enforced invariances:
+    - Radius: COM-to-motif distance has no effect; the radial direction is
+      normalized and the COM is detached from the gradient graph.
+    - Angular position on sphere: each motif may orbit freely around the COM.
+      The radial direction that builds the target frame is also detached, so
+      no angular-position gradient is introduced.
+    - Inter-motif distances: each motif is scored independently.
+
+    The reference global centre is the mean of all motif-block reference
+    centres. A motif whose reference centre coincides with this global centre
+    (degenerate radial vector) is skipped. Therefore the potential requires at
+    least two motif blocks with distinct reference centre positions.
+
+    ``motif_offsets`` is a list of [angle_x, angle_y, angle_z] in **degrees**
+    for each motif block, indexed in contig order. Missing entries default to
+    [0, 0, 0].  The offset rotates the target orientation inside the motif's
+    local radial frame:
+    - axis 0 (x) = along the radial direction (inward/outward spin)
+    - axes 1, 2 (y, z) = tangential rotations
+
+    The input-PDB pose corresponds to offset (0, 0, 0) for every motif.
+
+    Requires at least 3 atoms per motif block with valid reference coordinates
+    for a stable local frame.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_offsets: list | None = None,
+        motif_axis_weights: list | None = None,
+        origin_atom_filter: str = "real",
+        eps: float = 1e-6,
+    ):
+        super().__init__(weight)
+        self.motif_offsets: list = list(motif_offsets) if motif_offsets is not None else []
+        self.motif_axis_weights: list = (
+            list(motif_axis_weights) if motif_axis_weights is not None else []
+        )
+        valid_origin_filters = ("real", "potential", "guide", "motif", "all")
+        if origin_atom_filter not in valid_origin_filters:
+            raise ValueError(
+                "motif_radial_orientation origin_atom_filter must be one of "
+                f"{valid_origin_filters}"
+            )
+        self.origin_atom_filter = origin_atom_filter
+        self.eps = float(eps)
+        self.skip_reason: str | None = None
+        self.skip_detail: dict | None = None
+
+    def _offset_matrix(
+        self,
+        motif_i: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """3×3 Euler rotation (ZYX) for the per-motif offset, in degrees."""
+        if motif_i < len(self.motif_offsets):
+            angles = self.motif_offsets[motif_i]
+            if hasattr(angles, "__len__") and len(angles) >= 3:
+                return _euler_rotation_matrix_deg(
+                    float(angles[0]),
+                    float(angles[1]),
+                    float(angles[2]),
+                    device=device,
+                    dtype=dtype,
+                )
+        return torch.eye(3, device=device, dtype=dtype)
+
+    def _axis_weights_tensor(
+        self,
+        motif_i: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """[3] per-axis loss weights for motif_i. Default [1, 1, 1] (full constraint).
+
+        Axis 0 (r) is the radial direction; axes 1-2 (t1, t2) are the two
+        perpendicular tangents.  Setting a weight to 0 removes the loss
+        contribution along that local-frame axis.  Because rotation around
+        frame axis k leaves the k-th coordinate component unchanged while
+        moving the other two, zeroing an axis weight frees the rotational
+        DOFs whose atom displacement lives in the remaining two axes:
+
+          axis_weights=[1,0,0] → only r-components penalised → free spin around r
+          axis_weights=[0,1,1] → no r-component penalty    → free tumble in t1/t2 plane
+          axis_weights=[1,1,1] → full constraint (default, identical to old behaviour)
+        """
+        if motif_i < len(self.motif_axis_weights):
+            aw = self.motif_axis_weights[motif_i]
+            if hasattr(aw, "__len__") and len(aw) >= 3:
+                return torch.tensor(
+                    [float(aw[0]), float(aw[1]), float(aw[2])],
+                    device=device,
+                    dtype=dtype,
+                )
+        return torch.ones(3, device=device, dtype=dtype)
+
+    def compute(self, xyz, masks, metadata):
+        self.skip_reason = None
+        self.skip_detail = None
+
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        self.skip_detail = {
+            "n_motif_blocks": len(motif_blocks),
+            "has_floating_motif_reference_pos": "floating_motif_reference_pos"
+            in metadata,
+            "has_input_pos": "input_pos" in metadata,
+            "has_motif_pos": "motif_pos" in metadata,
+            "has_ref_pos": "ref_pos" in metadata,
+            "origin_atom_filter": self.origin_atom_filter,
+        }
+
+        if len(motif_blocks) == 0:
+            self.skip_reason = "no_motif_blocks"
+            return xyz.new_zeros(())
+
+        # Protein COM for this step — detached so the potential cannot push
+        # atoms toward or away from the COM (no radial-distance gradient).
+        origin_mask = _pose_origin_atom_mask(
+            self.origin_atom_filter, masks, xyz.device
+        )
+        current_com = _masked_current_com(xyz, origin_mask)
+        if current_com is None:
+            self.skip_reason = "current_com_missing"
+            return xyz.new_zeros(())
+        current_com = current_com.detach()  # [D, 3]
+
+        # Reference global centre = mean of all motif-block reference centres.
+        # Used to define the reference radial direction per motif.
+        ref_centers: list[torch.Tensor] = []
+        for block_mask in motif_blocks:
+            rc = _motif_block_reference_com(xyz, masks, metadata, block_mask)
+            ref_centers.append(rc)
+        valid_ref_centers = [c for c in ref_centers if c is not None]
+        if not valid_ref_centers:
+            self.skip_reason = "no_motif_reference_centers"
+            return xyz.new_zeros(())
+        c_ref_global = torch.stack(valid_ref_centers, dim=0).mean(dim=0)  # [3]
+
+        total_loss = xyz.new_zeros(())
+        n_active = 0
+
+        for motif_i, block_mask in enumerate(motif_blocks):
+            current_xyz_i, ref_xyz_i = _motif_block_current_and_reference_xyz(
+                xyz, masks, metadata, block_mask
+            )
+            if current_xyz_i is None or ref_xyz_i is None or ref_xyz_i.shape[0] < 3:
+                continue
+
+            ref_com_i = ref_xyz_i.mean(dim=0)  # [3]
+
+            # Reference radial direction: from the global reference centre to
+            # this motif's reference centre.  Skip degenerate cases (motif at
+            # the global centre, or only one motif block).
+            d_ref = ref_com_i - c_ref_global  # [3]
+            d_ref_norm = d_ref.norm()
+            if d_ref_norm < self.eps:
+                continue
+            r_ref_i = d_ref / d_ref_norm  # [3] unit vector
+
+            # Current motif centre (all block atoms for a stable estimate).
+            m_cur_i = _motif_block_current_com(xyz, block_mask)  # [D, 3]
+            if m_cur_i is None:
+                continue
+
+            # Current radial direction — detached so the gradient does NOT
+            # push the motif to a specific angular position on the sphere.
+            # Only the motif's internal rotation receives gradient updates.
+            d_cur = m_cur_i - current_com  # [D, 3]
+            d_cur_norm = d_cur.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+            r_cur_i = (d_cur / d_cur_norm).detach()  # [D, 3]
+
+            # Orthonormal frames aligned to the two radial directions.
+            # Columns of each frame are [r, t1, t2]: r is the radial axis,
+            # t1 and t2 are two perpendicular tangents chosen deterministically.
+            A_ref_i = _build_radial_frame(r_ref_i, self.eps)          # [3, 3]
+            A_cur_i = _build_radial_frame_batched(r_cur_i, self.eps)  # [D, 3, 3]
+
+            # Express reference coordinates in the local radial frame of
+            # A_ref_i, then apply any per-motif rotation offset.
+            ref_centered = ref_xyz_i - ref_com_i  # [N, 3]
+            R_offset_i = self._offset_matrix(motif_i, xyz.device, xyz.dtype)
+            ref_local = ref_centered @ A_ref_i          # [N, 3]
+            ref_local_offset = ref_local @ R_offset_i   # [N, 3]
+
+            # Current motif coordinates, centred (removes COM translation).
+            current_centered = (
+                current_xyz_i - current_xyz_i.mean(dim=1, keepdim=True)
+            )  # [D, N, 3]
+
+            # Project current coords into the same local radial frame so the
+            # diff can be weighted per axis.  Mathematically equivalent to
+            # the global-frame diff when axis_weights=[1,1,1] (A_cur_i is
+            # orthogonal → isometry), so the default behaviour is unchanged.
+            current_local = current_centered @ A_cur_i                   # [D, N, 3]
+            diff_local = current_local - ref_local_offset.unsqueeze(0)   # [D, N, 3]
+
+            # Per-axis weights: 0 = free movement along that frame axis.
+            axis_w = self._axis_weights_tensor(motif_i, xyz.device, xyz.dtype)
+            total_loss = total_loss + (diff_local.pow(2) * axis_w).sum(dim=-1).mean()
+            n_active += 1
+
+        if n_active == 0:
+            self.skip_reason = "no_active_motifs"
+            return xyz.new_zeros(())
+
+        return -self.weight * total_loss / n_active
+
+    def guide_atom_mask(self, masks, metadata, device):
+        motif_blocks = _motif_distance_blocks(masks, metadata, device)
+        if not motif_blocks:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        guide_mask = torch.zeros_like(motif_blocks[0], dtype=torch.bool, device=device)
+        for block_mask in motif_blocks:
+            guide_mask = guide_mask | block_mask
+        return guide_mask
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        if not motif_blocks:
+            return torch.zeros_like(atom_grad)
+        transformed = torch.zeros_like(atom_grad)
+        for block_mask in motif_blocks:
+            if block_mask.sum().item() < 3:
+                continue
+            # Project to pure rigid rotation: zero translation, zero deformation.
+            transformed[:, block_mask, :] = _project_gradient_to_rigid_body(
+                atom_grad[:, block_mask, :],
+                xyz[:, block_mask, :],
+                allow_translation=False,
+                allow_rotation=True,
+            )
+        return transformed
+
+
 def _motif_blocks(
     masks: dict[str, torch.Tensor],
     metadata: dict,
@@ -1562,6 +2059,57 @@ def _normalize_vectors(vectors: torch.Tensor, eps: float = 1e-6) -> torch.Tensor
     return vectors / norms
 
 
+def _build_radial_frame(r: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Build a deterministic orthonormal frame with r as the first column.
+
+    Picks the global axis least aligned with r as the second Gram-Schmidt seed
+    to avoid degeneracy (ensures the frame is well-conditioned for any r).
+
+    Args:
+        r:   [3] unit vector.
+        eps: denominator clamp for normalisation.
+
+    Returns:
+        [3, 3] matrix whose columns are [r, t1, t2] (all orthonormal).
+    """
+    # Axis whose component in r is smallest → least aligned with r
+    abs_r = r.detach().abs()
+    min_idx = int(abs_r.argmin().item())
+    v = r.new_zeros(3)
+    v[min_idx] = 1.0
+
+    # Gram-Schmidt: remove r-projection from v
+    t1 = v - (v * r).sum() * r
+    t1 = t1 / t1.norm().clamp_min(eps)
+    t2 = torch.cross(r.unsqueeze(0), t1.unsqueeze(0), dim=-1).squeeze(0)
+    return torch.stack([r, t1, t2], dim=-1)  # [3, 3], columns are basis vectors
+
+
+def _build_radial_frame_batched(r: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Batched version of _build_radial_frame.
+
+    Args:
+        r:   [D, 3] unit vectors (should be detached before calling to keep
+             the returned frame out of the autograd graph).
+        eps: denominator clamp for normalisation.
+
+    Returns:
+        [D, 3, 3] matrices whose columns are [r, t1, t2].
+    """
+    abs_r = r.abs()  # [D, 3]
+    min_idx = abs_r.argmin(dim=-1)  # [D] — index of least-aligned axis per sample
+
+    # One-hot: v[d, min_idx[d]] = 1.0
+    v = torch.zeros_like(r)
+    v.scatter_(-1, min_idx.unsqueeze(-1), 1.0)
+
+    # Gram-Schmidt
+    t1 = v - (v * r).sum(dim=-1, keepdim=True) * r  # [D, 3]
+    t1 = t1 / t1.norm(dim=-1, keepdim=True).clamp_min(eps)
+    t2 = torch.cross(r, t1, dim=-1)  # [D, 3]
+    return torch.stack([r, t1, t2], dim=-1)  # [D, 3, 3], columns are basis vectors
+
+
 def _project_gradient_to_rigid_body(
     atom_grad: torch.Tensor,
     xyz_block: torch.Tensor,
@@ -1633,4 +2181,7 @@ POTENTIAL_REGISTRY: dict[str, type[BasePotential]] = {
     "rigid_body_pose": MotifRigidBodyPose,
     "motif_bridge": MotifBridge,
     "motif_rigid": MotifRigid,
+    "motif_com_distance": MotifCOMDistance,
+    "motif_spherical_position": MotifSphericalPosition,
+    "motif_radial_orientation": MotifRadialOrientationPotential,
 }

@@ -151,6 +151,7 @@ All potentials support `weight` unless noted. The value is a scalar to maximize,
 | `motif_distance` | `weight=1.0`, `motif_i=0`, `motif_j=1`, `target_distance=10.0` | Harmonic COM-distance restraint between two contiguous motif-token blocks. Motif blocks are inferred from contig order, and guidance applies one translation to all atoms in each selected motif block. |
 | `motif_bridge` | `weight=1.0`, `motif_i=0`, `motif_j=1`, `spread_weight=1.0`, `outside_weight=1.0`, `tube_weight=0.2`, `max_radius=12.0`, `atom_filter=guide`, `include_motif_atoms=false` | Encourages generated non-motif atoms to spread evenly between two motif centers. |
 | `motif_rigid` | `weight=1.0`, `k=1.0`, `loss=pseudo_huber`, `group_mode=all`, `atom_filter=potential`, `motif_i=null`, `min_separation=0` | Preserves fixed-sequence and fixed-coordinate motif geometry by matching current motif atom-pair distances to RFD3 reference coordinates. |
+| `motif_radial_orientation` | `weight=1.0`, `motif_offsets=[]`, `origin_atom_filter=real`, `eps=1e-6` | Biases each motif block's rigid-body rotation to preserve (or offset) its input-PDB radial orientation relative to the current protein COM. Invariant to motif radius, angular position on the sphere, and inter-motif distances. Requires at least two motif blocks with distinct reference centres. |
 
 `interface_ncontacts` and `monomer_contacts` use the soft contact function `1 / (1 + ((distance - d_0) / r_0)^6)`.
 
@@ -239,6 +240,81 @@ guiding_potentials:
   - "type:motif_distance,weight:50.0,guide_scale:0.5,guide_decay:inverse_linear,guide_clip_rms:0.05,motif_i:0,motif_j:1,target_distance:50.0"
   - "type:motif_bridge,weight:5.0,guide_scale:0.5,guide_decay:inverse_linear,guide_clip_rms:0.05,motif_i:0,motif_j:1,spread_weight:1.0,outside_weight:1.0,tube_weight:0.2,max_radius:12.0,atom_filter:guide"
   - "type:motif_rigid,weight:1000.0,guide_scale:1.0,guide_decay:inverse_cosine,guide_clip_rms:0.05,atom_filter:backbone,k:0.25,loss:pseudo_huber,group_mode:all"
+```
+
+### `motif_radial_orientation` guide
+
+`motif_radial_orientation` biases the *rotational pose* of each contig-defined motif block relative to the direction from the current protein center of mass (COM) to the motif's center. This direction is the motif's *radial direction*. The potential asks: "is the motif rotated the same way around its radial axis as it was in the input PDB?"
+
+**What is preserved.** For each motif block, the potential stores a local reference frame at inference start. The frame is built from the motif's reference backbone coordinates expressed relative to the inward/outward radial axis. During diffusion the same frame-relative pose is reconstructed around the *current* radial direction and compared to the current motif atom positions. The loss is the mean squared deviation of centred atom positions from the reconstructed target.
+
+**What is NOT affected.** The potential is invariant by construction to:
+- Radius (distance from COM to motif): the radial direction is normalised and the COM is detached from the gradient graph.
+- Angular position on the sphere: the radial direction that builds the target frame is detached, so no gradient pushes the motif to a specific location around the COM.
+- Inter-motif distances: each block is scored independently.
+- Global translation and rotation: gradient is projected to pure rigid rotation for each motif block.
+
+**Requirement.** At least two motif blocks with distinct reference centre positions are needed. A motif whose reference centre coincides with the global reference centre produces a zero radial vector and is silently skipped.
+
+`motif_radial_orientation` variables:
+
+| Variable | Default | Values | Meaning |
+| --- | --- | --- | --- |
+| `weight` | `1.0` | float | Overall strength of the orientation restraint. |
+| `motif_offsets` | `[]` | list of `[ax, ay, az]` in degrees | Per-motif Euler (ZYX) offsets, indexed in contig order. Missing entries use `[0, 0, 0]`. The input-PDB pose corresponds to `[0, 0, 0]`. Offsets rotate the target inside the motif's local radial frame: axis 0 (x) spins around the radial direction, axes 1–2 (y, z) tilt the motif. |
+| `origin_atom_filter` | `real` | `real`, `potential`, `guide`, `motif`, `all` | Atom selection used to compute the current protein COM. `real` (all non-virtual atoms) is usually appropriate. |
+| `eps` | `1e-6` | float | Denominator clamp for normalisation and frame construction. |
+
+**YAML-only for `motif_offsets`.** Because `motif_offsets` is a list of lists it cannot be expressed in the flat `"type:X,key:val"` string format. Use the YAML dict form:
+
+```yaml
+inference_sampler:
+  potentials:
+    enabled: true
+    apply_mode: atom
+    guide_scale: 0.15
+    guide_decay: inverse_cosine
+    guide_clip_rms: 0.03
+    include_atoms: real_heavy
+    guiding_potentials:
+      # Preserve the input-PDB radial orientation for all motif blocks
+      - type: motif_radial_orientation
+        weight: 5.0
+        guide_scale: 0.2
+        guide_decay: inverse_linear
+        guide_clip_rms: 0.05
+        origin_atom_filter: real
+        motif_offsets: []          # empty list = reproduce input-PDB orientation
+
+      # Same, but spin motif block 0 by 90° around the radial axis and
+      # tilt motif block 1 by 45° around the first tangent axis
+      - type: motif_radial_orientation
+        weight: 5.0
+        origin_atom_filter: real
+        motif_offsets:
+          - [90.0, 0.0, 0.0]       # block 0: 90° spin around radial direction
+          - [0.0, 45.0, 0.0]       # block 1: 45° tilt around tangent axis 1
+```
+
+`motif_radial_orientation` is designed to complement `motif_rigid` (which preserves internal motif geometry) and `motif_distance` / `motif_bridge` (which control inter-motif spacing). A typical multi-motif scaffold design might use all three together:
+
+```yaml
+guiding_potentials:
+  - type: motif_distance
+    weight: 30.0
+    guide_decay: inverse_linear
+    motif_i: 0
+    motif_j: 1
+    target_distance: 40.0
+  - type: motif_radial_orientation
+    weight: 3.0
+    guide_decay: inverse_cosine
+    origin_atom_filter: real
+  - type: motif_rigid
+    weight: 500.0
+    guide_decay: inverse_cosine
+    atom_filter: backbone
+    k: 0.5
 ```
 
 ## Further example JSONs for different applications

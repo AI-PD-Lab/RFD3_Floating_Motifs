@@ -55,6 +55,33 @@ inference_sampler:
   floating_motif_burn_in: 0
   floating_motif_stop_after: null
 
+  # Hetero pseudo-symmetry controls (used with kind=hetero_symmetry).
+  # Disabled by default; CLI overrides can enable individual modes without
+  # Hydra force-add syntax.
+  hetero_post_init_symmetry: interface_only
+  hetero_projection_enabled: False
+  hetero_projection_hard: False
+  hetero_projection_weight: 1.0
+  hetero_projection_start_step: 0
+  hetero_projection_stop_after: 160
+  hetero_projection_schedule: constant
+  hetero_interface_distance_cutoff: 8.0
+  hetero_interface_sequence_buffer: 2
+  hetero_interface_include_sidechains: False
+  hetero_motif_contact_exclusion_enabled: False
+  hetero_motif_contact_distance_cutoff: 8.0
+  hetero_motif_contact_sequence_buffer: 1
+  hetero_support_enabled: False
+  hetero_support_distance_cutoff: 12.0
+  hetero_support_weight: 0.3
+  hetero_support_sequence_buffer: 2
+  hetero_recenter_enabled: True
+  hetero_motif_follow_scaffold_frame: True
+  hetero_debug: False
+  hetero_diagnostics_interval: 0
+  hetero_require_per_copy_floating_motifs: False
+  hetero_init_floating_motifs_from_reference: True
+
 # Saving args
 cleanup_guideposts: True
 cleanup_virtual_atoms: True

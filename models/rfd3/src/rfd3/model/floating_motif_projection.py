@@ -247,7 +247,12 @@ def _reference_coords_from_atom_array(atom_array):
 def _get_contig_motif_atom_mask(atom_array, src_components):
     motif_mask = np.asarray([bool(c) and c[0].isalpha() for c in src_components])
     if "is_motif_atom_unindexed" in atom_array.get_annotation_categories():
-        motif_mask &= ~atom_array.is_motif_atom_unindexed.astype(bool)
+        is_unindexed = atom_array.is_motif_atom_unindexed.astype(bool)
+        if "is_motif_atom_unindexed_floating_motif" in atom_array.get_annotation_categories():
+            is_unindexed &= ~atom_array.is_motif_atom_unindexed_floating_motif.astype(
+                bool
+            )
+        motif_mask &= ~is_unindexed
     if "is_ligand" in atom_array.get_annotation_categories():
         motif_mask &= ~atom_array.is_ligand.astype(bool)
     return motif_mask

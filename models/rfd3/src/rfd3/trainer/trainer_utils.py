@@ -1,4 +1,5 @@
 from collections import Counter, OrderedDict
+import re
 
 import numpy as np
 import torch
@@ -24,6 +25,7 @@ from foundry.common import exists
 from foundry.utils.ddp import RankedLogger
 
 global_logger = RankedLogger(__name__, rank_zero_only=False)
+UNINDEXED_FLOATING_MOTIF_ANNOTATION = "is_motif_atom_unindexed_floating_motif"
 
 #######################################################################
 # Pythonic Helper functions
@@ -354,8 +356,55 @@ def process_unindexed_outputs(
 
     # Initialize an empty array
     inserted_mask = np.full_like(atom_array_diffused.is_motif_atom_unindexed, False)
+    processed_token_starts: set[int] = set()
+
+    # First handle special unindexed motifs as contiguous segments mapped onto
+    # contiguous scaffold windows. This preserves internal motif order for
+    # larger floating motifs, rather than matching each residue independently.
+    segment_specs = _collect_unindexed_floating_motif_segments(atom_array)
+    for segment_spec in segment_specs:
+        segment_tokens = []
+        for start, end in segment_spec:
+            token = atom_array[start:end]
+            if not token.is_motif_atom_unindexed.all():
+                continue
+            segment_tokens.append(token)
+
+        if not segment_tokens:
+            continue
+
+        window = _find_best_contiguous_window(
+            segment_tokens,
+            atom_array_diffused,
+            inserted_mask,
+        )
+        if window is None:
+            global_logger.warning(
+                "Could not find contiguous scaffold window for unindexed floating motif "
+                "segment starting at %s; falling back to per-token placement.",
+                segment_tokens[0].src_component[0]
+                if "src_component" in segment_tokens[0].get_annotation_categories()
+                else "<unknown>",
+            )
+            continue
+
+        for start, _end in segment_spec:
+            processed_token_starts.add(start)
+
+        _apply_contiguous_segment_cleanup(
+            segment_tokens=segment_tokens,
+            window=window,
+            atom_array_diffused=atom_array_diffused,
+            inserted_mask=inserted_mask,
+            global_idx=global_idx,
+            metadata=metadata,
+            token_maes=token_maes,
+            token_rmcds=token_rmcds,
+        )
 
     for start, end in zip(starts[:-1], starts[1:]):
+        if start in processed_token_starts:
+            continue
         token = atom_array[start:end]
         if not token.is_motif_atom_unindexed.all():
             continue
@@ -475,6 +524,285 @@ def process_unindexed_outputs(
         }
 
     return atom_array_diffused, metadata
+
+
+def _collect_unindexed_floating_motif_segments(atom_array):
+    if UNINDEXED_FLOATING_MOTIF_ANNOTATION not in atom_array.get_annotation_categories():
+        return []
+
+    starts = get_token_starts(atom_array, add_exclusive_stop=True)
+    src = (
+        np.asarray(atom_array.src_component).astype(str)
+        if "src_component" in atom_array.get_annotation_categories()
+        else None
+    )
+    is_special = atom_array.get_annotation(UNINDEXED_FLOATING_MOTIF_ANNOTATION).astype(
+        bool
+    )
+
+    segments = []
+    current = []
+    prev_component = None
+
+    for start, end in zip(starts[:-1], starts[1:]):
+        token_special = bool(np.any(is_special[start:end]))
+        if not token_special:
+            if current:
+                segments.append(current)
+                current = []
+                prev_component = None
+            continue
+
+        component = src[start] if src is not None else None
+        if current and not _are_consecutive_components(prev_component, component):
+            segments.append(current)
+            current = [(start, end)]
+        elif not current:
+            current = [(start, end)]
+        else:
+            current.append((start, end))
+        prev_component = component
+
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _find_best_contiguous_window(segment_tokens, atom_array_diffused, inserted_mask):
+    n = len(segment_tokens)
+    residue_starts = get_token_starts(atom_array_diffused, add_exclusive_stop=True)
+    if len(residue_starts) - 1 < n:
+        return None
+    best = None
+    best_score = np.inf
+
+    for i in range(len(residue_starts) - 1 - n + 1):
+        window_pairs = [
+            (residue_starts[j], residue_starts[j + 1]) for j in range(i, i + n)
+        ]
+        if not _window_is_contiguous(atom_array_diffused, window_pairs):
+            continue
+        if any(inserted_mask[start:end].any() for start, end in window_pairs):
+            continue
+
+        score = _score_contiguous_window(
+            segment_tokens=segment_tokens,
+            window_pairs=window_pairs,
+            atom_array_diffused=atom_array_diffused,
+        )
+        if score < best_score:
+            best_score = score
+            best = window_pairs
+
+    return best
+
+
+def _apply_contiguous_segment_cleanup(
+    *,
+    segment_tokens,
+    window,
+    atom_array_diffused,
+    inserted_mask,
+    global_idx,
+    metadata,
+    token_maes,
+    token_rmcds,
+):
+    for token, (start, end) in zip(segment_tokens, window):
+        residue = atom_array_diffused[start:end]
+        token_pdb_id = (
+            token.src_sym_component[0]
+            if "src_sym_component" in token.get_annotation_categories()
+            else token.src_component[0]
+        )
+        res_name = token.res_name[0]
+
+        dists = np.linalg.norm(
+            token.coord[:, None] - residue.coord[None, :], axis=-1
+        )
+        matching_atom_name = token.atom_name[:, None] == residue.atom_name[None, :]
+        dists[~matching_atom_name] = np.inf
+        row_ind, col_ind = linear_sum_assignment(dists)
+
+        diff = token.coord[row_ind] - residue.coord[col_ind]
+        token_rmsd = float(np.sqrt((diff**2).sum(-1).mean()))
+        token_rmcd = float(np.cbrt((np.abs(diff) ** 3).sum(-1).mean()))
+        token_mae = float((np.abs(diff)).sum(-1).mean())
+
+        metadata["insertion_rmsd_by_token"][token_pdb_id] = token_rmsd
+        token_maes.append(token_mae)
+        token_rmcds.append(token_rmcd)
+
+        if res_name not in metadata["insertion_rmsd_by_restype"]:
+            metadata["insertion_rmsd_by_restype"][res_name] = []
+        metadata["insertion_rmsd_by_restype"][res_name].append(token_rmsd)
+        metadata["diffused_index_map"][token_pdb_id] = (
+            f"{atom_array_diffused.chain_id[start]}{atom_array_diffused.res_id[start]}"
+        )
+
+        residue_global = global_idx[start:end]
+        atom_array_diffused.coord[residue_global[col_ind]] = token.coord[row_ind]
+        if token.is_motif_atom_with_fixed_seq[0]:
+            atom_array_diffused.res_name[start:end] = token.res_name[0]
+        atom_array_diffused.is_motif_atom_with_fixed_coord[residue_global[col_ind]] = (
+            True
+        )
+        inserted_mask[start:end] = True
+
+
+def _window_is_contiguous(atom_array_diffused, window_pairs):
+    prev_chain = None
+    prev_resid = None
+    for start, _end in window_pairs:
+        chain = atom_array_diffused.chain_id[start]
+        resid = int(atom_array_diffused.res_id[start])
+        if prev_chain is not None and (chain != prev_chain or resid != prev_resid + 1):
+            return False
+        prev_chain = chain
+        prev_resid = resid
+    return True
+
+
+def _score_contiguous_window(*, segment_tokens, window_pairs, atom_array_diffused):
+    fit_terms = []
+    for token, (start, end) in zip(segment_tokens, window_pairs):
+        residue = atom_array_diffused[start:end]
+        fit_terms.append(_token_residue_fit_score(token, residue))
+
+    fit_score = float(np.mean(fit_terms)) if fit_terms else 0.0
+    junction_score = _junction_penalty(segment_tokens, window_pairs, atom_array_diffused)
+    clash_score = _clash_penalty(segment_tokens, window_pairs, atom_array_diffused)
+
+    # Fit should dominate; junction quality and clashes break ties away from bad windows.
+    return fit_score + 4.0 * junction_score + 10.0 * clash_score
+
+
+def _token_residue_fit_score(token, residue):
+    token_anchor, residue_anchor = _shared_anchor_coords(token, residue)
+    if token_anchor is None or residue_anchor is None:
+        token_rep = _get_token_rep_coord(token)
+        residue_rep = _get_token_rep_coord(residue)
+        return float(np.sum((token_rep - residue_rep) ** 2))
+    diff = token_anchor - residue_anchor
+    return float(np.mean(np.sum(diff**2, axis=-1)))
+
+
+def _shared_anchor_coords(token, residue):
+    anchor_priority = ("N", "CA", "C", "O", "CB")
+    token_coords = []
+    residue_coords = []
+    for atom_name in anchor_priority:
+        token_idx = np.where(token.atom_name == atom_name)[0]
+        residue_idx = np.where(residue.atom_name == atom_name)[0]
+        if token_idx.size == 0 or residue_idx.size == 0:
+            continue
+        token_coords.append(token.coord[token_idx[0]])
+        residue_coords.append(residue.coord[residue_idx[0]])
+    if not token_coords:
+        return None, None
+    return np.stack(token_coords, axis=0), np.stack(residue_coords, axis=0)
+
+
+def _junction_penalty(segment_tokens, window_pairs, atom_array_diffused):
+    penalty = 0.0
+    first_token = segment_tokens[0]
+    last_token = segment_tokens[-1]
+    first_start, _first_end = window_pairs[0]
+    _last_start, last_end = window_pairs[-1]
+
+    prev_residue = _neighbor_residue(atom_array_diffused, first_start, direction=-1)
+    next_residue = _neighbor_residue(atom_array_diffused, last_end - 1, direction=1)
+
+    if prev_residue is not None:
+        penalty += _pair_join_penalty(prev_residue, first_token)
+    if next_residue is not None:
+        penalty += _pair_join_penalty(last_token, next_residue)
+    return penalty
+
+
+def _neighbor_residue(atom_array, anchor_idx, direction):
+    starts = get_token_starts(atom_array, add_exclusive_stop=True)
+    token_idx = np.searchsorted(starts, anchor_idx, side="right") - 1
+    neigh_idx = token_idx + direction
+    if neigh_idx < 0 or neigh_idx >= len(starts) - 1:
+        return None
+    start, end = starts[neigh_idx], starts[neigh_idx + 1]
+    return atom_array[start:end]
+
+
+def _pair_join_penalty(left_residue, right_residue):
+    left_ca = _atom_coord(left_residue, "CA")
+    right_ca = _atom_coord(right_residue, "CA")
+    if left_ca is None or right_ca is None:
+        return 0.0
+    ca_dist = float(np.linalg.norm(left_ca - right_ca))
+    return (ca_dist - 3.8) ** 2
+
+
+def _clash_penalty(segment_tokens, window_pairs, atom_array_diffused):
+    window_mask = np.zeros(atom_array_diffused.array_length(), dtype=bool)
+    starts = get_token_starts(atom_array_diffused, add_exclusive_stop=True)
+    window_token_indices = []
+    for start, end in window_pairs:
+        window_mask[start:end] = True
+        token_idx = np.searchsorted(starts, start, side="right") - 1
+        window_token_indices.append(token_idx)
+
+    excluded_token_indices = set(window_token_indices)
+    if window_token_indices:
+        excluded_token_indices.add(window_token_indices[0] - 1)
+        excluded_token_indices.add(window_token_indices[-1] + 1)
+
+    for idx in list(excluded_token_indices):
+        if 0 <= idx < len(starts) - 1:
+            start, end = starts[idx], starts[idx + 1]
+            window_mask[start:end] = True
+
+    scaffold_coords = atom_array_diffused.coord[~window_mask]
+    if scaffold_coords.size == 0:
+        return 0.0
+
+    motif_coords = np.concatenate([tok.coord for tok in segment_tokens], axis=0)
+    dists = np.linalg.norm(motif_coords[:, None] - scaffold_coords[None, :], axis=-1)
+    if dists.size == 0:
+        return 0.0
+    threshold = 2.5
+    overlap = np.clip(threshold - dists, a_min=0.0, a_max=None)
+    return float(np.mean(overlap**2) / (threshold**2))
+
+
+def _atom_coord(residue, atom_name):
+    idx = np.where(residue.atom_name == atom_name)[0]
+    if idx.size == 0:
+        return None
+    return residue.coord[idx[0]]
+
+
+def _get_token_rep_coord(token):
+    if np.any(token.atom_name == "CA"):
+        return token.coord[np.where(token.atom_name == "CA")[0][0]]
+    if "atomize" in token.get_annotation_categories() and np.any(token.atomize):
+        return token.coord[np.where(token.atomize)[0][0]]
+    return np.mean(token.coord, axis=0)
+
+
+def _are_consecutive_components(previous, current):
+    prev_parsed = _parse_component(previous)
+    cur_parsed = _parse_component(current)
+    if prev_parsed is None or cur_parsed is None:
+        return previous == current
+    prev_chain, prev_resid = prev_parsed
+    cur_chain, cur_resid = cur_parsed
+    return prev_chain == cur_chain and cur_resid == prev_resid + 1
+
+
+def _parse_component(component):
+    if component is None:
+        return None
+    match = re.match(r"^([^0-9-]+)(-?\d+)", str(component))
+    if match is None:
+        return None
+    return match.group(1), int(match.group(2))
 
 
 def indices_to_components_(atom_array, col_ind):

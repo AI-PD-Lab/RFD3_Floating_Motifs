@@ -15,7 +15,6 @@ from typing import Literal
 import torch
 
 from rfd3.inference.symmetry.atom_array import FIXED_ENTITY_ID
-from rfd3.inference.symmetry.symmetry_utils import apply_symmetry_to_xyz_atomwise
 
 
 @dataclass
@@ -39,6 +38,8 @@ class HeteroPseudoSymmetryConfig:
     support_distance_cutoff: float = 12.0
     support_weight: float = 0.3
     support_sequence_buffer: int = 2
+    recenter_enabled: bool = True
+    motif_follow_scaffold_frame: bool = True
     debug: bool = False
 
 
@@ -80,16 +81,22 @@ def apply_hetero_pseudo_symmetry(
     if not should_apply_hetero_projection(config, step_idx):
         return X_L, {"active": False}
 
-    masks = build_hetero_pseudo_symmetry_masks(X_L, f, config)
+    X_work = (
+        _center_hetero_xyz(X_L, f, partial_diffusion=("partial_t" in f))
+        if config.recenter_enabled
+        else X_L
+    )
+    masks = build_hetero_pseudo_symmetry_masks(X_work, f, config)
     interface_weight = hetero_projection_weight(config, step_idx)
     support_weight = 0.0 if config.hard else interface_weight * config.support_weight
 
-    sym_feats = {k: v for k, v in f.items() if "sym" in k}
-    sym_projected = apply_symmetry_to_xyz_atomwise(
-        X_L.clone(), sym_feats, partial_diffusion=("partial_t" in f)
+    sym_projected = _apply_hetero_symmetry_to_xyz_scaffoldwise(
+        X_work.clone(),
+        f,
+        motif_mask=masks["motif_mask"],
     )
 
-    projected = X_L
+    projected = X_work
     if interface_weight > 0.0 and masks["interface_mask"].any():
         projected = _blend_masked(
             projected,
@@ -104,18 +111,122 @@ def apply_hetero_pseudo_symmetry(
             masks["support_mask"],
             support_weight,
         )
+    if config.motif_follow_scaffold_frame and masks["motif_mask"].any():
+        projected, motif_frame_updates = _apply_scaffold_frame_to_motifs(
+            X_work,
+            projected,
+            f,
+            motif_mask=masks["motif_mask"],
+            frame_mask=masks["interface_mask"] | masks["support_mask"],
+        )
+    else:
+        motif_frame_updates = torch.zeros(
+            X_work.shape[0] if X_work.ndim == 3 else 1,
+            dtype=torch.long,
+            device=X_work.device,
+        )
 
     debug = {
         "active": True,
         "hard": config.hard,
+        "recentered": config.recenter_enabled,
+        "motif_follow_scaffold_frame": config.motif_follow_scaffold_frame,
         "interface_weight": interface_weight,
         "support_weight": support_weight,
         "motif_atoms": masks["motif_mask"].sum(dim=-1),
+        "motif_frame_updates": motif_frame_updates,
         "motif_contact_atoms": masks["motif_contact_mask"].sum(dim=-1),
         "interface_atoms": masks["interface_mask"].sum(dim=-1),
         "support_atoms": masks["support_mask"].sum(dim=-1),
     }
     return projected.detach(), debug
+
+
+def _center_hetero_xyz(
+    X_L: torch.Tensor,
+    f: dict,
+    partial_diffusion: bool = False,
+) -> torch.Tensor:
+    """Recenter hetero coordinates without copying any ASU atoms across copies."""
+    if partial_diffusion:
+        return X_L
+
+    squeeze = X_L.ndim == 2
+    X = X_L.unsqueeze(0) if squeeze else X_L
+    L = X.shape[-2]
+    device = X.device
+    sym_entity_id = f["sym_entity_id"].to(device=device)
+    fixed_motif_mask = sym_entity_id == FIXED_ENTITY_ID
+    movable = ~fixed_motif_mask
+    if not movable.any():
+        return X_L
+
+    centered = X.clone()
+    centered[:, movable, :] = centered[:, movable, :] - centered[
+        :, movable, :
+    ].mean(dim=1, keepdim=True)
+    return centered.squeeze(0) if squeeze else centered
+
+
+def _apply_hetero_symmetry_to_xyz_scaffoldwise(
+    X_L: torch.Tensor,
+    f: dict,
+    motif_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Hetero-only symmetry target that tolerates different motif lengths.
+
+    The normal atomwise projector assumes every symmetric copy has exactly the
+    same atom count. Heterotypic SymMotif copies can differ in motif length, so
+    here we only build symmetry targets for non-motif real atoms by their order
+    within each copy. This keeps normal symmetry untouched and gives the
+    hetero interface/support masks a compatible target tensor.
+    """
+
+    squeeze = X_L.ndim == 2
+    X = X_L.unsqueeze(0) if squeeze else X_L
+    D, L, _ = X.shape
+    device = X.device
+
+    sym_entity_id = f["sym_entity_id"].to(device=device)
+    sym_transform_id = f["sym_transform_id"].to(device=device)
+    is_sym_asu = f["is_sym_asu"].to(device=device).bool()
+    real_mask = ~_bool_feature(f, "is_virtual", L, device)
+    motif_1d = motif_mask.any(dim=0) if motif_mask.ndim == 2 else motif_mask
+
+    sym_transforms = {
+        int(k): v
+        for k, v in f["sym_transform"].items()
+        if int(k) != FIXED_ENTITY_ID
+    }
+
+    sym_X = X.clone()
+    scaffold = real_mask & ~motif_1d
+    unique_entity_id = torch.unique(sym_entity_id)
+    unique_entity_id = unique_entity_id[unique_entity_id != FIXED_ENTITY_ID]
+    for entity_id in unique_entity_id.tolist():
+        entity_mask = sym_entity_id == int(entity_id)
+        asu_mask = entity_mask & is_sym_asu & scaffold
+        if not asu_mask.any():
+            continue
+        asu_idx = torch.where(asu_mask)[0]
+        transform_ids = torch.unique(sym_transform_id[entity_mask]).tolist()
+        for target_id in transform_ids:
+            target_id = int(target_id)
+            target_mask = entity_mask & (sym_transform_id == target_id) & scaffold
+            if not target_mask.any() or target_id not in sym_transforms:
+                continue
+            target_idx = torch.where(target_mask)[0]
+            n_match = min(asu_idx.numel(), target_idx.numel())
+            if n_match == 0:
+                continue
+            asu_xyz = X[:, asu_idx[:n_match], :]
+            R, T = sym_transforms[target_id]
+            projected = torch.einsum(
+                "blc,cd->bld", asu_xyz, R.to(device=device, dtype=asu_xyz.dtype)
+            ) + T.to(device=device, dtype=asu_xyz.dtype)
+            sym_X[:, target_idx[:n_match], :] = projected
+
+    return sym_X.squeeze(0) if squeeze else sym_X
 
 
 def build_hetero_pseudo_symmetry_masks(
@@ -328,6 +439,103 @@ def _blend_masked(
         mask = mask.unsqueeze(0).expand(current.shape[0], -1)
     blended = current * (1.0 - weight) + target * weight
     return torch.where(mask[..., None], blended, current)
+
+
+def _apply_scaffold_frame_to_motifs(
+    before: torch.Tensor,
+    after: torch.Tensor,
+    f: dict,
+    motif_mask: torch.Tensor,
+    frame_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Move each hetero motif by the rigid frame implied by its scaffold copy.
+
+    Groups atoms by sym_transform_id (instance index) rather than by
+    (sym_entity_id, sym_transform_id).  This allows scaffold atoms and motif
+    atoms that belong to the SAME instance but to DIFFERENT entities (e.g.
+    heterotypic SymMotif designs where the binder is entity 0 and the scaffold
+    placeholder is entity 1) to be correctly linked: the scaffold frame drives
+    the motif even when they carry different entity_ids.
+    """
+
+    squeeze = before.ndim == 2
+    X0 = before.unsqueeze(0) if squeeze else before
+    X1 = after.unsqueeze(0) if squeeze else after
+    motif_b = motif_mask.unsqueeze(0) if motif_mask.ndim == 1 else motif_mask
+    frame_b = frame_mask.unsqueeze(0) if frame_mask.ndim == 1 else frame_mask
+    D, L, _ = X0.shape
+    device = X0.device
+
+    real_mask = ~_bool_feature(f, "is_virtual", L, device)
+    sym_entity_id = f["sym_entity_id"].to(device=device)
+    sym_transform_id = f["sym_transform_id"].to(device=device)
+    updated = X1.clone()
+    update_counts = torch.zeros(D, dtype=torch.long, device=device)
+
+    non_fixed_mask = sym_entity_id != FIXED_ENTITY_ID
+    for transform_id in torch.unique(sym_transform_id[non_fixed_mask]).tolist():
+        transform_mask = (sym_transform_id == int(transform_id)) & non_fixed_mask
+        motif_1d = transform_mask & real_mask & motif_b.any(dim=0)
+        if not motif_1d.any():
+            continue
+
+        # Use scaffold atoms in this instance (same transform_id) as anchors.
+        # These may be in a different entity than the motif atoms, which is the
+        # common case for heterotypic SymMotif designs.
+        scaffold_mask = transform_mask & real_mask & ~motif_b.any(dim=0)
+        default_anchor = scaffold_mask
+        for batch_idx in range(D):
+            anchors = scaffold_mask & frame_b[batch_idx]
+            if not anchors.any():
+                anchors = default_anchor
+            if not anchors.any():
+                continue
+            moved = (
+                X1[batch_idx, anchors, :] - X0[batch_idx, anchors, :]
+            ).norm(dim=-1) > 1e-6
+            if not bool(moved.any().item()):
+                continue
+
+            R, T = _rigid_transform(
+                X0[batch_idx, anchors, :],
+                X1[batch_idx, anchors, :],
+            )
+            motif_idx = torch.where(motif_1d)[0]
+            updated[batch_idx, motif_idx, :] = (
+                X0[batch_idx, motif_idx, :] @ R + T
+            )
+            update_counts[batch_idx] += 1
+
+    return (updated.squeeze(0) if squeeze else updated), update_counts
+
+
+def _rigid_transform(
+    source: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    original_dtype = source.dtype
+    device_type = source.device.type
+    with torch.autocast(device_type=device_type, enabled=False):
+        source32 = source.float()
+        target32 = target.float()
+        source_centroid = source32.mean(dim=0)
+        target_centroid = target32.mean(dim=0)
+        if source32.shape[0] < 3:
+            R = torch.eye(3, device=source.device, dtype=torch.float32)
+            T = target_centroid - source_centroid
+            return R.to(original_dtype), T.to(original_dtype)
+
+        source_centered = source32 - source_centroid
+        target_centered = target32 - target_centroid
+        H = source_centered.transpose(-1, -2) @ target_centered
+        U, _, Vh = torch.linalg.svd(H)
+        R = U @ Vh
+        if torch.det(R) < 0:
+            U = U.clone()
+            U[:, -1] *= -1
+            R = U @ Vh
+        T = target_centroid - source_centroid @ R
+    return R.to(original_dtype), T.to(original_dtype)
 
 
 def _motif_mask(f: dict, L: int, device: torch.device) -> torch.Tensor:

@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import biotite.structure as struc
 import numpy as np
@@ -56,6 +56,28 @@ class SymmetryConfig(BaseModel):
         True,
         description="If True, the input motifs are expected to be already symmetric and won't be symmetrized. \
         If False, the all input motifs are expected to be ASU and will be symmetrized.",
+    )
+    # Hetero-symmetry mode fields (used with hetero_symmetry sampler).
+    # These fields are intentionally left as Optional[Any] so that the JSON spec
+    # can express them freely; _apply_symmetry in input_parsing.py reads them.
+    mode: Optional[str] = Field(
+        None,
+        description=(
+            "Hetero-symmetry mode for the hetero_symmetry sampler. "
+            "'heterotypic': shared scaffold topology where each symmetric copy engages a different "
+            "named motif (from the top-level 'motifs' dict). Requires "
+            "instances={'0': ['motif_name'], '1': ['motif_name'], ...}. "
+            "'independent': each copy has a fully independent contig and scaffold (reserved for future use)."
+        ),
+    )
+    instances: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Per-instance motif/contig assignments for hetero modes. "
+            "heterotypic: {'0': ['motif_fgfr'], '1': ['motif_her2']} — each key is a copy index, "
+            "value is a list of motif names from the top-level 'motifs' dict. "
+            "independent (reserved): {'0': {'contig': 'A1-59,200'}, '1': {'contig': 'B1-59,200'}}."
+        ),
     )
 
 

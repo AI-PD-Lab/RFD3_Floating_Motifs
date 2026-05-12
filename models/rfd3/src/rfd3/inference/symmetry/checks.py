@@ -45,10 +45,13 @@ def check_symmetry_config(
             if (sm and n not in sm.split(",")) and (n not in atom_array.src_component):
                 raise ValueError(f"Unsym motif {n} not found in atom_array")
 
+    hetero_mode = getattr(sym_conf, "mode", None) in {"heterotypic", "independent"}
+    has_hetero_instances = bool(getattr(sym_conf, "instances", None))
     if (
         is_motif_atom[~is_unsym_motif].any()
         and not sym_conf.is_symmetric_motif
         and not has_dist_cond
+        and not (hetero_mode and has_hetero_instances)
     ):
         raise ValueError(
             "Asymmetric motif inputs are not supported yet. Please provide a symmetric motif."

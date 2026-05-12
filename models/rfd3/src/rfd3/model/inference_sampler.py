@@ -1,5 +1,6 @@
 import inspect
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -8,6 +9,7 @@ import torch
 from jaxtyping import Float
 from rfd3.inference.symmetry.hetero_pseudo import (
     HeteroPseudoSymmetryConfig,
+    _center_hetero_xyz,
     apply_hetero_pseudo_symmetry,
 )
 from rfd3.inference.symmetry.symmetry_utils import apply_symmetry_to_xyz_atomwise
@@ -99,8 +101,12 @@ class SampleDiffusionConfig:
     hetero_support_distance_cutoff: float = 12.0
     hetero_support_weight: float = 0.3
     hetero_support_sequence_buffer: int = 2
+    hetero_recenter_enabled: bool = True
+    hetero_motif_follow_scaffold_frame: bool = True
     hetero_debug: bool = False
+    hetero_diagnostics_interval: int = 0
     hetero_require_per_copy_floating_motifs: bool = True
+    hetero_init_floating_motifs_from_reference: bool = True
 
 
 class SampleDiffusionWithMotif(SampleDiffusionConfig):
@@ -212,6 +218,11 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             if self.floating_motif_project
             else is_motif_atom_with_fixed_coord
         )
+        f_diffusion = (
+            _with_floating_motifs_unfixed_for_diffusion(f, floating_motif_refs)
+            if self.floating_motif_project
+            else f
+        )
 
         # Book-keeping
         noise_schedule = self._construct_inference_noise_schedule(
@@ -317,7 +328,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 outs = diffusion_module(
                     X_noisy_L=X_noisy_L,
                     t=t_hat.tile(D),
-                    f=f,
+                    f=f_diffusion,
                     P_LL=None,  # Not used in chunked mode
                     chunked_pairwise_embedder=chunked_embedder,
                     initializer_outputs=other_outputs,
@@ -333,7 +344,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 outs = diffusion_module(
                     X_noisy_L=X_noisy_L,
                     t=t_hat.tile(D),
-                    f=f,
+                    f=f_diffusion,
                     n_recycle=self.n_recycle,
                     **initializer_outputs,
                 )
@@ -461,6 +472,19 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
         self.sym_step_frac = sym_step_frac
         super().__init__(**kwargs)
 
+    def post_step_hook(self, X_L: torch.Tensor, f: dict) -> torch.Tensor:
+        """Called after every diffusion step (after Kabsch paste). No-op by default."""
+        return X_L
+
+    def log_step_diagnostics(
+        self,
+        step_num: int,
+        stage: str,
+        X_L: torch.Tensor,
+        f: dict,
+    ) -> None:
+        del step_num, stage, X_L, f
+
     def apply_symmetry_to_X_L(self, X_L, f):
         # check that we are doing symmetric inference
 
@@ -520,6 +544,11 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             )
             if self.floating_motif_project
             else is_motif_atom_with_fixed_coord
+        )
+        f_diffusion = (
+            _with_floating_motifs_unfixed_for_diffusion(f, floating_motif_refs)
+            if self.floating_motif_project
+            else f
         )
         # Book-keeping
         noise_schedule = self._construct_inference_noise_schedule(
@@ -602,6 +631,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
 
             # NOTE: no symmetry applied to the noisy structure
             X_noisy_L = X_L + epsilon_L
+            self.log_step_diagnostics(step_num, "noisy", X_noisy_L, f)
 
             # Denoise the coordinates
             # Handle chunked mode vs standard mode (same as default sampler)
@@ -619,7 +649,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 outs = diffusion_module(
                     X_noisy_L=X_noisy_L,
                     t=t_hat.tile(D),
-                    f=f,
+                    f=f_diffusion,
                     P_LL=None,  # Not used in chunked mode
                     chunked_pairwise_embedder=chunked_embedder,
                     initializer_outputs=other_outputs,
@@ -635,7 +665,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 outs = diffusion_module(
                     X_noisy_L=X_noisy_L,
                     t=t_hat.tile(D),
-                    f=f,
+                    f=f_diffusion,
                     n_recycle=self.n_recycle,
                     **initializer_outputs,
                 )
@@ -644,6 +674,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             )
 
             X_denoised_L = outs["X_L"] if "X_L" in outs else outs
+            self.log_step_diagnostics(step_num, "denoised", X_denoised_L, f)
 
             # Compute the delta between the noisy and denoised coordinates, scaled by t_hat
             delta_L = (
@@ -675,9 +706,11 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                     T=float(noise_schedule[0]),
                     step_idx=step_num,
                 )
+            self.log_step_diagnostics(step_num, "post_ode", X_L, f)
             X_L = self.apply_post_update_symmetry(
                 X_L, f, step_num, c_t, gamma_min_sym
             )
+            self.log_step_diagnostics(step_num, "post_hetero", X_L, f)
             if should_project_floating_motifs(
                 step_num,
                 enabled=self.floating_motif_project,
@@ -686,6 +719,9 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 stop_after=self.floating_motif_stop_after,
             ):
                 X_L = project_floating_motifs_all_atom(X_L, floating_motif_refs)
+            self.log_step_diagnostics(step_num, "post_kabsch", X_L, f)
+            X_L = self.post_step_hook(X_L, f)
+            self.log_step_diagnostics(step_num, "post_hook", X_L, f)
 
             # Append the results to the trajectory (for visualization of the diffusion process)
             X_noisy_L_scaled = (
@@ -758,6 +794,8 @@ class SampleDiffusionWithHeteroPseudoSymmetry(SampleDiffusionWithSymmetry):
             support_distance_cutoff=self.hetero_support_distance_cutoff,
             support_weight=self.hetero_support_weight,
             support_sequence_buffer=self.hetero_support_sequence_buffer,
+            recenter_enabled=self.hetero_recenter_enabled,
+            motif_follow_scaffold_frame=self.hetero_motif_follow_scaffold_frame,
             debug=self.hetero_debug,
         )
         ranked_logger.info(
@@ -767,6 +805,19 @@ class SampleDiffusionWithHeteroPseudoSymmetry(SampleDiffusionWithSymmetry):
             f"weight={self.hetero_config.weight:.3f} "
             f"support_weight={self.hetero_config.support_weight:.3f}"
         )
+        if self.hetero_debug or self.hetero_diagnostics_interval > 0:
+            _emit_hetero_debug(
+                "[hetero_debug_init] "
+                f"post_init={self.hetero_config.post_init_symmetry} "
+                f"projection_enabled={self.hetero_config.projection_enabled} "
+                f"hard={self.hetero_config.hard} "
+                f"weight={self.hetero_config.weight:.3f} "
+                f"stop_after={self.hetero_config.stop_after} "
+                f"recenter={self.hetero_config.recenter_enabled} "
+                "motif_follow_scaffold_frame="
+                f"{self.hetero_config.motif_follow_scaffold_frame} "
+                f"diag_interval={self.hetero_diagnostics_interval}"
+            )
 
     def apply_symmetry_to_X_L(self, X_L, f):
         del f
@@ -776,20 +827,79 @@ class SampleDiffusionWithHeteroPseudoSymmetry(SampleDiffusionWithSymmetry):
         del f, step_num, c_t, gamma_min_sym
         return outs
 
+    def post_step_hook(self, X_L: torch.Tensor, f: dict) -> torch.Tensor:
+        """Recenter all movable atoms after Kabsch paste to prevent COM drift."""
+        return _center_hetero_xyz(X_L, f, partial_diffusion=("partial_t" in f))
+
+    def log_step_diagnostics(
+        self,
+        step_num: int,
+        stage: str,
+        X_L: torch.Tensor,
+        f: dict,
+    ) -> None:
+        if self.hetero_diagnostics_interval <= 0:
+            return
+        if step_num >= 3 and step_num % self.hetero_diagnostics_interval != 0:
+            return
+        stats = _coordinate_diagnostics(X_L, f)
+        _emit_hetero_debug(
+            "[hetero_diag] "
+            f"step={step_num:03d} stage={stage} "
+            f"all_rog={stats['all_rog']:.2f} "
+            f"scaffold_rog={stats['scaffold_rog']:.2f} "
+            f"motif_rog={stats['motif_rog']:.2f} "
+            f"all_max_r={stats['all_max_r']:.2f} "
+            f"scaffold_max_r={stats['scaffold_max_r']:.2f} "
+            f"motif_max_r={stats['motif_max_r']:.2f} "
+            f"all_com_norm={stats['all_com_norm']:.2f} "
+            f"scaffold_com_norm={stats['scaffold_com_norm']:.2f} "
+            f"motif_com_norm={stats['motif_com_norm']:.2f}"
+        )
+
     def apply_post_update_symmetry(self, X_L, f, step_num, c_t, gamma_min_sym):
         del c_t, gamma_min_sym
         X_L, debug = apply_hetero_pseudo_symmetry(
             X_L, f, self.hetero_config, step_num
         )
         if self.hetero_config.debug:
-            ranked_logger.info(f"[hetero_symmetry] step={step_num} {debug}")
+            _emit_hetero_debug(f"[hetero_symmetry] step={step_num} {debug}")
+        return X_L
+
+    def _get_initial_structure(
+        self,
+        c0: torch.Tensor,
+        D: int,
+        L: int,
+        coord_atom_lvl_to_be_noised: torch.Tensor,
+        is_motif_atom_with_fixed_coord,
+    ) -> torch.Tensor:
+        X_L = super()._get_initial_structure(
+            c0=c0,
+            D=D,
+            L=L,
+            coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised,
+            is_motif_atom_with_fixed_coord=is_motif_atom_with_fixed_coord,
+        )
+        floating_motif_refs = getattr(
+            self, "_hetero_initial_floating_motif_refs", None
+        )
+        if (
+            self.hetero_init_floating_motifs_from_reference
+            and floating_motif_refs
+        ):
+            X_L = _insert_floating_motif_reference_coords(X_L, floating_motif_refs)
         return X_L
 
     def sample_diffusion_like_af3(self, *, f, floating_motif_refs=None, **kwargs):
         self._validate_hetero_floating_motifs(f, floating_motif_refs)
-        return super().sample_diffusion_like_af3(
-            f=f, floating_motif_refs=floating_motif_refs, **kwargs
-        )
+        self._hetero_initial_floating_motif_refs = floating_motif_refs
+        try:
+            return super().sample_diffusion_like_af3(
+                f=f, floating_motif_refs=floating_motif_refs, **kwargs
+            )
+        finally:
+            self._hetero_initial_floating_motif_refs = None
 
     def _validate_hetero_floating_motifs(self, f, floating_motif_refs):
         if (
@@ -853,6 +963,145 @@ class ConditionalDiffusionSampler:
                         [param.name for param in signature.parameters.values()]
                     )
         return arg_names
+
+
+def _insert_floating_motif_reference_coords(X_L, floating_motif_refs):
+    """Initialize hetero floating motifs at their per-copy reference positions."""
+    if not floating_motif_refs:
+        return X_L
+
+    X_out = X_L.clone()
+    for motif_ref in floating_motif_refs:
+        atom_idx = motif_ref.sample_atom_indices.to(
+            device=X_out.device, dtype=torch.long
+        )
+        if atom_idx.numel() == 0:
+            continue
+        reference = motif_ref.reference_xyz.to(
+            device=X_out.device, dtype=X_out.dtype
+        )
+        valid = (
+            motif_ref.reference_atom_mask.to(device=X_out.device).bool()
+            & torch.isfinite(reference).all(dim=-1)
+        )
+        if not valid.any():
+            continue
+        current = X_out.index_select(dim=-2, index=atom_idx)
+        reference = reference.unsqueeze(0).expand(current.shape[0], -1, -1)
+        valid = valid.unsqueeze(0).expand(current.shape[0], -1)
+        updated = torch.where(valid[..., None], reference, current)
+        X_out.scatter_(
+            dim=-2,
+            index=atom_idx.view(1, -1, 1).expand(X_out.shape[0], -1, 3),
+            src=updated,
+        )
+    return X_out
+
+
+def _with_floating_motifs_unfixed_for_diffusion(f, floating_motif_refs):
+    """Let floating motifs denoise while preserving the original conditioning dict."""
+    if not floating_motif_refs or "is_motif_atom_with_fixed_coord" not in f:
+        return f
+
+    fixed_atom_mask = remove_floating_motif_atoms_from_fixed_mask(
+        f["is_motif_atom_with_fixed_coord"], floating_motif_refs
+    )
+    f_diffusion = dict(f)
+    f_diffusion["is_motif_atom_with_fixed_coord"] = fixed_atom_mask
+
+    if (
+        "is_motif_token_with_fully_fixed_coord" in f
+        and "atom_to_token_map" in f
+    ):
+        f_diffusion["is_motif_token_with_fully_fixed_coord"] = (
+            _token_fully_fixed_coord_mask(
+                fixed_atom_mask,
+                f["atom_to_token_map"],
+                f["is_motif_token_with_fully_fixed_coord"],
+            )
+        )
+    return f_diffusion
+
+
+def _token_fully_fixed_coord_mask(
+    fixed_atom_mask: torch.Tensor,
+    atom_to_token_map: torch.Tensor,
+    template_token_mask: torch.Tensor,
+) -> torch.Tensor:
+    token_mask = template_token_mask.clone()
+    atom_to_token_map = atom_to_token_map.to(
+        device=fixed_atom_mask.device, dtype=torch.long
+    )
+    for token_idx in torch.unique(atom_to_token_map).tolist():
+        token_atoms = atom_to_token_map == int(token_idx)
+        token_mask[int(token_idx)] = bool(fixed_atom_mask[token_atoms].all().item())
+    return token_mask
+
+
+def _emit_hetero_debug(message: str) -> None:
+    """Emit hetero diagnostics even when rank-filtered logging is suppressed."""
+    ranked_logger.info(message)
+    print(message, file=sys.stderr, flush=True)
+
+
+def _coordinate_diagnostics(X_L: torch.Tensor, f: dict) -> dict[str, float]:
+    X = X_L.detach()
+    if X.ndim == 2:
+        X = X.unsqueeze(0)
+    X = X.float()
+    L = X.shape[-2]
+    device = X.device
+    real_mask = ~_feature_bool(f, "is_virtual", L, device)
+    motif_mask = (
+        _feature_bool(f, "is_motif_atom_with_fixed_coord", L, device)
+        | _feature_bool(f, "is_motif_atom_with_fixed_seq", L, device)
+        | _feature_bool(f, "is_motif_atom_unindexed", L, device)
+        | _feature_bool(f, "is_motif_atom", L, device)
+    ) & real_mask
+    scaffold_mask = real_mask & ~motif_mask
+    stats = {}
+    stats.update(_coordinate_subset_stats(X, real_mask, "all"))
+    stats.update(_coordinate_subset_stats(X, scaffold_mask, "scaffold"))
+    stats.update(_coordinate_subset_stats(X, motif_mask, "motif"))
+    return stats
+
+
+def _coordinate_subset_stats(
+    X: torch.Tensor,
+    mask: torch.Tensor,
+    prefix: str,
+) -> dict[str, float]:
+    if not bool(mask.any().item()):
+        return {
+            f"{prefix}_rog": float("nan"),
+            f"{prefix}_max_r": float("nan"),
+            f"{prefix}_com_norm": float("nan"),
+        }
+    coords = X[:, mask, :]
+    com = coords.mean(dim=1, keepdim=True)
+    centered = coords - com
+    radius = torch.linalg.norm(centered, dim=-1)
+    return {
+        f"{prefix}_rog": torch.sqrt((radius.square()).mean()).item(),
+        f"{prefix}_max_r": radius.max().item(),
+        f"{prefix}_com_norm": torch.linalg.norm(com.squeeze(1), dim=-1).mean().item(),
+    }
+
+
+def _feature_bool(
+    f: dict,
+    key: str,
+    L: int,
+    device: torch.device,
+) -> torch.Tensor:
+    value = f.get(key)
+    if value is None:
+        return torch.zeros(L, dtype=torch.bool, device=device)
+    if isinstance(value, torch.Tensor):
+        value = value.to(device=device)
+    else:
+        value = torch.as_tensor(value, device=device)
+    return value.bool()
 
 
 def centre_random_augment_around_motif(

@@ -1,5 +1,37 @@
 # RFD3 Local Changes
 
+## Unindexed Motifs
+
+Added a new input field:
+
+```json
+{
+  "length": 200,
+  "motifs": {
+    "binderA": "A1-59",
+    "binderB": "B1-65"
+  },
+  "unindexed_motifs": ["binderA", "binderB"]
+}
+```
+
+`unindexed_motifs` lets you include named motifs from the `motifs` dict on the
+main chain without writing an explicit contig placement for them. The current
+active behavior is:
+
+- motifs are inserted into a hidden sampled inline layout before diffusion
+- the model sees one real contiguous chain from the start
+- motifs remain floating / Kabsch-aligned
+- `length` is the total final chain length, including the inserted motifs
+
+This differs from:
+
+- `sequence_unrestrained_motifs`: appends motifs as separate floating chains
+- `unindex`: uses the original unindexed guidepost path and trainer-side cleanup
+
+`unindexed_motifs` names must exist in `motifs`, and must not also appear in
+`contig`, `sequence_unrestrained_motifs`, or `SymMotif` assignments.
+
 ## Hetero Pseudo-Symmetry Inference
 
 Added a new sampler kind:

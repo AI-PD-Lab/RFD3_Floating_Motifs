@@ -58,6 +58,10 @@ class RFD3PotentialAdapter:
     ):
         self.config = config
 
+        # Always register floating motif atoms as explicit_motif so motif_atom_mask
+        # is correct regardless of select_fixed_atoms / select_unfixed_sequence choices.
+        f = _ensure_floating_motifs_in_motif_mask(f, floating_motif_refs)
+
         # Build masks once (they depend only on f, which is static across steps)
         self.masks = build_masks(f, config)
 
@@ -102,6 +106,7 @@ class RFD3PotentialAdapter:
             f"enabled={self.enabled()} mode={config.apply_mode} "
             f"n_potentials={len(potentials)} "
             f"n_guided_atoms={int(self.masks['guide_atom_mask'].sum().item())} "
+            f"n_motif_atoms={int(self.masks['motif_atom_mask'].sum().item())} "
             f"has_floating_ref={'floating_motif_reference_pos' in self.metadata}",
             file=sys.stderr,
             flush=True,
@@ -281,6 +286,47 @@ def _add_floating_motif_reference_metadata_from_refs(
 
     if torch.isfinite(reference_pos).any():
         metadata["floating_motif_reference_pos"] = reference_pos
+
+
+def _ensure_floating_motifs_in_motif_mask(
+    f: dict,
+    floating_motif_refs,
+) -> dict:
+    """Always register floating motif atoms via the explicit_motif path of motif_atom_mask.
+
+    masks.py builds motif_atom_mask = is_fixed | is_fixed_seq | is_unindexed | explicit_motif.
+    Using floating_motif_refs (built from src_component, the same source as the Kabsch
+    projector) as the authoritative motif-atom source guarantees correct motif block
+    detection regardless of which combination of select_fixed_atoms and
+    select_unfixed_sequence the user chose — including the partial case where only some
+    motif residues have unfixed sequence.
+
+    Any existing is_motif_atom in f is preserved via OR so no prior signal is lost.
+    """
+    if not floating_motif_refs:
+        return f
+
+    n_atoms_tensor = f.get("atom_to_token_map")
+    if n_atoms_tensor is None:
+        return f
+    n_atoms = int(n_atoms_tensor.shape[0])
+
+    motif_atom = torch.zeros(n_atoms, dtype=torch.bool)
+    for motif_ref in floating_motif_refs:
+        atom_idx = motif_ref.sample_atom_indices.long()
+        valid = (atom_idx >= 0) & (atom_idx < n_atoms)
+        motif_atom[atom_idx[valid]] = True
+
+    if not bool(motif_atom.any()):
+        return f
+
+    existing = f.get("is_motif_atom")
+    if existing is not None:
+        motif_atom = motif_atom | torch.as_tensor(existing, dtype=torch.bool)
+
+    augmented = dict(f)
+    augmented["is_motif_atom"] = motif_atom
+    return augmented
 
 
 def _to_plain_config(config):

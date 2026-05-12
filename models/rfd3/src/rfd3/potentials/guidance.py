@@ -386,6 +386,7 @@ def _token_translation(
         idx_1d,
         guide_atom_mask[None, :].to(dtype=dtype).expand(D, L),
     )
+    token_has_guided = token_count > 0  # [D, n_tokens] — before clamp
     token_count = token_count.clamp(min=1.0)
 
     token_mean = token_sum / token_count[:, :, None]  # [D, I, 3]
@@ -393,8 +394,11 @@ def _token_translation(
     # Broadcast: each atom gets its token's mean translation
     token_broadcast = token_mean[:, atom_to_token_map, :]  # [D, L, 3]
 
-    # Atoms not in guide_atom_mask get zero (tokens with no guided atoms already 0)
-    token_broadcast = token_broadcast * guide_atom_mask[None, :, None].to(dtype=dtype)
+    # Zero only tokens with no guided atoms; all atoms in a guided token move together
+    # (masking by guide_atom_mask here would displace only CA and leave N/C/O fixed,
+    # producing impossible bond lengths)
+    token_has_guided_per_atom = token_has_guided[:, atom_to_token_map]  # [D, L]
+    token_broadcast = token_broadcast * token_has_guided_per_atom[:, :, None].to(dtype=dtype)
 
     return token_broadcast
 

@@ -1020,6 +1020,111 @@ class SymmetryAwareSingleMotifBridge(BasePotential):
         )
 
 
+class SymmetryEllipsoidBridge(BasePotential):
+    """Distribute scaffold atoms inside a subunit-shaped ellipsoid.
+
+    For each symmetric subunit the ellipsoid is defined by three axes anchored
+    at the subunit COM:
+
+      axis 1 – COM → motif COM            (long axis, semi-length = dist(COM, motif))
+      axis 2 – COM → midpoint(COM, left-neighbor COM)  (semi-length = dist/2)
+      axis 3 – COM → midpoint(COM, right-neighbor COM) (semi-length = dist/2, GS-orth)
+
+    The three directions are Gram–Schmidt orthonormalised so the ellipsoidal
+    radius is well-defined.  Scaffold atoms are spread evenly inside the
+    ellipsoid using bin-midpoint targets (same approach as the fixed
+    SymmetryAwareSingleMotifBridge), with a two-sided boundary penalty.
+
+    Because the ellipsoid is centred at the subunit COM, atoms on the
+    non-motif-facing half of the subunit are naturally included.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_i: int = 0,
+        spread_weight: float = 1.0,
+        outside_weight: float = 1.0,
+        atom_filter: str = "guide",
+        include_motif_atoms: bool = False,
+        eps: float = 1e-6,
+        reduction: str = "sum",
+    ):
+        super().__init__(weight)
+        self.motif_i = int(motif_i)
+        self.spread_weight = float(spread_weight)
+        self.outside_weight = float(outside_weight)
+        self.atom_filter = atom_filter
+        self.include_motif_atoms = bool(include_motif_atoms)
+        self.eps = float(eps)
+        self.reduction = _validate_symmetry_reduction(reduction)
+
+    def compute(self, xyz, masks, metadata):
+        subunits = _symmetry_subunit_motif_blocks(masks, metadata, xyz.device)
+        bridge_masks = _symmetry_subunit_bridge_masks(
+            masks, metadata, xyz.device, self.atom_filter, self.include_motif_atoms
+        )
+        real_mask = masks.get(
+            "real_atom_mask",
+            torch.ones(xyz.shape[1], dtype=torch.bool, device=xyz.device),
+        )
+        subunit_all_masks = _symmetry_subunit_atom_masks(metadata, real_mask, xyz.device)
+
+        n_subunits = len(subunit_all_masks)
+        if n_subunits < 2:
+            return xyz.new_zeros(())
+
+        # Precompute per-subunit COMs  [n_subunits] of (D, 3) or None
+        subunit_coms = [
+            _motif_block_current_com(xyz, m) for m in subunit_all_masks
+        ]
+
+        total_loss = xyz.new_zeros(())
+        n_active = 0
+        for subunit_idx in range(n_subunits):
+            if subunit_idx >= len(subunits) or subunit_idx >= len(bridge_masks):
+                continue
+            local_blocks = subunits[subunit_idx]
+            if self.motif_i >= len(local_blocks):
+                continue
+
+            motif_com = _motif_block_current_com(xyz, local_blocks[self.motif_i])
+            subunit_com = subunit_coms[subunit_idx]
+            com_left = subunit_coms[(subunit_idx - 1) % n_subunits]
+            com_right = subunit_coms[(subunit_idx + 1) % n_subunits]
+
+            if any(c is None for c in (motif_com, subunit_com, com_left, com_right)):
+                continue
+
+            loss = _ellipsoid_bridge_loss(
+                xyz,
+                motif_com,
+                subunit_com,
+                com_left,
+                com_right,
+                bridge_masks[subunit_idx],
+                self,
+            )
+            if loss is None:
+                continue
+            total_loss = total_loss + loss
+            n_active += 1
+
+        if n_active == 0:
+            return xyz.new_zeros(())
+        return _weighted_symmetry_loss(self.weight, total_loss, n_active, self.reduction)
+
+    def guide_atom_mask(self, masks, metadata, device):
+        return _symmetry_aware_bridge_guide_mask(
+            masks, metadata, device, self.atom_filter, self.include_motif_atoms
+        )
+
+    def instance_guide_masks(self, masks, metadata, device):
+        return _symmetry_subunit_bridge_masks(
+            masks, metadata, device, self.atom_filter, self.include_motif_atoms
+        )
+
+
 class MotifRigid(BasePotential):
     """Preserve motif geometry against RFD3 reference coordinates.
 
@@ -1897,9 +2002,18 @@ class SymmetryAwareMotifRadialOrientation(MotifRadialOrientationPotential):
         return _symmetry_aware_all_blocks(masks, metadata, device)
 
     def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
-        return _rigidize_blocks_rotation(
-            atom_grad, _symmetry_aware_all_blocks(masks, metadata, xyz.device), xyz
-        )
+        all_blocks = _symmetry_aware_all_blocks(masks, metadata, xyz.device)
+        transformed = torch.zeros_like(atom_grad)
+        for block_mask in all_blocks:
+            if block_mask.sum().item() < 2:
+                continue
+            transformed[:, block_mask, :] = _project_gradient_to_rigid_body(
+                atom_grad[:, block_mask, :],
+                xyz[:, block_mask, :],
+                allow_translation=False,
+                allow_rotation=True,
+            )
+        return transformed
 
 
 class SymmetryAwareMotifCOMRadialOrientation(SymmetryAwareMotifRadialOrientation):
@@ -2173,6 +2287,77 @@ def _two_motif_bridge_loss(
     )
 
 
+def _ellipsoid_bridge_loss(
+    xyz: torch.Tensor,          # [D, L, 3]
+    motif_com: torch.Tensor,    # [D, 3]
+    subunit_com: torch.Tensor,  # [D, 3]
+    com_left: torch.Tensor,     # [D, 3]  left-neighbor subunit COM
+    com_right: torch.Tensor,    # [D, 3]  right-neighbor subunit COM
+    bridge_mask: torch.Tensor,  # [L]     bool
+    obj,
+) -> torch.Tensor | None:
+    """Loss that distributes bridge atoms evenly inside a subunit ellipsoid.
+
+    Ellipsoid axes (all anchored at subunit_com):
+      e1  motif direction        semi-length a = ||motif_com - subunit_com||
+      e2  left-border direction  semi-length b = ||com_left  - subunit_com|| / 2
+      e3  right-border direction semi-length c = ||com_right - subunit_com|| / 2
+
+    e2 and e3 are Gram–Schmidt orthogonalised against the preceding axes;
+    e3 falls back to e1 × e2 when the right-border vector is coplanar with (e1, e2).
+    """
+    if bridge_mask.sum().item() < 1:
+        return None
+
+    eps = obj.eps
+
+    # --- ellipsoid axes -------------------------------------------------------
+    v1 = motif_com - subunit_com                        # [D, 3]
+    v2 = (com_left  - subunit_com) * 0.5               # border = midpoint → COM
+    v3 = (com_right - subunit_com) * 0.5
+
+    a = v1.norm(dim=-1).clamp(min=eps)                  # [D]
+    b = v2.norm(dim=-1).clamp(min=eps)
+    c = v3.norm(dim=-1).clamp(min=eps)
+
+    e1 = v1 / a[:, None]                                # [D, 3]
+
+    v2_orth = v2 - (v2 * e1).sum(dim=-1, keepdim=True) * e1
+    e2 = v2_orth / v2_orth.norm(dim=-1, keepdim=True).clamp(min=eps)
+
+    # e3: orthogonalise v3 against e1 and e2; fall back to e1 × e2
+    v3_orth = v3 - (v3 * e1).sum(dim=-1, keepdim=True) * e1
+    v3_orth = v3_orth - (v3_orth * e2).sum(dim=-1, keepdim=True) * e2
+    v3_norm = v3_orth.norm(dim=-1, keepdim=True).clamp(min=eps)
+    e3_cross = torch.linalg.cross(e1, e2, dim=-1)
+    e3_cross = e3_cross / e3_cross.norm(dim=-1, keepdim=True).clamp(min=eps)
+    degenerate = v3_norm < eps
+    e3 = torch.where(degenerate.expand_as(v3_orth), e3_cross, v3_orth / v3_norm)
+
+    # --- project bridge atoms into ellipsoidal coordinates -------------------
+    rel = xyz[:, bridge_mask, :] - subunit_com[:, None, :]   # [D, N, 3]
+
+    p1 = (rel * e1[:, None, :]).sum(dim=-1) / a[:, None]     # [D, N]
+    p2 = (rel * e2[:, None, :]).sum(dim=-1) / b[:, None]
+    p3 = (rel * e3[:, None, :]).sum(dim=-1) / c[:, None]
+
+    d_ellip = (p1.pow(2) + p2.pow(2) + p3.pow(2)).sqrt()    # [D, N]
+
+    # --- spread + boundary losses (bin-midpoint targets) ---------------------
+    sorted_d = torch.sort(d_ellip, dim=-1).values
+    n = sorted_d.shape[-1]
+    target = (torch.arange(n, device=xyz.device, dtype=xyz.dtype) + 0.5) / n
+    target = target[None, :].expand_as(sorted_d)
+
+    spread_loss = (sorted_d - target).pow(2).mean()
+    # Two-sided: penalise atoms outside the ellipsoid AND atoms collapsed
+    # onto the center (d_ellip < 0 not possible, but keeps symmetry with bridge).
+    outside_loss = (
+        torch.relu(d_ellip - 1.0).pow(2) + torch.relu(-d_ellip).pow(2)
+    ).mean()
+    return obj.spread_weight * spread_loss + obj.outside_weight * outside_loss
+
+
 def _single_motif_bridge_loss(
     xyz: torch.Tensor,
     motif_mask: torch.Tensor,
@@ -2187,19 +2372,20 @@ def _single_motif_bridge_loss(
     dist = (bridge_xyz - motif_com[:, None, :]).norm(dim=-1)
     radius_fraction = dist / max(obj.max_radius, obj.eps)
     sorted_fraction = torch.sort(radius_fraction, dim=-1).values
-    if sorted_fraction.shape[-1] == 1:
-        target_fraction = sorted_fraction.new_full(sorted_fraction.shape, 0.5)
-    else:
-        target_fraction = torch.linspace(
-            0.0,
-            1.0,
-            sorted_fraction.shape[-1],
-            device=xyz.device,
-            dtype=xyz.dtype,
-        )
-        target_fraction = target_fraction[None, :].expand_as(sorted_fraction)
+    n = sorted_fraction.shape[-1]
+    # Bin midpoints: (0.5/n, 1.5/n, ..., (n-0.5)/n).  No atom is targeted to
+    # sit on the motif COM (fraction 0) or exactly at max_radius (fraction 1),
+    # so the closest atom always has an outward target and the spread is symmetric.
+    target_fraction = (
+        torch.arange(n, device=xyz.device, dtype=xyz.dtype) + 0.5
+    ) / n
+    target_fraction = target_fraction[None, :].expand_as(sorted_fraction)
     spread_loss = (sorted_fraction - target_fraction).pow(2).mean()
-    outside_loss = torch.relu(radius_fraction - 1.0).pow(2).mean()
+    # Two-sided boundary: penalise atoms outside max_radius AND atoms sitting
+    # directly on the motif COM (radius ≈ 0), mirroring the two-motif bridge.
+    outside_loss = (
+        torch.relu(radius_fraction - 1.0).pow(2) + torch.relu(-radius_fraction).pow(2)
+    ).mean()
     return obj.spread_weight * spread_loss + obj.outside_weight * outside_loss
 
 
@@ -3087,6 +3273,7 @@ POTENTIAL_REGISTRY: dict[str, type[BasePotential]] = {
     "symmetry_motif_distance": SymmetryAwareMotifDistance,
     "symmetry_motif_bridge": SymmetryAwareMotifBridge,
     "symmetry_single_motif_bridge": SymmetryAwareSingleMotifBridge,
+    "symmetry_ellipsoid_bridge": SymmetryEllipsoidBridge,
     "symmetry_motif_center_distance": SymmetryAwareMotifCenterDistance,
     "symmetry_motif_radial_position": SymmetryAwareMotifRadialPosition,
     "symmetry_motif_radial_orientation": SymmetryAwareMotifRadialOrientation,

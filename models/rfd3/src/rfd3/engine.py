@@ -176,6 +176,13 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         # save
         self.specification_overrides = dict(specification or {})
         self.inference_sampler_overrides = dict(inference_sampler or {})
+        if (
+            "auto_length_potentials" not in self.specification_overrides
+            and "potentials" in self.inference_sampler_overrides
+        ):
+            self.specification_overrides["auto_length_potentials"] = (
+                self.inference_sampler_overrides["potentials"]
+            )
 
         # Setup output directories and args
         self.global_prefix = global_prefix

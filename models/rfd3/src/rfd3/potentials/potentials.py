@@ -855,6 +855,168 @@ class MotifBridge(BasePotential):
         return -self.weight * total_loss
 
 
+class MotifBridge2(BasePotential):
+    """Spread non-motif atoms inside a rounded cylinder around two motif blocks.
+
+    This is a two-motif alternative to ``motif_bridge``.  It still uses the
+    motif-center axis for longitudinal spread, but replaces the tube with a
+    capped cylinder.  The cylinder has constant radius between the two motif
+    COMs, then starts rounding at each motif COM and extends outward by
+    ``end_padding``.  This lets guided atoms wrap around the motif ends without
+    making the middle of the bridge artificially wider than the ends.
+
+    ``end_bias`` controls the target longitudinal distribution.  At 0.0, atoms
+    are spread evenly from motif_i to motif_j.  Larger values bias the target
+    positions toward both motif ends, leaving fewer atoms in the middle.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_i: int = 0,
+        motif_j: int = 1,
+        spread_weight: float = 1.0,
+        outside_weight: float = 1.0,
+        cylinder_weight: float | None = None,
+        ellipsoid_weight: float = 1.0,
+        radius: float = 12.0,
+        end_padding: float = 2.0,
+        end_bias: float = 0.0,
+        atom_filter: str = "guide",
+        include_motif_atoms: bool = False,
+        eps: float = 1e-6,
+    ):
+        super().__init__(weight)
+        if radius <= 0.0:
+            raise ValueError("motif_bridge2 radius must be positive")
+        if end_padding < 0.0:
+            raise ValueError("motif_bridge2 end_padding must be non-negative")
+        if end_bias < 0.0:
+            raise ValueError("motif_bridge2 end_bias must be non-negative")
+        valid_atom_filters = (
+            "guide",
+            "potential",
+            "binder",
+            "generated",
+            "real",
+            "backbone",
+            "CA",
+            "all",
+        )
+        if atom_filter not in valid_atom_filters:
+            raise ValueError(
+                "motif_bridge2 atom_filter must be one of "
+                f"{valid_atom_filters}"
+            )
+        self.motif_i = int(motif_i)
+        self.motif_j = int(motif_j)
+        self.spread_weight = float(spread_weight)
+        self.outside_weight = float(outside_weight)
+        self.cylinder_weight = (
+            float(ellipsoid_weight)
+            if cylinder_weight is None
+            else float(cylinder_weight)
+        )
+        self.ellipsoid_weight = self.cylinder_weight
+        self.radius = float(radius)
+        self.end_padding = float(end_padding)
+        self.end_bias = float(end_bias)
+        self.atom_filter = atom_filter
+        self.include_motif_atoms = bool(include_motif_atoms)
+        self.eps = float(eps)
+
+    def compute(self, xyz, masks, metadata):
+        motif_blocks = _motif_blocks(masks, metadata, xyz.device)
+        max_idx = max(self.motif_i, self.motif_j)
+        if self.motif_i < 0 or self.motif_j < 0 or max_idx >= len(motif_blocks):
+            return xyz.new_zeros(())
+
+        motif_a = xyz[:, motif_blocks[self.motif_i], :]
+        motif_b = xyz[:, motif_blocks[self.motif_j], :]
+        if motif_a.shape[1] == 0 or motif_b.shape[1] == 0:
+            return xyz.new_zeros(())
+
+        bridge_mask = _bridge_atom_mask(
+            atom_filter=self.atom_filter,
+            masks=masks,
+            device=xyz.device,
+        )
+        if not self.include_motif_atoms:
+            bridge_mask = bridge_mask & ~masks["motif_atom_mask"].to(
+                device=xyz.device, dtype=torch.bool
+            )
+        if bridge_mask.sum().item() < 1:
+            return xyz.new_zeros(())
+
+        bridge_xyz = xyz[:, bridge_mask, :]
+        com_a = motif_a.mean(dim=1)
+        com_b = motif_b.mean(dim=1)
+        axis = com_b - com_a
+        axis_len = axis.norm(dim=-1).clamp(min=self.eps)
+        axis_unit = axis / axis_len[:, None]
+
+        rel_from_a = bridge_xyz - com_a[:, None, :]
+        alpha = (rel_from_a * axis_unit[:, None, :]).sum(dim=-1) / axis_len[:, None]
+        pad_alpha = self.end_padding / axis_len[:, None]
+        alpha_min = -pad_alpha
+        alpha_max = 1.0 + pad_alpha
+        alpha_span = (alpha_max - alpha_min).clamp(min=self.eps)
+
+        sorted_alpha = torch.sort(alpha, dim=-1).values
+        n_atoms = sorted_alpha.shape[-1]
+        if n_atoms == 1:
+            target_unit = sorted_alpha.new_full(sorted_alpha.shape, 0.5)
+        else:
+            target_unit = torch.linspace(
+                0.0,
+                1.0,
+                n_atoms,
+                device=xyz.device,
+                dtype=xyz.dtype,
+            )
+            target_unit = target_unit[None, :].expand_as(sorted_alpha)
+            end_clustered = 0.5 * (1.0 - torch.cos(torch.pi * target_unit))
+            bias_mix = self.end_bias / (1.0 + self.end_bias)
+            target_unit = (1.0 - bias_mix) * target_unit + bias_mix * end_clustered
+
+        target_alpha = alpha_min + target_unit * alpha_span
+        spread_loss = (sorted_alpha - target_alpha).pow(2).mean()
+        outside_loss = (
+            torch.relu(alpha_min - alpha).pow(2)
+            + torch.relu(alpha - alpha_max).pow(2)
+        ).mean()
+
+        center = 0.5 * (com_a + com_b)
+        rel_center = bridge_xyz - center[:, None, :]
+        axial = (rel_center * axis_unit[:, None, :]).sum(dim=-1)
+        projected = center[:, None, :] + axial[:, :, None] * axis_unit[:, None, :]
+        radial_dist = (bridge_xyz - projected).norm(dim=-1)
+
+        radius = bridge_xyz.new_tensor(self.radius).clamp(min=self.eps)
+        if self.end_padding > 0.0:
+            before_a = alpha < 0.0
+            after_b = alpha > 1.0
+            cap_pos = torch.zeros_like(alpha)
+            cap_pos = torch.where(before_a, alpha / pad_alpha.clamp(min=self.eps), cap_pos)
+            cap_pos = torch.where(
+                after_b,
+                (alpha - 1.0) / pad_alpha.clamp(min=self.eps),
+                cap_pos,
+            )
+            cap_scale = torch.sqrt(torch.relu(1.0 - cap_pos.pow(2)))
+            allowed_radius = torch.where(before_a | after_b, radius * cap_scale, radius)
+        else:
+            allowed_radius = torch.ones_like(radial_dist) * radius
+        cylinder_loss = torch.relu(radial_dist - allowed_radius).pow(2).mean()
+
+        total_loss = (
+            self.spread_weight * spread_loss
+            + self.outside_weight * outside_loss
+            + self.cylinder_weight * cylinder_loss
+        )
+        return -self.weight * total_loss
+
+
 class SymmetryAwareMotifBridge(BasePotential):
     """Run motif_bridge independently per symmetry subunit.
 
@@ -3266,6 +3428,7 @@ POTENTIAL_REGISTRY: dict[str, type[BasePotential]] = {
     "motif_rigid_body_pose": MotifRigidBodyPose,
     "rigid_body_pose": MotifRigidBodyPose,
     "motif_bridge": MotifBridge,
+    "motif_bridge2": MotifBridge2,
     "motif_rigid": MotifRigid,
     "motif_com_distance": MotifCOMDistance,
     "motif_spherical_position": MotifSphericalPosition,

@@ -1,6 +1,7 @@
 import copy
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -85,10 +86,16 @@ logger = RankedLogger(__name__, rank_zero_only=True)
 
 
 _SCAFFOLD_CONTIG_TOKEN_RE = re.compile(r"^\d+(?:-\d+)?$")
+_AUTO_CONTIG_TOKEN_RE = re.compile(r"^auto$", re.IGNORECASE)
 UNINDEXED_FLOATING_MOTIF_ANNOTATION = "is_motif_atom_unindexed_floating_motif"
 # Keep the original true-unindex implementation on disk for later experiments, but
 # route active unindexed_motifs through inline sampled placement for now.
 UNINDEXED_MOTIFS_USE_LEGACY_TRUE_UNINDEX = False
+AUTO_LENGTH_TOKEN = "auto"
+AUTO_LENGTH_DEFAULT_DISTANCE = 50.0
+AUTO_LENGTH_DEFAULT_RADIUS = 20.0
+AUTO_LENGTH_RESIDUE_VOLUME = 130.0
+AUTO_LENGTH_RANGE_FRACTION = 0.20
 
 
 def _input_selection_from_contig_with_placeholders(
@@ -106,6 +113,7 @@ def _input_selection_from_contig_with_placeholders(
         if (
             token == "SymMotif"
             or token in motif_names
+            or _AUTO_CONTIG_TOKEN_RE.match(token)
             or _SCAFFOLD_CONTIG_TOKEN_RE.match(token)
         ):
             continue
@@ -146,6 +154,259 @@ def _shift_floating_motif_reference_coords(atom_array, shift):
         values -= shift[axis]
         atom_array.set_annotation(annotation, values)
     return atom_array
+
+
+def resolve_auto_length(
+    *,
+    potentials,
+    default_distance: float = AUTO_LENGTH_DEFAULT_DISTANCE,
+    default_radius: float = AUTO_LENGTH_DEFAULT_RADIUS,
+    residue_volume: float = AUTO_LENGTH_RESIDUE_VOLUME,
+    range_fraction: float = AUTO_LENGTH_RANGE_FRACTION,
+) -> dict:
+    """Resolve ``length: auto`` to a normal min-max residue range."""
+    if default_distance <= 0:
+        raise ValueError("auto_length_default_distance must be positive.")
+    if default_radius <= 0:
+        raise ValueError("auto_length_default_radius must be positive.")
+    if residue_volume <= 0:
+        raise ValueError("auto_length_residue_volume must be positive.")
+    if range_fraction < 0:
+        raise ValueError("auto_length_range_fraction must be non-negative.")
+
+    potential_specs = _auto_length_guiding_potentials(potentials)
+    distance = _auto_length_distance_from_potentials(
+        potential_specs,
+        default_distance=default_distance,
+    )
+    radius = _auto_length_radius_from_potentials(
+        potential_specs,
+        default_radius=default_radius,
+    )
+
+    semi_major = distance / 2.0
+    volume = (4.0 / 3.0) * math.pi * semi_major * radius * radius
+    median = max(1, int(round(volume / residue_volume)))
+    low = max(1, int(round(median * (1.0 - range_fraction))))
+    high = max(low, int(round(median * (1.0 + range_fraction))))
+
+    return {
+        "length": f"{low}-{high}",
+        "median": median,
+        "min": low,
+        "max": high,
+        "distance": float(distance),
+        "radius": float(radius),
+        "semi_major_axis": float(semi_major),
+        "volume": float(volume),
+        "residue_volume": float(residue_volume),
+        "range_fraction": float(range_fraction),
+        "n_potential_specs": len(potential_specs),
+    }
+
+
+def _auto_length_guiding_potentials(potentials) -> list[dict]:
+    plain = _plain_config(potentials)
+    if plain is None:
+        return []
+    if isinstance(plain, dict):
+        guiding = plain.get("guiding_potentials", [])
+        return [p for p in guiding if isinstance(p, dict)]
+    if isinstance(plain, list):
+        return [p for p in plain if isinstance(p, dict)]
+    return []
+
+
+def _plain_config(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {k: _plain_config(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_config(v) for v in value]
+    if hasattr(value, "items"):
+        return {k: _plain_config(v) for k, v in value.items()}
+    return value
+
+
+def _auto_length_distance_from_potentials(
+    potential_specs: list[dict],
+    *,
+    default_distance: float,
+) -> float:
+    pair_distances = []
+    radial_distances = []
+
+    for spec in potential_specs:
+        ptype = str(spec.get("type", "")).lower()
+        target_values = _numeric_values(spec.get("target_distances"))
+        target_values += _numeric_values(spec.get("target_distance"))
+        if not target_values:
+            continue
+
+        if _is_pair_distance_potential(ptype):
+            pair_distances.extend(target_values)
+        elif _is_com_or_center_distance_potential(ptype):
+            radial_distances.extend(target_values)
+
+    candidates = list(pair_distances)
+    radial_distances = sorted(radial_distances, reverse=True)
+    if len(radial_distances) >= 2:
+        candidates.append(radial_distances[0] + radial_distances[1])
+    elif len(radial_distances) == 1:
+        candidates.append(2.0 * radial_distances[0])
+
+    return max(candidates) if candidates else default_distance
+
+
+def _auto_length_radius_from_potentials(
+    potential_specs: list[dict],
+    *,
+    default_radius: float,
+) -> float:
+    radii = []
+    for spec in potential_specs:
+        ptype = str(spec.get("type", "")).lower()
+        if "bridge" not in ptype:
+            continue
+        radii.extend(_numeric_values(spec.get("max_radius")))
+    return max(radii) if radii else default_radius
+
+
+def _is_pair_distance_potential(ptype: str) -> bool:
+    return ptype in {
+        "motif_distance",
+        "symmetry_motif_distance",
+    }
+
+
+def _is_com_or_center_distance_potential(ptype: str) -> bool:
+    return ptype in {
+        "motif_com_distance",
+        "symmetry_motif_com_distance",
+        "motif_center_distance",
+        "symmetry_motif_center_distance",
+    }
+
+
+def _numeric_values(value) -> list[float]:
+    if value is None or isinstance(value, bool):
+        return []
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return [float(value)]
+    if isinstance(value, (list, tuple)):
+        values = []
+        for item in value:
+            values.extend(_numeric_values(item))
+        return values
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if "," in stripped or "[" in stripped or "]" in stripped:
+            return [
+                float(x)
+                for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", stripped)
+            ]
+        try:
+            return [float(stripped)]
+        except ValueError:
+            return []
+    return []
+
+
+def _parse_length_range(length: Optional[str]) -> tuple[int, int]:
+    if not exists(length):
+        raise ValueError("Contig token 'auto' requires the top-level 'length' field.")
+    length = str(length)
+    if "-" in length:
+        length_min, length_max = map(int, length.split("-"))
+        if length_min > length_max:
+            raise ValueError(f"Invalid length range '{length}'.")
+        return length_min, length_max
+    value = int(length)
+    return value, value
+
+
+def _resolve_contig_auto_tokens(contig: Optional[str], length: Optional[str]) -> tuple[Optional[str], Optional[dict]]:
+    if not exists(contig):
+        return contig, None
+
+    parts = [part.strip() for part in str(contig).split(",")]
+    auto_positions = [
+        idx for idx, part in enumerate(parts) if _AUTO_CONTIG_TOKEN_RE.match(part)
+    ]
+    if not auto_positions:
+        return contig, None
+
+    length_min, length_max = _parse_length_range(length)
+    is_length_range = length_min != length_max
+    fixed_budget = 0
+    resolved_parts = list(parts)
+    for idx, part in enumerate(parts):
+        if idx in auto_positions:
+            continue
+        fixed_budget += _contig_part_max_length(part)
+
+    remaining_min = length_min - fixed_budget
+    remaining_max = length_max - fixed_budget
+    if remaining_min < 0 or remaining_max < 0:
+        raise ValueError(
+            f"Contig token 'auto' has negative remaining length: sampled length "
+            f"{length_min}-{length_max}, fixed/max contig budget {fixed_budget}."
+        )
+
+    min_values = _split_integer_budget(remaining_min, len(auto_positions))
+    max_values = _split_integer_budget(remaining_max, len(auto_positions))
+    auto_lengths = []
+    for idx, min_value, max_value in zip(auto_positions, min_values, max_values):
+        if min_value > max_value:
+            raise ValueError(
+                f"Contig token 'auto' produced invalid range {min_value}-{max_value}."
+            )
+        if is_length_range:
+            value = f"{min_value}-{max_value}"
+        else:
+            value = str(min_value)
+        auto_lengths.append(value)
+        resolved_parts[idx] = value
+
+    resolved = ",".join(resolved_parts)
+    resolved_length = f"{length_min}-{length_max}" if is_length_range else str(length_min)
+    return resolved, {
+        "input_contig": contig,
+        "resolved_contig": resolved,
+        "length": resolved_length,
+        "length_min": length_min,
+        "length_max": length_max,
+        "fixed_budget": fixed_budget,
+        "remaining_length": (
+            f"{remaining_min}-{remaining_max}" if is_length_range else remaining_min
+        ),
+        "auto_lengths": auto_lengths,
+    }
+
+
+def _split_integer_budget(total: int, n_parts: int) -> list[int]:
+    base = total // n_parts
+    extra = total % n_parts
+    return [base + (1 if idx < extra else 0) for idx in range(n_parts)]
+
+
+def _contig_part_max_length(part: str) -> int:
+    if not part or part == "/0":
+        return 0
+
+    numeric = part
+    suffix = numeric[-1] if numeric[-1:] in {"P", "R", "D"} else ""
+    if suffix:
+        numeric = numeric[:-1]
+    if numeric.isdigit():
+        return int(numeric)
+    if "-" in numeric and all(piece.isdigit() for piece in numeric.split("-", 1)):
+        return int(numeric.split("-", 1)[1])
+
+    return len(get_design_pattern_with_constraints(part))
 
 
 def _infer_uniform_coordinate_shift(before, after):
@@ -245,7 +506,17 @@ class DesignInputSpecification(BaseModel):
         "NOT also appear in 'contig', 'sequence_unrestrained_motifs', or be assigned via "
         "'SymMotif'.")
     # Extra args:
-    length:  Optional[str] = Field(None, description="Length range as 'min-max' or int. Constrains length of contig if provided")
+    length:  Optional[str] = Field(None, description="Length range as 'min-max', int, or 'auto'. Constrains length of contig if provided")
+    auto_length_potentials: Optional[Any] = Field(None, exclude=True,
+        description="Hidden sampler potential config used only when length='auto'.")
+    auto_length_default_distance: float = Field(AUTO_LENGTH_DEFAULT_DISTANCE,
+        description="Fallback distance between ellipsoid endpoints for length='auto' (Angstrom).")
+    auto_length_default_radius: float = Field(AUTO_LENGTH_DEFAULT_RADIUS,
+        description="Fallback ellipsoid radius for length='auto' (Angstrom).")
+    auto_length_residue_volume: float = Field(AUTO_LENGTH_RESIDUE_VOLUME,
+        description="Volume per residue for length='auto' (Angstrom^3/residue).")
+    auto_length_range_fraction: float = Field(AUTO_LENGTH_RANGE_FRACTION,
+        description="Fractional range around the auto-length median, e.g. 0.20 gives +/-20%.")
     ligand:  Optional[str] = Field(None, description="Ligand name or index to include in design.")
     allow_ligand_on_existing_chain: bool = Field(False, description="If True, suppress the error when a ligand shares a chain ID with the built atom array. Use with caution — chain ID is leaked to the model.")
     cif_parser_args: Optional[Dict[str, Any]] = Field(None, description="CIF parser arguments")
@@ -441,6 +712,24 @@ class DesignInputSpecification(BaseModel):
     def canonicalize(cls, data: dict) -> dict:
         # Canonicalize length argument
         data["length"] = str(data["length"]) if exists(data.get("length")) else None
+        if isinstance(data.get("length"), str) and data["length"].lower() == AUTO_LENGTH_TOKEN:
+            auto_info = resolve_auto_length(
+                potentials=data.get("auto_length_potentials"),
+                default_distance=float(
+                    data.get("auto_length_default_distance", AUTO_LENGTH_DEFAULT_DISTANCE)
+                ),
+                default_radius=float(
+                    data.get("auto_length_default_radius", AUTO_LENGTH_DEFAULT_RADIUS)
+                ),
+                residue_volume=float(
+                    data.get("auto_length_residue_volume", AUTO_LENGTH_RESIDUE_VOLUME)
+                ),
+                range_fraction=float(
+                    data.get("auto_length_range_fraction", AUTO_LENGTH_RANGE_FRACTION)
+                ),
+            )
+            data["length"] = auto_info["length"]
+            data["extra"] = data.get("extra", {}) | {"auto_length": auto_info}
 
         # Normalize input to str
         data["input"] = str(data["input"]) if exists(data.get("input")) else None
@@ -979,13 +1268,24 @@ class DesignInputSpecification(BaseModel):
             effective_length = self._adjust_length_for_inline_motifs(
                 self.length, inline_motif_components
             )
+            sampling_contig, contig_auto_info = _resolve_contig_auto_tokens(
+                _design_contig,
+                effective_length,
+            )
+            sampling_length = (
+                str(contig_auto_info["length"])
+                if contig_auto_info is not None
+                else effective_length
+            )
             if exists(_design_contig) or exists(self.length):
                 components_to_accumulate = get_design_pattern_with_constraints(
-                    _design_contig if _design_contig else effective_length,
-                    length=effective_length,
+                    sampling_contig if sampling_contig else sampling_length,
+                    length=sampling_length,
                 )
             else:
                 components_to_accumulate = []
+            if contig_auto_info is not None:
+                self.extra["contig_auto"] = contig_auto_info
 
             if inline_motif_components:
                 components_to_accumulate = self._insert_inline_named_motifs(
@@ -1552,8 +1852,17 @@ class DesignInputSpecification(BaseModel):
 
         resolved_contig = ",".join(resolved_parts)
         if UNINDEXED_MOTIFS_USE_LEGACY_TRUE_UNINDEX:
+            sampling_contig, _contig_auto_info = _resolve_contig_auto_tokens(
+                resolved_contig,
+                self.length,
+            )
+            sampling_length = (
+                str(_contig_auto_info["length"])
+                if _contig_auto_info is not None
+                else self.length
+            )
             components = get_design_pattern_with_constraints(
-                resolved_contig, length=self.length
+                sampling_contig, length=sampling_length
             )
             (
                 unindexed_motif_tokens,
@@ -1573,8 +1882,17 @@ class DesignInputSpecification(BaseModel):
             effective_length = self._adjust_length_for_inline_motifs(
                 self.length, inline_motif_components
             )
+            sampling_contig, _contig_auto_info = _resolve_contig_auto_tokens(
+                resolved_contig,
+                effective_length,
+            )
+            sampling_length = (
+                str(_contig_auto_info["length"])
+                if _contig_auto_info is not None
+                else effective_length
+            )
             components = get_design_pattern_with_constraints(
-                resolved_contig, length=effective_length
+                sampling_contig, length=sampling_length
             )
             indexed_tokens.update(inline_motif_tokens)
             components = self._insert_inline_named_motifs(

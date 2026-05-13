@@ -1,4 +1,4 @@
-# New Input Fields: `non_fixed_contig`, `motifs`, `unindexed_motifs`, and Hetero-Symmetry Modes
+# New Input Fields: `length: auto`, `non_fixed_contig`, `motifs`, `unindexed_motifs`, and Hetero-Symmetry Modes
 
 This document describes input specification fields added to
 `DesignInputSpecification` in the `SymKabschPot` fork:
@@ -6,7 +6,93 @@ This document describes input specification fields added to
 - `non_fixed_contig` — standalone floating design pattern (mutually exclusive with `contig`)
 - `motifs` — named, independently floating fragments; can be referenced by name in `contig`
 - `unindexed_motifs` — named motifs appended inline on the main chain without explicit contig placement
+- `length: "auto"` — potential-aware ellipsoid estimate for scaffold length
 - `symmetry.mode` / `symmetry.instances` — hetero-symmetry modes for `hetero_symmetry` sampler
+
+---
+
+## `length: "auto"`
+
+**Type**: literal string token `"auto"` in the existing `length` field
+
+**Semantics**: Resolves to a normal `"min-max"` length range before contig expansion. This keeps
+the existing length implementation unchanged after validation.
+
+The estimate models the design volume as an ellipsoid:
+
+```text
+semi-major axis = distance_between_points / 2
+minor axes      = bridge_radius
+volume          = 4/3 * pi * a * b * c
+median residues = volume / 130
+range           = median +/- 20%
+```
+
+Defaults:
+
+- `distance_between_points = 50 A`
+- `bridge_radius = 20 A`
+- `residue_volume = 130 A^3`
+
+Example:
+
+```text
+V = 4/3 * pi * 25 * 20 * 20 = 41888 A^3
+N = 41888 / 130 = 322 residues
+length = 258-386
+```
+
+When `inference_sampler.potentials` are provided, auto length uses potential parameters when
+available:
+
+- `motif_distance` / `symmetry_motif_distance`: `target_distance`
+- `motif_com_distance` / `symmetry_motif_com_distance` / center-distance potentials:
+  `target_distance` or `target_distances`
+- bridge potentials: `max_radius`
+
+Missing values fall back to the defaults above.
+
+### Contig-Level `auto`
+
+When a top-level `length` is provided, the contig string may also contain the literal token
+`auto`:
+
+```json
+{
+  "contig": "A1-59,auto,B1-65",
+  "length": "auto"
+}
+```
+
+The contig `auto` slot receives the remaining scaffold length after subtracting:
+
+- all motif / PDB residue spans in the contig
+- the maximum size of any other scaffold range in the contig
+
+Example with a fixed total length:
+
+```json
+{
+  "contig": "A1-59,auto,B1-65",
+  "length": 300
+}
+```
+
+The `auto` slot becomes `176`, because `300 - 59 - 65 = 176`.
+
+Example with a ranged total length:
+
+```json
+{
+  "contig": "A1-59,auto,B1-65",
+  "length": "258-386"
+}
+```
+
+The `auto` slot becomes `134-262`, because both total-length bounds subtract the same
+fixed motif budget: `258 - 59 - 65 = 134` and `386 - 59 - 65 = 262`.
+This also applies when `length: "auto"` resolves to a range. If top-level `length` is a
+single number, the contig `auto` replacement remains a single number.
 
 ---
 

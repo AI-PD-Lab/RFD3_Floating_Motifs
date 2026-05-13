@@ -1,5 +1,77 @@
 # RFD3 Local Changes
 
+## Auto Length
+
+Input specs may set:
+
+```json
+{
+  "length": "auto"
+}
+```
+
+Only the literal token `"auto"` activates this path. It is resolved during input
+validation to a normal `"min-max"` length range, so all existing contig and
+length handling remains unchanged afterward.
+
+The estimate uses a prolate ellipsoid:
+
+```text
+semi-major axis = distance_between_points / 2
+minor axes      = bridge_radius
+volume          = 4/3 * pi * a * b * c
+median residues = volume / 130
+range           = median +/- 20%
+```
+
+Defaults are `distance_between_points=50 A` and `bridge_radius=20 A`. Example:
+
+```text
+V = 4/3 * pi * 25 * 20 * 20 = 41888 A^3
+N = 41888 / 130 = 322 residues
+length = 258-386
+```
+
+When potentials are provided through `inference_sampler.potentials`, auto length
+tries to infer:
+
+- point distance from `motif_distance` / `symmetry_motif_distance`
+- point distance from `motif_com_distance` / `symmetry_motif_com_distance` /
+  center-distance targets when pair distances are absent
+- bridge radius from `max_radius` on bridge potentials
+
+If a value is missing, the defaults above are used.
+
+The `auto` token can also be used inside a contig when top-level `length` is
+provided:
+
+```json
+{
+  "contig": "A1-59,auto,B1-65",
+  "length": "auto"
+}
+```
+
+The contig `auto` slot receives the remaining scaffold length after subtracting
+all motif residues and the maximum size of any other scaffold ranges in the
+contig. For example, with `length: 300`, `A1-59,auto,B1-65` resolves the
+`auto` slot to `176` residues.
+
+If top-level `length` is a range, either written directly or produced by
+`length: "auto"`, the contig `auto` slot becomes a range too:
+
+```json
+{
+  "contig": "A1-59,auto,B1-65",
+  "length": "258-386"
+}
+```
+
+Here the `auto` slot resolves to `134-262`, because both length bounds subtract
+the same fixed motif budget: `258 - 59 - 65 = 134` and
+`386 - 59 - 65 = 262`. A single-number top-level `length` still produces a
+single-number contig replacement.
+
 ## Unindexed Motifs
 
 Added a new input field:

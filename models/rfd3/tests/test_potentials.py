@@ -23,6 +23,7 @@ from rfd3.potentials.potentials import (
     InterfaceNContacts,
     MonomerROG,
     MotifBridge,
+    MotifBridge2,
     MotifCOMDistance,
     MotifDistance,
     MotifRadialOrientationPotential,
@@ -589,6 +590,15 @@ def test_parsing_dict_and_string():
             "max_radius": 8.0,
         },
         {
+            "type": "motif_bridge2",
+            "weight": 2.0,
+            "motif_i": 0,
+            "motif_j": 1,
+            "radius": 9.0,
+            "end_padding": 3.0,
+            "end_bias": 2.0,
+        },
+        {
             "type": "motif_rigid",
             "weight": 3.0,
             "k": 0.5,
@@ -607,17 +617,22 @@ def test_parsing_dict_and_string():
     assert pots_dict[2].target_distance == 12.0
     assert isinstance(pots_dict[3], MotifBridge)
     assert pots_dict[3].max_radius == 8.0
-    assert isinstance(pots_dict[4], MotifRigid)
-    assert pots_dict[4].k == 0.5
-    assert pots_dict[4].guide_scale == 2.0
-    assert pots_dict[4].guide_decay == "inverse_linear"
-    assert pots_dict[4].guide_clip_rms == 0.01
+    assert isinstance(pots_dict[4], MotifBridge2)
+    assert pots_dict[4].radius == 9.0
+    assert pots_dict[4].end_padding == 3.0
+    assert pots_dict[4].end_bias == 2.0
+    assert isinstance(pots_dict[5], MotifRigid)
+    assert pots_dict[5].k == 0.5
+    assert pots_dict[5].guide_scale == 2.0
+    assert pots_dict[5].guide_decay == "inverse_linear"
+    assert pots_dict[5].guide_clip_rms == 0.01
 
     specs_str = [
         "type:binder_ROG,weight:2.0",
         "type:interface_ncontacts,weight:0.5,r_0:6.0,d_0:1.5",
         "type:motif_distance,weight:1.5,motif_i:0,motif_j:1,target_distance:12.0",
         "type:motif_bridge,weight:4.0,motif_i:0,motif_j:1,max_radius:8.0",
+        "type:motif_bridge2,weight:2.0,motif_i:0,motif_j:1,radius:9.0,end_padding:3.0,end_bias:2.0",
         "type:motif_rigid,weight:3.0,k:0.5,loss:mse,guide_scale:2.0,guide_decay:inverse_linear,guide_clip_rms:0.01",
     ]
     pots_str = parse_potentials(specs_str)
@@ -629,11 +644,15 @@ def test_parsing_dict_and_string():
     assert pots_str[2].target_distance == 12.0
     assert isinstance(pots_str[3], MotifBridge)
     assert pots_str[3].max_radius == 8.0
-    assert isinstance(pots_str[4], MotifRigid)
-    assert pots_str[4].loss == "mse"
-    assert pots_str[4].guide_scale == 2.0
-    assert pots_str[4].guide_decay == "inverse_linear"
-    assert pots_str[4].guide_clip_rms == 0.01
+    assert isinstance(pots_str[4], MotifBridge2)
+    assert pots_str[4].radius == 9.0
+    assert pots_str[4].end_padding == 3.0
+    assert pots_str[4].end_bias == 2.0
+    assert isinstance(pots_str[5], MotifRigid)
+    assert pots_str[5].loss == "mse"
+    assert pots_str[5].guide_scale == 2.0
+    assert pots_str[5].guide_decay == "inverse_linear"
+    assert pots_str[5].guide_clip_rms == 0.01
 
 
 @pytest.mark.fast
@@ -893,6 +912,69 @@ def test_motif_bridge_guidance_moves_scaffold_between_motifs():
                 spread_weight=1.0,
                 outside_weight=1.0,
                 tube_weight=0.0,
+            )
+        ],
+        guide_clip_rms=1e6,
+    )
+    xyz = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [20.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+            ]
+        ]
+    )
+
+    guidance, _ = compute_potential_guidance(
+        xyz_t=xyz,
+        potential_manager=manager,
+        t=1.0,
+        T=1.0,
+        masks=masks,
+        metadata={"atom_to_token_map": f["atom_to_token_map"]},
+        apply_mode="atom",
+        atom_guidance_fraction=0.0,
+    )
+    xyz_new = xyz + 0.1 * guidance
+
+    assert xyz_new[0, 1, 0] < xyz[0, 1, 0]
+    assert guidance[:, f["is_motif_atom_with_fixed_coord"], :].abs().max().item() == 0.0
+
+
+@pytest.mark.fast
+def test_motif_bridge2_guidance_moves_scaffold_into_capped_cylinder():
+    """motif_bridge2 should move generated atoms into the padded motif cylinder."""
+    f = {
+        "atom_to_token_map": torch.tensor([0, 1, 2]),
+        "is_motif_atom_with_fixed_coord": torch.tensor([True, False, True]),
+        "is_virtual": torch.zeros(3, dtype=torch.bool),
+        "is_ca": torch.ones(3, dtype=torch.bool),
+        "is_backbone": torch.ones(3, dtype=torch.bool),
+    }
+    config = PotentialsConfig(
+        enabled=True,
+        include_atoms="CA",
+        exclude_fixed_atoms=True,
+        exclude_virtual_atoms=True,
+        guide_only_generated=True,
+        guide_scale=1.0,
+        guide_decay="constant",
+        guide_clip_rms=1e6,
+    )
+    masks = build_masks(f, config)
+    manager = _make_manager(
+        [
+            MotifBridge2(
+                weight=1.0,
+                motif_i=0,
+                motif_j=1,
+                spread_weight=1.0,
+                outside_weight=1.0,
+                ellipsoid_weight=1.0,
+                radius=5.0,
+                end_padding=2.0,
+                end_bias=1.0,
             )
         ],
         guide_clip_rms=1e6,

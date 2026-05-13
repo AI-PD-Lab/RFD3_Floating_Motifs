@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 from atomworks.io.tools.inference import components_to_atom_array
 from biotite.structure import get_residue_starts
-from rfd3.inference.input_parsing import DesignInputSpecification
+from rfd3.inference.input_parsing import DesignInputSpecification, resolve_auto_length
 from rfd3.inference.symmetry.symmetry_utils import SymmetryConfig
 from rfd3.model.floating_motif_projection import (
     _get_contig_motif_atom_mask,
@@ -167,6 +167,130 @@ def test_nfc_only_no_contig():
 # ---------------------------------------------------------------------------
 # motifs tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.fast
+def test_auto_length_default_ellipsoid_example():
+    """length='auto' default should match the 50 A by 20 A ellipsoid estimate."""
+    info = resolve_auto_length(potentials=None)
+    assert info["median"] == 322
+    assert info["length"] == "258-386"
+    assert info["distance"] == 50.0
+    assert info["radius"] == 20.0
+
+
+@pytest.mark.fast
+def test_auto_length_uses_potential_distance_and_bridge_radius():
+    """Auto length should read motif-distance and bridge-radius potential fields."""
+    info = resolve_auto_length(
+        potentials={
+            "guiding_potentials": [
+                {"type": "motif_distance", "target_distance": 60.0},
+                {"type": "motif_bridge", "max_radius": 15.0},
+            ]
+        }
+    )
+    # V = 4/3*pi*30*15*15 = 28274.3 A^3; /130 = 217.5 residues.
+    assert info["median"] == 217
+    assert info["length"] == "174-260"
+    assert info["distance"] == 60.0
+    assert info["radius"] == 15.0
+
+
+@pytest.mark.fast
+def test_design_spec_length_auto_becomes_regular_range():
+    """The literal length token 'auto' should canonicalize before normal expansion."""
+    aa_in = _make_two_chain_input()
+    spec = DesignInputSpecification(
+        atom_array_input=aa_in,
+        length="auto",
+        auto_length_potentials={
+            "guiding_potentials": [
+                {"type": "motif_distance", "target_distance": 60.0},
+                {"type": "motif_bridge", "max_radius": 15.0},
+            ]
+        },
+    )
+    assert spec.length == "174-260"
+    assert spec.extra["auto_length"]["median"] == 217
+
+
+@pytest.mark.fast
+def test_contig_auto_token_fills_remaining_length():
+    """A contig-level auto token should fill total length minus motif lengths."""
+    aa_in = _make_two_chain_input()
+    spec = DesignInputSpecification(
+        atom_array_input=aa_in,
+        contig="A1-5,auto,B1-5",
+        length="30",
+        select_fixed_atoms=False,
+    )
+    result, metadata = spec.build(return_metadata=True)
+    assert len(get_residue_starts(result)) == 30
+    assert metadata["extra"]["contig_auto"]["length"] == "30"
+    assert metadata["extra"]["contig_auto"]["length_min"] == 30
+    assert metadata["extra"]["contig_auto"]["length_max"] == 30
+    assert metadata["extra"]["contig_auto"]["fixed_budget"] == 10
+    assert metadata["extra"]["contig_auto"]["auto_lengths"] == ["20"]
+
+
+@pytest.mark.fast
+def test_contig_auto_token_subtracts_max_of_other_ranges():
+    """Other scaffold ranges should count by their maximum when resolving contig auto."""
+    aa_in = _make_two_chain_input()
+    spec = DesignInputSpecification(
+        atom_array_input=aa_in,
+        contig="A1-5,10-15,auto,B1-5",
+        length="40",
+        select_fixed_atoms=False,
+    )
+    result, metadata = spec.build(return_metadata=True)
+    assert len(get_residue_starts(result)) == 40
+    assert metadata["extra"]["contig_auto"]["fixed_budget"] == 25
+    assert metadata["extra"]["contig_auto"]["auto_lengths"] == ["15"]
+
+
+@pytest.mark.fast
+def test_contig_auto_token_becomes_range_with_length_range():
+    """With ranged top-level length, contig auto should resolve to a range."""
+    aa_in = _make_two_chain_input()
+    spec = DesignInputSpecification(
+        atom_array_input=aa_in,
+        contig="A1-5,auto,B1-5",
+        length="30-40",
+        select_fixed_atoms=False,
+    )
+    result, metadata = spec.build(return_metadata=True)
+    n_res = len(get_residue_starts(result))
+    assert 30 <= n_res <= 40
+    assert metadata["extra"]["contig_auto"]["length"] == "30-40"
+    assert metadata["extra"]["contig_auto"]["length_min"] == 30
+    assert metadata["extra"]["contig_auto"]["length_max"] == 40
+    assert metadata["extra"]["contig_auto"]["fixed_budget"] == 10
+    assert metadata["extra"]["contig_auto"]["auto_lengths"] == ["20-30"]
+    assert metadata["extra"]["contig_auto"]["resolved_contig"] == "A1-5,20-30,B1-5"
+
+
+@pytest.mark.fast
+def test_contig_auto_range_subtracts_max_of_other_ranges_from_both_bounds():
+    """Ranged contig auto should subtract other range maxima from both bounds."""
+    aa_in = _make_two_chain_input()
+    spec = DesignInputSpecification(
+        atom_array_input=aa_in,
+        contig="A1-5,10-15,auto,B1-5",
+        length="40-50",
+        select_fixed_atoms=False,
+    )
+    result, metadata = spec.build(return_metadata=True)
+    n_res = len(get_residue_starts(result))
+    assert 40 <= n_res <= 50
+    assert metadata["extra"]["contig_auto"]["fixed_budget"] == 25
+    assert metadata["extra"]["contig_auto"]["auto_lengths"] == ["15-25"]
+    assert (
+        metadata["extra"]["contig_auto"]["resolved_contig"]
+        == "A1-5,10-15,15-25,B1-5"
+    )
+
 
 @pytest.mark.fast
 def test_motif_appended_as_separate_chain():

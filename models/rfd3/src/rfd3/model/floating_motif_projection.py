@@ -15,6 +15,10 @@ FLOATING_MOTIF_REFERENCE_ANNOTATIONS = (
     "floating_motif_reference_z",
 )
 
+# Annotation that groups atoms into named rigid-body super-motifs.
+# Atoms with the same non-empty value are Kabsch-aligned together as one rigid body.
+SUPERMOTIF_ID_ANNOTATION = "supermotif_id"
+
 _WARNED_INSUFFICIENT_MOTIFS: set[tuple[str, int]] = set()
 
 
@@ -112,10 +116,12 @@ def build_floating_motif_references_from_contigs(
     input_pdb_features: Any = None,
     sample_features: dict[str, Any] | None = None,
 ) -> list[FloatingMotifReference]:
-    """Build independent contig motif references from the inference AtomArray.
+    """Build contig motif references from the inference AtomArray.
 
-    The current RFD3 inference path encodes contig provenance in
-    atom_array.src_component, so no new motif range parser is needed here.
+    Super-motifs (atoms sharing a non-empty SUPERMOTIF_ID_ANNOTATION value) are
+    collected first and aligned together as one rigid body each.  All remaining
+    contig motif atoms are then split into independent contiguous segments and
+    aligned independently, preserving the original behaviour.
     """
 
     del contig_map, input_pdb_features
@@ -133,20 +139,55 @@ def build_floating_motif_references_from_contigs(
     if not np.any(is_contig_motif):
         return []
 
-    references = []
+    references: list[FloatingMotifReference] = []
+    supermotif_src_components: set[str] = set()
+
+    # --- 1. Super-motifs: group non-connected parts into single rigid bodies ---
+    if SUPERMOTIF_ID_ANNOTATION in atom_array.get_annotation_categories():
+        supermotif_ids = np.asarray(
+            atom_array.get_annotation(SUPERMOTIF_ID_ANNOTATION)
+        ).astype(str)
+        unique_sm_ids = sorted({s for s in supermotif_ids if s})
+
+        for sm_id in unique_sm_ids:
+            sm_mask = (supermotif_ids == sm_id) & is_contig_motif
+            sm_atom_indices = np.where(sm_mask)[0].astype(np.int64)
+            if sm_atom_indices.size == 0:
+                continue
+
+            references.append(
+                FloatingMotifReference(
+                    sample_atom_indices=torch.as_tensor(sm_atom_indices, dtype=torch.long),
+                    reference_xyz=torch.as_tensor(ref_xyz[sm_atom_indices]).detach().clone(),
+                    reference_atom_mask=torch.as_tensor(
+                        _get_reference_atom_mask(atom_array, ref_xyz, sm_atom_indices)
+                    ).bool(),
+                    source_components=tuple(
+                        dict.fromkeys(str(c) for c in src_components[sm_atom_indices])
+                    ),
+                )
+            )
+            supermotif_src_components.update(str(c) for c in src_components[sm_mask])
+
+    # --- 2. Remaining atoms: independent contiguous segments (original behaviour) ---
+    if supermotif_src_components:
+        remaining_motif_mask = is_contig_motif & ~np.isin(
+            src_components, list(supermotif_src_components)
+        )
+    else:
+        remaining_motif_mask = is_contig_motif
+
     for atom_indices in _iter_contiguous_motif_atom_segments(
-        atom_array, src_components, is_contig_motif
+        atom_array, src_components, remaining_motif_mask
     ):
         atom_indices_np = np.asarray(atom_indices, dtype=np.int64)
-        reference_xyz = torch.as_tensor(ref_xyz[atom_indices_np]).detach().clone()
-        reference_atom_mask = torch.as_tensor(
-            _get_reference_atom_mask(atom_array, ref_xyz, atom_indices_np)
-        ).bool()
         references.append(
             FloatingMotifReference(
                 sample_atom_indices=torch.as_tensor(atom_indices_np, dtype=torch.long),
-                reference_xyz=reference_xyz,
-                reference_atom_mask=reference_atom_mask,
+                reference_xyz=torch.as_tensor(ref_xyz[atom_indices_np]).detach().clone(),
+                reference_atom_mask=torch.as_tensor(
+                    _get_reference_atom_mask(atom_array, ref_xyz, atom_indices_np)
+                ).bool(),
                 source_components=tuple(
                     dict.fromkeys(str(x) for x in src_components[atom_indices_np])
                 ),

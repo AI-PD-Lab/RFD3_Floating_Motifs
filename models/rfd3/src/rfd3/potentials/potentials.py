@@ -2206,6 +2206,283 @@ class SymmetryAwareMotifCOMRadialOrientation(SymmetryAwareMotifRadialOrientation
         )
 
 
+class SymmetryAwareMotifAxisPosition(BasePotential):
+    """Spherical angular position (theta, phi) of each subunit's motif COM measured in
+    the subunit's own local frame relative to the symmetry center.
+
+    Coordinates (both in degrees):
+      theta — signed elevation from the equatorial plane
+              (0 = same level as symmetry center, + toward +axis, - toward -axis).
+      phi   — azimuthal angle in the plane perpendicular to the axis, measured
+              relative to the centerline of that symmetry instance.  A single
+              phi target therefore means the same thing for every Cn copy.
+              Positive phi moves toward the next subunit; negative phi moves
+              toward the previous subunit.  Values are compared modulo 360°.
+
+    The COM is expressed in the local frame of each subunit (i.e. the atom
+    coordinates are transformed by the inverse of the subunit symmetry frame),
+    then phi is shifted so phi=0 sits in the middle of the subunit's symmetry
+    wedge instead of on the frame boundary.  The same ``target_theta`` /
+    ``target_phi`` applies identically to all Cn copies.  For hetero symmetry,
+    supply one ``[theta]`` or ``[theta, phi]`` entry per subunit in
+    ``target_positions`` to override independently.
+
+    Radial distance is intentionally not constrained here — use
+    ``symmetry_motif_center_distance`` for that.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        target_theta: float | None = None,
+        target_phi: float | None = None,
+        target_positions: list | None = None,
+        weight_theta: float = 1.0,
+        weight_phi: float = 1.0,
+        center: list | None = None,
+        axis: list | None = None,
+        motif_i: int = 0,
+        eps: float = 1e-6,
+        reduction: str = "sum",
+    ):
+        super().__init__(weight)
+        self.target_theta = float(target_theta) if target_theta is not None else None
+        self.target_phi = float(target_phi) if target_phi is not None else None
+        self.target_positions = list(target_positions) if target_positions is not None else []
+        self.weight_theta = float(weight_theta)
+        self.weight_phi = float(weight_phi)
+        self.center = [float(x) for x in center] if center is not None else [0.0, 0.0, 0.0]
+        self.axis = [float(x) for x in axis] if axis is not None else [0.0, 0.0, 1.0]
+        self.motif_i = int(motif_i)
+        self.eps = float(eps)
+        self.reduction = _validate_symmetry_reduction(reduction)
+
+    def _get_target_theta(self, subunit_idx: int) -> float | None:
+        if subunit_idx < len(self.target_positions):
+            pos = self.target_positions[subunit_idx]
+            if hasattr(pos, "__len__") and len(pos) >= 1:
+                return float(pos[0])
+        return self.target_theta
+
+    def _get_target_phi(self, subunit_idx: int) -> float | None:
+        if subunit_idx < len(self.target_positions):
+            pos = self.target_positions[subunit_idx]
+            if hasattr(pos, "__len__") and len(pos) >= 2:
+                return float(pos[1])
+        return self.target_phi
+
+    def _subunit_rotation(self, subunit_idx, transform_ids, metadata, device, dtype):
+        sym_transform = metadata.get("sym_transform", {})
+        if not sym_transform or subunit_idx >= len(transform_ids):
+            return None
+        tid = int(transform_ids[subunit_idx].item() if hasattr(transform_ids[subunit_idx], "item") else transform_ids[subunit_idx])
+        if tid not in sym_transform and str(tid) not in sym_transform:
+            return None
+        key = tid if tid in sym_transform else str(tid)
+        return sym_transform[key][0].to(device=device, dtype=dtype)
+
+    def _phi_midline_offset(self, n_instances: int, device, dtype):
+        if n_instances <= 1:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        return torch.tensor(180.0 / float(n_instances), device=device, dtype=dtype)
+
+    def compute(self, xyz, masks, metadata):
+        subunits = _symmetry_subunit_motif_blocks(masks, metadata, xyz.device)
+        if not subunits:
+            return xyz.new_zeros(())
+
+        # Ordered transform IDs — mirrors the ordering in _symmetry_subunit_motif_blocks
+        transform_ids = []
+        if "sym_transform_id" in metadata:
+            sym_tid = metadata["sym_transform_id"].to(device=xyz.device, dtype=torch.long)
+            sym_eid = metadata.get("sym_entity_id")
+            if sym_eid is not None:
+                valid = sym_eid.to(device=xyz.device, dtype=torch.long) != -1
+            else:
+                valid = torch.ones_like(sym_tid, dtype=torch.bool)
+            valid = valid & (sym_tid != -1)
+            transform_ids = torch.unique(sym_tid[valid]).sort().values
+
+        center = torch.tensor(self.center, device=xyz.device, dtype=xyz.dtype)
+        axis = torch.tensor(self.axis, device=xyz.device, dtype=xyz.dtype)
+        axis = axis / axis.norm().clamp_min(self.eps)
+
+        total_loss = xyz.new_zeros(())
+        n_active = 0
+
+        for subunit_idx, local_blocks in enumerate(subunits):
+            if self.motif_i >= len(local_blocks):
+                continue
+            com = _motif_block_current_com(xyz, local_blocks[self.motif_i])
+            if com is None:
+                continue
+
+            # Vector from symmetry center to motif COM [B, 3], then transform to local frame.
+            vec = com - center.unsqueeze(0)
+            R_i = self._subunit_rotation(subunit_idx, transform_ids, metadata, xyz.device, xyz.dtype)
+            # Coordinates are row vectors. R_i maps local->global as x @ R_i.T,
+            # so the inverse/global->local operation is x @ R_i.
+            vec_local = vec @ R_i if R_i is not None else vec
+
+            # Elevation axis in local frame (invariant under Cn/Dn Z-rotations, correct otherwise)
+            axis_local = (axis @ R_i) if R_i is not None else axis
+
+            r = vec_local.norm(dim=-1).clamp_min(self.eps)  # [B]
+
+            tgt_theta = self._get_target_theta(subunit_idx)
+            if tgt_theta is not None:
+                sin_elevation = (vec_local * axis_local).sum(dim=-1) / r
+                theta_deg = torch.rad2deg(
+                    torch.asin(sin_elevation.clamp(-1.0 + self.eps, 1.0 - self.eps))
+                )
+                total_loss = total_loss + (self.weight_theta * (theta_deg - tgt_theta) ** 2).mean()
+                n_active += 1
+
+            tgt_phi = self._get_target_phi(subunit_idx)
+            if tgt_phi is not None:
+                phi_deg = torch.rad2deg(torch.atan2(vec_local[:, 1], vec_local[:, 0]))
+                phi_deg = phi_deg - self._phi_midline_offset(
+                    len(transform_ids) if len(transform_ids) > 0 else len(subunits),
+                    xyz.device,
+                    xyz.dtype,
+                )
+                dphi = torch.remainder(phi_deg - tgt_phi + 180.0, 360.0) - 180.0
+                total_loss = total_loss + (self.weight_phi * dphi ** 2).mean()
+                n_active += 1
+
+        if n_active == 0:
+            return xyz.new_zeros(())
+        return _weighted_symmetry_loss(self.weight, total_loss, n_active, self.reduction)
+
+    def guide_atom_mask(self, masks, metadata, device):
+        return _symmetry_aware_all_motif_mask(masks, metadata, device)
+
+    def instance_guide_masks(self, masks, metadata, device):
+        return _symmetry_aware_all_blocks(masks, metadata, device)
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        return _rigidize_blocks_translation(
+            atom_grad, _symmetry_aware_all_blocks(masks, metadata, xyz.device)
+        )
+
+
+class SymmetryAwareInterInstanceMotifDistance(BasePotential):
+    """Penalise pairwise distances between motif COMs across different symmetry subunits.
+
+    By default, homomer/normal symmetry only scores neighbouring subunit pairs:
+    (0,1), (1,2), ..., (N-1,0).  This avoids over-constraining all pairwise
+    distances in one cyclic ring.
+
+    For hetero or hand-specified layouts, use ``target_pairs`` as a list of
+    dictionaries.  Each dict defines the two subunit/motif instances and the
+    distance target, e.g. ``{subunit_i: 0, motif_i: 0, subunit_j: 2,
+    motif_j: 1, target_distance: 30.0}``.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        target_distance: float = 20.0,
+        target_distances: list | None = None,
+        target_pairs: list | None = None,
+        motif_i: int = 0,
+        motif_j: int | None = None,
+        neighbor_only: bool = True,
+        reduction: str = "sum",
+    ):
+        super().__init__(weight)
+        self.target_distance = float(target_distance)
+        self.target_distances = (
+            [float(x) for x in target_distances] if target_distances is not None else []
+        )
+        self.target_pairs = list(target_pairs) if target_pairs is not None else []
+        self.motif_i = int(motif_i)
+        self.motif_j = int(motif_j) if motif_j is not None else self.motif_i
+        self.neighbor_only = bool(neighbor_only)
+        self.reduction = _validate_symmetry_reduction(reduction)
+
+    def _get_pair_target(self, pair_idx: int) -> float:
+        if pair_idx < len(self.target_distances):
+            return self.target_distances[pair_idx]
+        return self.target_distance
+
+    def _default_subunit_pairs(self, n: int) -> list[tuple[int, int, int, int, float]]:
+        if n < 2:
+            return []
+        subunit_pairs: list[tuple[int, int]]
+        if self.neighbor_only:
+            subunit_pairs = [(i, (i + 1) % n) for i in range(n)]
+            if n == 2:
+                subunit_pairs = [(0, 1)]
+        else:
+            subunit_pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        return [
+            (si, sj, self.motif_i, self.motif_j, self._get_pair_target(pair_idx))
+            for pair_idx, (si, sj) in enumerate(subunit_pairs)
+        ]
+
+    def _explicit_subunit_pairs(self) -> list[tuple[int, int, int, int, float]]:
+        pairs = []
+        for pair in self.target_pairs:
+            if not isinstance(pair, dict):
+                raise ValueError(
+                    "symmetry_motif_inter_instance_distance target_pairs entries "
+                    "must be dictionaries"
+                )
+            si = int(pair.get("subunit_i", pair.get("instance_i", 0)))
+            sj = int(pair.get("subunit_j", pair.get("instance_j", 1)))
+            mi = int(pair.get("motif_i", self.motif_i))
+            mj = int(pair.get("motif_j", self.motif_j))
+            if "target_distance" not in pair and "distance" not in pair:
+                raise ValueError(
+                    "symmetry_motif_inter_instance_distance target_pairs entries "
+                    "must include target_distance"
+                )
+            target = float(pair.get("target_distance", pair.get("distance")))
+            pairs.append((si, sj, mi, mj, target))
+        return pairs
+
+    def compute(self, xyz, masks, metadata):
+        subunits = _symmetry_subunit_motif_blocks(masks, metadata, xyz.device)
+        if len(subunits) < 2:
+            return xyz.new_zeros(())
+        total_loss = xyz.new_zeros(())
+        n_active = 0
+        pair_specs = (
+            self._explicit_subunit_pairs()
+            if self.target_pairs
+            else self._default_subunit_pairs(len(subunits))
+        )
+        for si, sj, motif_i, motif_j, target in pair_specs:
+            if si < 0 or sj < 0 or si >= len(subunits) or sj >= len(subunits):
+                continue
+            local_i = subunits[si]
+            local_j = subunits[sj]
+            if motif_i < 0 or motif_j < 0 or motif_i >= len(local_i) or motif_j >= len(local_j):
+                continue
+            com_i = _motif_block_current_com(xyz, local_i[motif_i])
+            com_j = _motif_block_current_com(xyz, local_j[motif_j])
+            if com_i is None or com_j is None:
+                continue
+            dist = (com_i - com_j).norm(dim=-1)
+            total_loss = total_loss + ((dist - target) ** 2).mean()
+            n_active += 1
+        if n_active == 0:
+            return xyz.new_zeros(())
+        return _weighted_symmetry_loss(self.weight, total_loss, n_active, self.reduction)
+
+    def guide_atom_mask(self, masks, metadata, device):
+        return _symmetry_aware_all_motif_mask(masks, metadata, device)
+
+    def instance_guide_masks(self, masks, metadata, device):
+        return _symmetry_aware_all_blocks(masks, metadata, device)
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        return _rigidize_blocks_translation(
+            atom_grad, _symmetry_aware_all_blocks(masks, metadata, xyz.device)
+        )
+
+
 def _symmetry_subunit_motif_blocks(
     masks: dict[str, torch.Tensor],
     metadata: dict,
@@ -3443,4 +3720,6 @@ POTENTIAL_REGISTRY: dict[str, type[BasePotential]] = {
     "symmetry_motif_com_distance": SymmetryAwareMotifCOMDistance,
     "symmetry_motif_com_radial_position": SymmetryAwareMotifCOMRadialPosition,
     "symmetry_motif_com_radial_orientation": SymmetryAwareMotifCOMRadialOrientation,
+    "symmetry_motif_axis_position": SymmetryAwareMotifAxisPosition,
+    "symmetry_motif_inter_instance_distance": SymmetryAwareInterInstanceMotifDistance,
 }

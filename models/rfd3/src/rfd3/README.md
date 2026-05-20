@@ -248,6 +248,8 @@ New potential names:
 - `symmetry_motif_com_distance`
 - `symmetry_motif_com_radial_position`
 - `symmetry_motif_com_radial_orientation`
+- `symmetry_motif_axis_position`
+- `symmetry_motif_inter_instance_distance`
 
 `symmetry_motif_distance` accepts either the old pair style:
 
@@ -287,3 +289,107 @@ The COM variants use the current protein COM instead of the symmetry center:
 ```yaml
 {type: symmetry_motif_com_distance, target_distance: 20.0, origin_atom_filter: real}
 ```
+
+`symmetry_motif_axis_position` constrains the angular position of each subunit's
+motif COM in **spherical coordinates around the symmetry center**, expressed in
+**each subunit's own local frame** so that a single target specification applies
+uniformly across all Cn copies.
+
+Coordinates (both in degrees):
+
+- **theta** — signed elevation from the equatorial plane
+  (0° = same level as the symmetry center, + toward the positive symmetry axis,
+  - toward the negative symmetry axis).  For the default axis `[0, 0, 1]`,
+  positive theta moves upward in global Z and negative theta moves downward.
+- **phi** — azimuthal angle in the plane perpendicular to the axis, measured
+  relative to the centerline of that subunit's symmetry instance.  Concretely,
+  the COM vector is transformed into the subunit's local frame and then shifted
+  by half of the instance width, so phi = 0° is always the middle of that
+  subunit's wedge.  For C4 this means phi = 0° points at global 45°/135°/225°/315°
+  for subunits 0/1/2/3.  Positive phi moves toward the next subunit; negative
+  phi moves toward the previous subunit.  Values are compared modulo 360°, so
+  `-30`, `330`, and `690` describe the same target direction.
+
+Radial distance is not constrained here; combine with `symmetry_motif_center_distance`
+for that.
+
+```yaml
+# Cn symmetry: keep all copies level with the symmetry center,
+# 30° ahead of each copy's wedge centerline
+{type: symmetry_motif_axis_position, weight: 2.0, target_theta: 0.0, target_phi: 30.0,
+ weight_theta: 1.0, weight_phi: 0.5}
+
+# Signed theta and phi are allowed:
+# 20° above the equatorial plane, 30° behind each copy's wedge centerline
+{type: symmetry_motif_axis_position, weight: 2.0, target_theta: 20.0, target_phi: -30.0}
+
+# Hetero: per-subunit overrides as [theta_deg, phi_deg]
+{type: symmetry_motif_axis_position, weight: 2.0,
+ target_positions: [[0.0, 0.0], [20.0, 45.0], [-20.0, -30.0]]}
+```
+
+Parameters:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `target_theta` | `null` | Signed elevation target in degrees. `0` means the equatorial plane at the symmetry center; positive moves toward `axis`, negative moves opposite `axis`. Skipped if null. |
+| `target_phi` | `null` | Signed azimuthal angle target in the subunit's local frame, in degrees. Positive moves toward the next subunit; negative moves toward the previous subunit. Values are wrapped modulo 360°. Skipped if null. |
+| `target_positions` | `[]` | Per-subunit overrides as `[theta]` or `[theta, phi]` entries. Missing entries fall back to `target_theta` / `target_phi`. One entry works for all Cn copies. |
+| `weight_theta` | `1.0` | Relative weight for the signed elevation term. |
+| `weight_phi` | `1.0` | Relative weight for the azimuthal term. |
+| `center` | `[0, 0, 0]` | Symmetry center in global coordinates. |
+| `axis` | `[0, 0, 1]` | Symmetry axis direction (Z for all Cn/Dn). |
+| `motif_i` | `0` | Which motif block (0-based) to use from each subunit. |
+| `reduction` | `sum` | `sum` or `mean` over active subunit/angle terms. |
+
+---
+
+`symmetry_motif_inter_instance_distance` penalises the pairwise COM–COM distance
+between motif blocks across **different** symmetry subunits.  By default it only
+scores neighbouring symmetry instances: `(0,1), (1,2), ..., (N-1,0)`.  For C2,
+this collapses to the single pair `(0,1)`.  This means every subunit is
+constrained to both of its ring neighbours, but each neighbour edge is counted
+once: in C4, subunit 0 is constrained to subunits 1 and 3 via pairs `(0,1)` and
+`(3,0)`.  Set `neighbor_only: false` only if you really want all N·(N−1)/2
+cross-subunit pairs.
+
+For hetero symmetry or hand-specified pair layouts, prefer `target_pairs`: a
+list of dictionaries where each entry names the two subunit/motif instances and
+the target distance.
+
+```yaml
+# Cn symmetry: keep neighbouring motif instances at 30 Å
+{type: symmetry_motif_inter_instance_distance, weight: 3.0, target_distance: 30.0}
+
+# Cn symmetry: old all-pairs behaviour, if explicitly wanted
+{type: symmetry_motif_inter_instance_distance, weight: 3.0,
+ target_distance: 30.0, neighbor_only: false}
+
+# Hetero/dictionary style: define the exact two motif instances and distance
+type: symmetry_motif_inter_instance_distance
+weight: 3.0
+target_pairs:
+  - {subunit_i: 0, motif_i: 0, subunit_j: 1, motif_j: 0, target_distance: 25.0}
+  - {subunit_i: 0, motif_i: 1, subunit_j: 2, motif_j: 0, target_distance: 40.0}
+  - {subunit_i: 1, motif_i: 1, subunit_j: 2, motif_j: 1, target_distance: 30.0}
+
+# Use motif block 1 from each subunit instead of block 0
+{type: symmetry_motif_inter_instance_distance, weight: 3.0, target_distance: 25.0,
+ motif_i: 1}
+
+# Use block 0 from the first subunit and block 1 from the second (asymmetric)
+{type: symmetry_motif_inter_instance_distance, weight: 3.0, target_distance: 20.0,
+ motif_i: 0, motif_j: 1}
+```
+
+Parameters:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `target_distance` | `20.0` | Shared distance target in Å for default generated pairs. |
+| `target_distances` | `[]` | Optional per-default-pair targets. With `neighbor_only: true`, order is `(0,1),(1,2),...,(N-1,0)`; with `neighbor_only: false`, order is lexicographic all-pairs `(0,1),(0,2),...`. Missing pairs fall back to `target_distance`. |
+| `target_pairs` | `[]` | Explicit dictionary-style pairs. Each entry can define `subunit_i`, `motif_i`, `subunit_j`, `motif_j`, and `target_distance`. If set, this overrides generated neighbour/all-pair selection. |
+| `motif_i` | `0` | Default block index (0-based) to pick from the first subunit of generated/default pairs. |
+| `motif_j` | same as `motif_i` | Default block index from the second subunit of generated/default pairs. |
+| `neighbor_only` | `true` | If true, generated/default pairs include only neighbouring symmetry instances. If false, generated/default pairs include all cross-subunit pairs. Ignored when `target_pairs` is set. |
+| `reduction` | `sum` | `sum` or `mean` over active cross-subunit pairs. |

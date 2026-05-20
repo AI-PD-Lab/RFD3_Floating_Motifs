@@ -55,6 +55,7 @@ from rfd3.inference.symmetry.checks import check_symmetry_config
 from rfd3.inference.symmetry.frames import get_symmetry_frames_from_symmetry_id
 from rfd3.model.floating_motif_projection import (
     FLOATING_MOTIF_REFERENCE_ANNOTATIONS,
+    SUPERMOTIF_ID_ANNOTATION,
     annotate_floating_motif_reference_coords,
 )
 from rfd3.transforms.conditioning_base import (
@@ -505,6 +506,14 @@ class DesignInputSpecification(BaseModel):
         "motifs remain floating/Kabsch-aligned and internally conserved. Names listed here must "
         "NOT also appear in 'contig', 'sequence_unrestrained_motifs', or be assigned via "
         "'SymMotif'.")
+    supermotifs: Optional[Dict[str, Union[str, List[str]]]] = Field(None,
+        description="Named rigid-body super-motifs for groups of non-connected fragments. "
+        "Each entry maps a super-motif name to either a contig string (e.g. 'A1-10,B5-15') "
+        "selecting residues directly, or a list of motif names from the 'motifs' dict. "
+        "All referenced residues must already be included in 'contig', 'motifs', or "
+        "'non_fixed_contig'. Super-motifs do NOT need to appear in 'contig'. "
+        "During floating motif projection the parts of each super-motif are Kabsch-aligned "
+        "together as a single rigid body instead of independently.")
     # Extra args:
     length:  Optional[str] = Field(None, description="Length range as 'min-max', int, or 'auto'. Constrains length of contig if provided")
     auto_length_potentials: Optional[Any] = Field(None, exclude=True,
@@ -662,8 +671,8 @@ class DesignInputSpecification(BaseModel):
                 "you want a fully floating design pattern with no position constraint."
             )
 
-        # non_fixed_contig and motifs require an input PDB
-        for field in ("non_fixed_contig", "motifs"):
+        # non_fixed_contig, motifs, and supermotifs require an input PDB
+        for field in ("non_fixed_contig", "motifs", "supermotifs"):
             if exists(data.get(field)) and not (
                 exists(data.get("input")) or exists(data.get("atom_array_input"))
             ):
@@ -923,6 +932,87 @@ class DesignInputSpecification(BaseModel):
                             f"Invalid contig string for motif '{motif_name}': {e}"
                         ) from e
 
+            # Validate supermotifs dict
+            if exists(data.get("supermotifs")):
+                if not isinstance(data["supermotifs"], dict):
+                    raise ValueError(
+                        f"'supermotifs' must be a dict of {{name: contig_str_or_motif_list}}, "
+                        f"got {type(data['supermotifs'])}."
+                    )
+                motifs_keys = set(data.get("motifs") or {})
+
+                # Build a mask of all residues already included in this specification,
+                # so we can verify each supermotif only references included atoms.
+                included_mask = np.zeros(len(atom_array), dtype=bool)
+                for _f in ("contig", "non_fixed_contig"):
+                    _val = data.get(_f)
+                    if exists(_val):
+                        _raw = _val.raw if hasattr(_val, "raw") else _val
+                        if isinstance(_raw, str):
+                            try:
+                                included_mask |= _input_selection_from_contig_with_placeholders(
+                                    _raw, atom_array=atom_array, motif_names=motifs_keys
+                                ).get_mask()
+                            except Exception:
+                                pass
+                        elif isinstance(_val, InputSelection):
+                            included_mask |= _val.get_mask()
+                for _mc in (data.get("motifs") or {}).values():
+                    try:
+                        included_mask |= InputSelection.from_any(_mc, atom_array=atom_array).get_mask()
+                    except Exception:
+                        pass
+                if exists(data.get("unindex")):
+                    _ui = data["unindex"]
+                    if isinstance(_ui, InputSelection):
+                        included_mask |= _ui.get_mask()
+
+                for sm_name, sm_def in data["supermotifs"].items():
+                    if isinstance(sm_def, list):
+                        # List of motif names — each must exist in motifs
+                        if not sm_def:
+                            raise ValueError(
+                                f"Supermotif '{sm_name}' is an empty list; "
+                                f"provide at least one motif name or a contig string."
+                            )
+                        for motif_name in sm_def:
+                            if not isinstance(motif_name, str):
+                                raise ValueError(
+                                    f"Supermotif '{sm_name}' list entries must be strings, "
+                                    f"got {type(motif_name)}."
+                                )
+                            if motif_name not in motifs_keys:
+                                raise ValueError(
+                                    f"Supermotif '{sm_name}' references motif '{motif_name}' "
+                                    f"which is not defined in 'motifs'."
+                                )
+                    elif isinstance(sm_def, str):
+                        # Contig string — parse and verify all residues are in the included set
+                        try:
+                            sm_mask = InputSelection.from_any(
+                                sm_def, atom_array=atom_array
+                            ).get_mask()
+                        except Exception as e:
+                            raise ValueError(
+                                f"Invalid contig string for supermotif '{sm_name}': {e}"
+                            ) from e
+                        if not np.any(sm_mask):
+                            raise ValueError(
+                                f"Supermotif '{sm_name}' contig '{sm_def}' matched no atoms "
+                                f"in the input structure."
+                            )
+                        if np.any(sm_mask & ~included_mask):
+                            raise ValueError(
+                                f"Supermotif '{sm_name}' references residues that are not "
+                                f"included in 'contig', 'motifs', or 'non_fixed_contig'. "
+                                f"All supermotif parts must already be defined in the input."
+                            )
+                    else:
+                        raise ValueError(
+                            f"Supermotif '{sm_name}' definition must be a contig string or a "
+                            f"list of motif names, got {type(sm_def)}."
+                        )
+
             # Coerce selections
             for sele in selections:
                 if sele in ["contig", "non_fixed_contig", "unindexed_breaks"]:
@@ -1147,6 +1237,7 @@ class DesignInputSpecification(BaseModel):
             atom_array, atom_array_input_annotated
         )
         atom_array = annotate_floating_motif_reference_coords(atom_array)
+        atom_array = self._annotate_supermotifs(atom_array, atom_array_input_annotated)
 
         # Apply globals to all tokens (including diffused)
         atom_array = self._set_origin(atom_array)
@@ -1393,6 +1484,53 @@ class DesignInputSpecification(BaseModel):
             marked[np.isin(src, list(motif_components))] = 1
 
         atom_array.set_annotation(UNINDEXED_FLOATING_MOTIF_ANNOTATION, marked)
+        return atom_array
+
+    def _annotate_supermotifs(self, atom_array, atom_array_input_annotated):
+        """Tag atoms with their super-motif ID for grouped rigid-body Kabsch alignment.
+
+        Atoms sharing the same non-empty SUPERMOTIF_ID_ANNOTATION value are aligned
+        together as one rigid body by build_floating_motif_references_from_contigs.
+        """
+        n = atom_array.array_length()
+        supermotif_ids = np.empty(n, dtype=object)
+        supermotif_ids[:] = ""
+
+        if exists(self.supermotifs):
+            src = np.asarray(atom_array.src_component).astype(str)
+            for sm_name, sm_def in self.supermotifs.items():
+                # Resolve supermotif definition to a combined contig string
+                if isinstance(sm_def, list):
+                    combined_contig = ",".join(self.motifs[m] for m in sm_def)
+                else:
+                    combined_contig = sm_def
+
+                # Resolve the contig string against the SOURCE atom array to obtain
+                # the set of src_component values covered by this supermotif.
+                try:
+                    sm_tokens = InputSelection.from_any(
+                        combined_contig, atom_array=atom_array_input_annotated
+                    ).get_tokens(atom_array_input_annotated)
+                except Exception as e:
+                    raise ValueError(
+                        f"Failed to resolve supermotif '{sm_name}' against input: {e}"
+                    ) from e
+
+                sm_src_components = set(sm_tokens.keys())
+                mask = np.isin(src, list(sm_src_components))
+
+                # Guard against cross-supermotif atom overlap
+                overlap = mask & (supermotif_ids != "")
+                if np.any(overlap):
+                    conflicting = set(supermotif_ids[overlap].tolist())
+                    raise ValueError(
+                        f"Supermotif '{sm_name}' overlaps with supermotif(s) "
+                        f"{sorted(conflicting)}. Super-motif atom sets must be disjoint."
+                    )
+
+                supermotif_ids[mask] = sm_name
+
+        atom_array.set_annotation(SUPERMOTIF_ID_ANNOTATION, supermotif_ids.astype(str))
         return atom_array
 
     def _get_inline_named_motif_payload(

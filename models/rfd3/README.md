@@ -63,6 +63,51 @@ rfd3 design ... inference_sampler.floating_motif_project=True inference_sampler.
 
 `floating_motif_project_every` controls the projection interval, `floating_motif_burn_in` skips projection for the first N denoising steps, and `floating_motif_stop_after` optionally stops projection after a specific step. In this potentials-enabled checkout, the step order is normal sampler update, external potential guidance, then floating motif Kabsch projection. The projection is an inference-time approximation of floating-anchor diffusion; it does not change training or model architecture.
 
+### Super-motifs (rigid non-connected bodies)
+
+By default, floating motif projection aligns each *contiguous* motif segment independently.  A **super-motif** groups non-connected motif fragments into a single rigid body so that all inter-fragment distances and angles are preserved together by a single Kabsch solve.
+
+Add a `supermotifs` dict to your input JSON alongside the existing `motifs` key.  Each entry maps a name to either:
+- a **list of motif names** from `motifs`, or
+- a **direct contig string** selecting residues from the input PDB.
+
+```json
+{
+    "input": "protein.pdb",
+    "motifs": {
+        "loop_1": "A1-10",
+        "loop_2": "A25-34"
+    },
+    "supermotifs": {
+        "rigid_interface": ["loop_1", "loop_2"]
+    },
+    "contig": "loop_1,15,loop_2",
+    "length": "40-50"
+}
+```
+
+Or with a direct contig string:
+
+```json
+{
+    "supermotifs": {
+        "rigid_interface": "A1-10,A25-34"
+    }
+}
+```
+
+Rules:
+- All residues referenced in `supermotifs` must already appear in `contig`, `motifs`, or `non_fixed_contig` — an error is raised otherwise.
+- Super-motifs do **not** need to appear in `contig` themselves.
+- Super-motif atom sets must be disjoint; overlapping definitions raise an error.
+- Floating motif projection must be enabled for super-motifs to have any effect:
+
+```bash
+rfd3 design ... inference_sampler.floating_motif_project=True
+```
+
+See `docs/examples/supermotifs_test.json` and `run_supermotifs_test.sh` for a minimal working example.
+
 There are various interesting ways you can use RFD3 beyond [Atom14](https://www.biorxiv.org/content/10.1101/2024.08.16.608235v4) design as it's trained on a large array of different tasks.
 For example, you can fix sequence and not structure (prediction-type task), fix the backbone and unfix the sequence (MPNN-type inverse folding) or unfix the sidechains only (PLACER/ChemNet-style):
 

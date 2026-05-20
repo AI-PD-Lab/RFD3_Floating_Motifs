@@ -1373,7 +1373,7 @@ class DesignInputSpecification(BaseModel):
 
     def _mark_unindexed_named_motifs(self, atom_array, atom_array_input_annotated):
         """Mark built atoms originating from unindexed_motifs for Kabsch eligibility."""
-        if not exists(self.unindexed_motifs):
+        if not exists(self.unindexed_motifs) or self._external_motif_unindexing_enabled():
             return atom_array
 
         atom_array.set_annotation(
@@ -1404,7 +1404,7 @@ class DesignInputSpecification(BaseModel):
         inline layout before diffusion, rather than diffused as appended true-unindex
         guideposts and cleaned up afterward.
         """
-        if not exists(self.unindexed_motifs):
+        if not exists(self.unindexed_motifs) or self._external_motif_unindexing_enabled():
             return {}, []
 
         excluded_motifs = excluded_motifs or set()
@@ -1422,6 +1422,16 @@ class DesignInputSpecification(BaseModel):
                 get_design_pattern_with_constraints(motif_contig_str)
             )
         return indexed_tokens, inline_components
+
+    def _external_motif_unindexing_enabled(self) -> bool:
+        """Allow JSON motif names to act as external references only.
+
+        The sampler-side motif_unindexing module reads the same JSON
+        input/motifs/unindexed_motifs fields, but no motif atoms should be
+        inserted by this parser path when this opt-in marker is present.
+        """
+        extra = self.extra or {}
+        return bool(extra.get("external_motif_unindexing", False))
 
     def _insert_inline_named_motifs(
         self,
@@ -1547,7 +1557,7 @@ class DesignInputSpecification(BaseModel):
         but retain a dedicated annotation so floating motif projection still treats them as
         rigid floating motifs.
         """
-        if not exists(self.unindexed_motifs):
+        if not exists(self.unindexed_motifs) or self._external_motif_unindexing_enabled():
             return {}, [], []
 
         excluded_motifs = excluded_motifs or set()

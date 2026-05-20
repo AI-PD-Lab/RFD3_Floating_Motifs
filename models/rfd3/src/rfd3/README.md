@@ -287,3 +287,69 @@ The COM variants use the current protein COM instead of the symmetry center:
 ```yaml
 {type: symmetry_motif_com_distance, target_distance: 20.0, origin_atom_filter: real}
 ```
+
+## External-Reference Motif Unindexing
+
+SymKabschPot also supports an inference-only motif unindexing controller under
+`inference_sampler.motif_unindexing`.  This is separate from the legacy
+input-level `unindex` path: motif PDBs are used only as external Kabsch
+references and motif atoms are not inserted into the generated atom array.
+
+When enabled, sampling starts from the normal unconditional generated structure.
+At each pre-activation update, the controller scans generated CA windows, aligns
+each candidate to each motif PDB with Kabsch, greedily assigns one
+non-overlapping window per motif, and applies a Kabsch-shaped bias to those
+generated residues.  Once the mean assigned RMSD is below
+`activation_threshold`, the inferred windows are converted into ordinary
+`FloatingMotifReference` objects and the existing floating motif projector is
+used.  Matching and pre-activation biasing are CA-based, but activated
+projection expands each matched residue to configured atom names such as
+`N,CA,C,O,CB` when those atoms exist.  Projection stops after
+`post_activation_guidance_steps`, or at absolute denoising step
+`post_activation_stop_after` when that field is set.
+
+Example:
+
+```yaml
+inference_sampler:
+  motif_unindexing:
+    enabled: true
+    motif_pdbs:
+      - /path/to/motif_1.pdb
+      - /path/to/motif_2.pdb
+    target_length: 120
+    update_frequency: 1
+    loss_weight: 1.0
+    activation_threshold: 2.0
+    post_activation_stop_after: 160
+    projection_atom_names: [N, CA, C, O, CB]
+    allow_overlap: false
+```
+
+Fields:
+
+- `enabled`: opt-in switch. Existing behavior is unchanged when false.
+- `motif_pdbs`: external motif PDB files. The current implementation uses
+  ordered CA coordinates from each file.
+- `target_length`: optional bookkeeping for the intended unconditional length;
+  the normal input length controls actual initialization.
+- `update_frequency`: how often to rerun candidate matching before activation.
+- `loss_weight`: pre-activation Kabsch bias strength.
+- `activation_threshold`: mean assignment RMSD threshold in Angstrom.
+- `post_activation_guidance_steps`: number of steps to run normal floating motif
+  projection after activation.
+- `post_activation_stop_after`: absolute denoising step after which
+  post-activation projection stops. Takes precedence over
+  `post_activation_guidance_steps`.
+- `projection_atom_names`: atom names used to expand activated CA matches to
+  projection references. Missing atoms are skipped.
+- `allow_overlap`: when false, greedy assignment prevents multiple motifs from
+  claiming the same generated atoms.
+- `debug`: log activation diagnostics.
+
+This path is used by monomer, homomeric symmetry, and hetero-symmetry samplers.
+For symmetry sampling, symmetry projection is reapplied after dynamic motif
+projection so the post-step coordinates remain symmetric.  Current limitations:
+matching is CA-only, assignment is greedy rather than globally optimized, and
+this feature should not be confused with the legacy atom-inserting `unindex`
+input mode.

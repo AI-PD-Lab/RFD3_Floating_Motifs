@@ -242,6 +242,77 @@ guiding_potentials:
   - "type:motif_rigid,weight:1000.0,guide_scale:1.0,guide_decay:inverse_cosine,guide_clip_rms:0.05,atom_filter:backbone,k:0.25,loss:pseudo_huber,group_mode:all"
 ```
 
+### External-reference motif unindexing
+
+`motif_unindexing` is an inference-only SymKabschPot feature for motif guidance
+without pre-indexed motif residues. It is disabled by default and does not use
+the legacy unindexed-token path. Motif PDB files are loaded as external
+Kabsch-reference coordinates only; their atoms are never inserted into the
+generated atom array.
+
+The generated structure is initialized as the usual unconditional design for
+the requested length. During sampling, the unindexing controller scans
+candidate generated CA windows, aligns each window to each external motif by
+Kabsch, scores the alignment RMSD, and greedily assigns one non-overlapping
+window per motif. Before activation, it applies a small Kabsch-based bias to
+the selected generated windows so they become more motif-like. When the mean
+assignment RMSD is below `activation_threshold`, the controller converts the
+assignments into ordinary `FloatingMotifReference` objects and calls the
+existing floating motif Kabsch projector. The pre-activation search is CA-based,
+but activated projection expands the matched residues to the configured atom
+names when those atoms exist in both the generated residue and the motif
+reference. Projection stops after `post_activation_guidance_steps`, or at the
+absolute denoising step `post_activation_stop_after` when that field is set.
+
+This path works through the same sampler hook used by monomer, homomeric
+symmetry, and hetero-symmetry modes. In symmetry mode, the sampler reapplies
+the normal symmetry projection after dynamic motif projection so the final
+post-step coordinates remain symmetric.
+
+Example:
+
+```yaml
+inference_sampler:
+  motif_unindexing:
+    enabled: true
+    motif_pdbs:
+      - /path/to/motif_1.pdb
+      - /path/to/motif_2.pdb
+    target_length: 120
+    update_frequency: 1
+    loss_weight: 1.0
+    activation_threshold: 2.0
+    post_activation_stop_after: 160
+    projection_atom_names: [N, CA, C, O, CB]
+    allow_overlap: false
+```
+
+Configuration fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Enables the external-reference motif unindexing controller. Existing behavior is unchanged when false. |
+| `motif_pdbs` | `[]` | PDB files used as external motif references. CA atoms are used for matching; configured atom names are used for projection when available. |
+| `target_length` | `null` | Optional bookkeeping field for the intended unconditional monomer length. The current sampler uses the normal input length machinery. |
+| `update_frequency` | `1` | Re-run Kabsch window matching every N denoising steps before activation. |
+| `loss_weight` | `1.0` | Strength of the pre-activation Kabsch bias. |
+| `activation_threshold` | `2.0` | Mean assignment RMSD threshold, in Angstrom, for switching to normal floating motif projection. |
+| `post_activation_guidance_steps` | `20` | Number of denoising steps to keep applying the existing floating motif projector after activation. |
+| `post_activation_stop_after` | `null` | Absolute denoising step after which post-activation projection stops. This takes precedence over `post_activation_guidance_steps`. |
+| `projection_atom_names` | `[N, CA, C, O, CB]` | Atom names to use when expanding activated CA matches to projection references. Missing atoms are skipped. |
+| `allow_overlap` | `false` | If false, greedy motif assignment masks already-used generated atoms so multiple motifs cannot use the same region. |
+| `debug` | `false` | Emit activation diagnostics through the logger. |
+
+Known limitations:
+
+- Matching and pre-activation biasing are CA-only in this first implementation. Activated projection can use matched backbone/CB atoms. It avoids
+  requiring residue identities or atom-name compatibility between the generated
+  unconditional chain and the external motif PDB.
+- Assignment is greedy in motif order. This is robust and small, but it is not
+  a global combinatorial optimizer for many motifs.
+- The old input-level `unindex` feature still inserts unindexed motif atoms and
+  is separate from this feature. Do not use both as if they were the same mode.
+
 ### `motif_radial_orientation` guide
 
 `motif_radial_orientation` biases the *rotational pose* of each contig-defined motif block relative to the direction from the current protein center of mass (COM) to the motif's center. This direction is the motif's *radial direction*. The potential asks: "is the motif rotated the same way around its radial axis as it was in the input PDB?"

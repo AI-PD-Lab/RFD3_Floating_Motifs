@@ -155,13 +155,33 @@ def build_floating_motif_references_from_contigs(
     return references
 
 
-def project_floating_motifs_all_atom(xyz, floating_motif_refs):
+_PROJ_CALL_COUNT = 0
+
+
+def project_floating_motifs_all_atom(xyz, floating_motif_refs, alpha: float = 1.0):
     """Project each contig motif independently after a denoising update.
 
     This is an inference-time approximation of floating-anchor diffusion behavior.
     It rigidly projects sampled contig motifs after normal RFD3 denoising; it is
     not true FADiff training and does not alter the model architecture.
+
+    ``alpha`` controls how much of the Kabsch-aligned reference to blend in:
+    1.0 (default) is the original hard replacement; 0.0 leaves coordinates
+    unchanged.  Values in between give a linear blend
+    ``alpha * aligned + (1 - alpha) * current``, which lets the motif geometry
+    relax gradually toward the end of the post-activation window.
     """
+    # ── TEMPORARY DIAGNOSTIC ──────────────────────────────────────────────────
+    global _PROJ_CALL_COUNT
+    _PROJ_CALL_COUNT += 1
+    logger.info(
+        "[proj_diag] call=%d alpha=%.6f n_refs=%d xyz_shape=%s",
+        _PROJ_CALL_COUNT,
+        alpha,
+        len(floating_motif_refs) if floating_motif_refs else 0,
+        tuple(xyz.shape),
+    )
+    # ─────────────────────────────────────────────────────────────────────────
 
     if not floating_motif_refs:
         return xyz
@@ -207,7 +227,23 @@ def project_floating_motifs_all_atom(xyz, floating_motif_refs):
 
         replace_mask = valid_mask & torch.isfinite(aligned).all(dim=-1)
         motif_current = projected.index_select(dim=-2, index=atom_idx)
-        motif_current = torch.where(replace_mask[..., None], aligned, motif_current)
+        blended = alpha * aligned + (1.0 - alpha) * motif_current
+        # ── TEMPORARY DIAGNOSTIC ─────────────────────────────────────────────
+        logger.info(
+            "[proj_diag] blend: (aligned-blended).abs().max()=%.6e  "
+            "(motif_current-blended).abs().max()=%.6e  "
+            "dtypes: aligned=%s blended=%s motif_current=%s  "
+            "replace_mask_true=%d/%d",
+            float((aligned - blended).abs().max().item()),
+            float((motif_current - blended).abs().max().item()),
+            str(aligned.dtype),
+            str(blended.dtype),
+            str(motif_current.dtype),
+            int(replace_mask.sum().item()),
+            int(replace_mask.numel()),
+        )
+        # ─────────────────────────────────────────────────────────────────────
+        motif_current = torch.where(replace_mask[..., None], blended, motif_current)
         projected.scatter_(
             dim=-2,
             index=atom_idx.view(1, -1, 1).expand(projected.shape[0], -1, 3),

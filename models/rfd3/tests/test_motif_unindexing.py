@@ -1,5 +1,9 @@
 import torch
 
+from rfd3.model.floating_motif_projection import (
+    FloatingMotifReference,
+    project_floating_motifs_all_atom,
+)
 from rfd3.model.motif_unindexing import (
     MotifAssignment,
     MotifUnindexingConfig,
@@ -639,3 +643,167 @@ def test_boundary_distance_bias_moves_only_adjacent_scaffold_ca(tmp_path):
     assert abs(after_right.item() - 3.8) < abs(before_right.item() - 3.8)
     assert not torch.equal(updated[:, 0], xyz[:, 0])
     assert not torch.equal(updated[:, 4], xyz[:, 4])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Soft Kabsch: projection_alpha() and project_floating_motifs_all_atom(alpha=)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_projection_alpha_disabled_returns_one(tmp_path):
+    """soft_kabsch_enabled=False → alpha is always 1.0 regardless of step."""
+    motif = tmp_path / "motif.pdb"
+    _write_ca_pdb(motif, [(0, 0, 0), (1, 0, 0), (2, 0, 0)])
+    controller = build_motif_unindexing_controller(
+        MotifUnindexingConfig(
+            enabled=True,
+            motif_pdbs=[str(motif)],
+            soft_kabsch_enabled=False,
+            soft_kabsch_ramp_start_step=0,
+            soft_kabsch_alpha_min=0.0,
+            post_activation_guidance_steps=20,
+        ),
+        _features(n_atoms=3),
+    )
+    controller.activated_step = 5
+    for step in [0, 5, 10, 100]:
+        assert controller.projection_alpha(step) == 1.0, f"expected 1.0 at step {step}"
+
+
+def test_projection_alpha_pre_activation_returns_one(tmp_path):
+    """alpha is 1.0 before activated_step is set."""
+    motif = tmp_path / "motif.pdb"
+    _write_ca_pdb(motif, [(0, 0, 0), (1, 0, 0), (2, 0, 0)])
+    controller = build_motif_unindexing_controller(
+        MotifUnindexingConfig(
+            enabled=True,
+            motif_pdbs=[str(motif)],
+            soft_kabsch_enabled=True,
+            soft_kabsch_ramp_start_step=0,
+            soft_kabsch_alpha_min=0.0,
+            post_activation_guidance_steps=20,
+        ),
+        _features(n_atoms=3),
+    )
+    assert controller.activated_step is None
+    for step in [0, 10, 50]:
+        assert controller.projection_alpha(step) == 1.0, f"expected 1.0 at step {step}"
+
+
+def test_projection_alpha_before_ramp_start_returns_one(tmp_path):
+    """Steps before ramp_start_step return alpha=1.0."""
+    motif = tmp_path / "motif.pdb"
+    _write_ca_pdb(motif, [(0, 0, 0), (1, 0, 0), (2, 0, 0)])
+    controller = build_motif_unindexing_controller(
+        MotifUnindexingConfig(
+            enabled=True,
+            motif_pdbs=[str(motif)],
+            soft_kabsch_enabled=True,
+            soft_kabsch_ramp_start_step=50,
+            soft_kabsch_alpha_min=0.0,
+            post_activation_guidance_steps=100,
+        ),
+        _features(n_atoms=3),
+    )
+    controller.activated_step = 10
+    assert controller.projection_alpha(49) == 1.0
+    # At ramp_start itself progress=0 → alpha still 1.0; one step later it drops.
+    assert controller.projection_alpha(50) == 1.0
+    assert controller.projection_alpha(51) < 1.0  # first step into the ramp
+
+
+def test_projection_alpha_at_ramp_end_returns_floor(tmp_path):
+    """At the final active projection step, alpha equals soft_kabsch_alpha_min."""
+    motif = tmp_path / "motif.pdb"
+    _write_ca_pdb(motif, [(0, 0, 0), (1, 0, 0), (2, 0, 0)])
+    controller = build_motif_unindexing_controller(
+        MotifUnindexingConfig(
+            enabled=True,
+            motif_pdbs=[str(motif)],
+            soft_kabsch_enabled=True,
+            soft_kabsch_ramp_start_step=10,
+            soft_kabsch_alpha_min=0.2,
+            post_activation_stop_after=30,  # absolute ceiling; ramp_end = 30
+        ),
+        _features(n_atoms=3),
+    )
+    controller.activated_step = 5
+    # ramp_end = post_activation_stop_after = 30
+    assert abs(controller.projection_alpha(30) - 0.2) < 1e-6
+
+
+def test_projection_alpha_linear_interpolation(tmp_path):
+    """At the midpoint of the ramp, alpha ≈ (1.0 + alpha_min) / 2."""
+    motif = tmp_path / "motif.pdb"
+    _write_ca_pdb(motif, [(0, 0, 0), (1, 0, 0), (2, 0, 0)])
+    alpha_min = 0.0
+    ramp_start = 10
+    ramp_end = 30  # post_activation_stop_after
+    controller = build_motif_unindexing_controller(
+        MotifUnindexingConfig(
+            enabled=True,
+            motif_pdbs=[str(motif)],
+            soft_kabsch_enabled=True,
+            soft_kabsch_ramp_start_step=ramp_start,
+            soft_kabsch_alpha_min=alpha_min,
+            post_activation_stop_after=ramp_end,
+        ),
+        _features(n_atoms=3),
+    )
+    controller.activated_step = 5
+    midpoint = ramp_start + (ramp_end - ramp_start) // 2  # step 20
+    alpha = controller.projection_alpha(midpoint)
+    expected = (1.0 + alpha_min) / 2.0
+    assert abs(alpha - expected) < 1e-5, f"expected {expected:.4f}, got {alpha:.4f}"
+
+
+def test_soft_kabsch_blend(tmp_path):
+    """project_floating_motifs_all_atom with alpha=0.5 gives midpoint coords."""
+    torch.manual_seed(42)
+    n_atoms = 6
+    current = torch.randn(n_atoms, 3)
+    # Reference is a rotated+translated copy of current so Kabsch aligns perfectly
+    from rfd3.model.floating_motif_projection import kabsch_align_all_atom
+
+    reference = current.clone() + torch.tensor([5.0, 3.0, -2.0])
+    # Build a FloatingMotifReference with the reference exactly equal to current
+    # (trivial Kabsch = identity), so aligned == reference → blend is easy to check
+    ref = FloatingMotifReference(
+        sample_atom_indices=torch.arange(n_atoms),
+        reference_xyz=reference,
+        reference_atom_mask=torch.ones(n_atoms, dtype=torch.bool),
+    )
+    xyz = current.clone()
+    projected_half = project_floating_motifs_all_atom(xyz.unsqueeze(0), [ref], alpha=0.5)
+    projected_half = projected_half.squeeze(0)
+
+    # Kabsch-align reference onto current (same as what the function does internally)
+    ref_exp = reference.unsqueeze(0)
+    cur_exp = current.unsqueeze(0)
+    aligned = kabsch_align_all_atom(ref_exp, cur_exp).squeeze(0)
+    expected = 0.5 * aligned + 0.5 * current
+
+    assert torch.allclose(projected_half, expected, atol=1e-5), (
+        f"blend mismatch: max diff {(projected_half - expected).abs().max().item():.2e}"
+    )
+
+
+def test_soft_kabsch_alpha_one_matches_hard_kabsch(tmp_path):
+    """alpha=1.0 produces exactly the same output as the original hard replacement."""
+    torch.manual_seed(7)
+    n_atoms = 8
+    current = torch.randn(n_atoms, 3)
+    reference = torch.randn(n_atoms, 3)
+    ref = FloatingMotifReference(
+        sample_atom_indices=torch.arange(n_atoms),
+        reference_xyz=reference,
+        reference_atom_mask=torch.ones(n_atoms, dtype=torch.bool),
+    )
+    xyz_default = current.clone().unsqueeze(0)
+    xyz_alpha1 = current.clone().unsqueeze(0)
+
+    # Default (no alpha arg) and alpha=1.0 must be identical
+    out_default = project_floating_motifs_all_atom(xyz_default, [ref])
+    out_alpha1 = project_floating_motifs_all_atom(xyz_alpha1, [ref], alpha=1.0)
+
+    assert torch.equal(out_default, out_alpha1), "alpha=1.0 diverged from default"

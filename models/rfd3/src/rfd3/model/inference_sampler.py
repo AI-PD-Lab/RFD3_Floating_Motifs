@@ -540,12 +540,28 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 dynamic_refs = motif_unindexing_controller.active_floating_motif_refs(
                     step_num
                 )
+                # ── TEMPORARY DIAGNOSTIC ─────────────────────────────────────
+                ranked_logger.info(
+                    "[sampler_diag] step=%d activated_step=%s n_dynamic_refs=%d "
+                    "is_post_active=%s alpha=%.4f",
+                    step_num,
+                    motif_unindexing_controller.activated_step,
+                    len(dynamic_refs),
+                    motif_unindexing_controller.is_post_activation_active(step_num),
+                    motif_unindexing_controller.projection_alpha(step_num),
+                )
+                # ─────────────────────────────────────────────────────────────
                 if dynamic_refs:
-                    X_L = project_floating_motifs_all_atom(X_L, dynamic_refs)
+                    X_L = project_floating_motifs_all_atom(
+                        X_L,
+                        dynamic_refs,
+                        alpha=motif_unindexing_controller.projection_alpha(step_num),
+                    )
                 X_L = motif_unindexing_controller.apply_boundary_distance_bias(
                     X_L,
                     step_num,
                 )
+                motif_unindexing_controller.log_diagnostics(X_L, step_num)
             if motif_backbone_bias_controller is not None:
                 X_L = motif_backbone_bias_controller.apply_bias(X_L, step_num)
 
@@ -948,7 +964,11 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                     step_num
                 )
                 if dynamic_refs:
-                    X_L = project_floating_motifs_all_atom(X_L, dynamic_refs)
+                    X_L = project_floating_motifs_all_atom(
+                        X_L,
+                        dynamic_refs,
+                        alpha=motif_unindexing_controller.projection_alpha(step_num),
+                    )
                     X_L = self.apply_post_update_symmetry(
                         X_L, f, step_num, c_t, gamma_min_sym
                     )
@@ -956,6 +976,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                     X_L,
                     step_num,
                 )
+                motif_unindexing_controller.log_diagnostics(X_L, step_num)
             if motif_backbone_bias_controller is not None:
                 X_L = motif_backbone_bias_controller.apply_bias(X_L, step_num)
             self.log_step_diagnostics(step_num, "post_kabsch", X_L, f)

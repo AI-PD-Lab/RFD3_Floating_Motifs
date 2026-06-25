@@ -81,6 +81,12 @@ class MotifUnindexingConfig:
     boundary_distance_bias_weight: float = 1.0
     boundary_distance_target: float = 3.8
     boundary_distance_bias_clip_rms: float | None = None
+    # Soft Kabsch: replace hard binary paste with a linearly-decaying blend.
+    # Disabled by default; when disabled projection_alpha() always returns 1.0,
+    # preserving bit-identical behaviour with prior code.
+    soft_kabsch_enabled: bool = False
+    soft_kabsch_ramp_start_step: int | None = None
+    soft_kabsch_alpha_min: float = 0.0
     debug: bool = False
     debug_frequency: int = 1
 
@@ -156,7 +162,9 @@ class MotifUnindexingController:
                 "rebuild_static_cache_at_projection_stop=%s "
                 "floating_project_on_activation=%s bias_stop_after=%s "
                 "projection_atom_names=%s boundary_distance_bias_weight=%.4f "
-                "boundary_distance_target=%.4f boundary_distance_bias_clip_rms=%s",
+                "boundary_distance_target=%.4f boundary_distance_bias_clip_rms=%s "
+                "soft_kabsch_enabled=%s soft_kabsch_ramp_start_step=%s "
+                "soft_kabsch_alpha_min=%.4f",
                 "unindexed_motifs" if config.use_unindexed_motifs else "motif_pdbs",
                 len(self.motifs),
                 [
@@ -192,6 +200,9 @@ class MotifUnindexingController:
                 config.boundary_distance_bias_weight,
                 config.boundary_distance_target,
                 _fmt(config.boundary_distance_bias_clip_rms),
+                config.soft_kabsch_enabled,
+                "none" if config.soft_kabsch_ramp_start_step is None else str(config.soft_kabsch_ramp_start_step),
+                config.soft_kabsch_alpha_min,
             )
 
     def enabled(self) -> bool:
@@ -808,6 +819,98 @@ class MotifUnindexingController:
             self._logged_post_activation_stop = True
         return is_active
 
+    def log_diagnostics(self, xyz: torch.Tensor, step_idx: int) -> None:
+        """Log per-step motif RMSD and CA–CA chain-break diagnostics.
+
+        Active only when ``debug=True``, ``activated_step`` is set, and the
+        current step is a multiple of ``debug_frequency``.  Designed to be
+        called unconditionally from the sampler; it is a no-op otherwise.
+        """
+        if not self.config.debug:
+            return
+        if self.activated_step is None:
+            return
+        if not self._should_debug(step_idx):
+            return
+
+        # --- Per-assignment RMSD (post-projection, Kabsch-aligned) ---
+        alpha = self.projection_alpha(step_idx)
+        for assignment in self.assignments:
+            atom_idx = (
+                assignment.projection_sample_atom_indices
+                if assignment.projection_sample_atom_indices is not None
+                else assignment.sample_atom_indices
+            ).to(device=xyz.device, dtype=torch.long)
+            reference_xyz = (
+                assignment.projection_reference_xyz
+                if assignment.projection_reference_xyz is not None
+                else assignment.reference_xyz
+            ).to(device=xyz.device, dtype=xyz.dtype)
+            current = xyz.index_select(dim=-2, index=atom_idx)
+            reference = reference_xyz.unsqueeze(0).expand(current.shape[0], -1, -1)
+            aligned = kabsch_align_all_atom(reference, current).detach()
+            rmsd_val = float(_rmsd(current, aligned).mean().item())
+            motif = self.motifs[assignment.motif_index]
+            logger.info(
+                "[motif_unindexing] step=%s diag motif=%s rmsd=%.4f alpha=%.4f",
+                step_idx,
+                motif.name or motif.path,
+                rmsd_val,
+                alpha,
+            )
+
+        # --- CA–CA chain-break detection ---
+        xyz_cpu = xyz.detach().cpu().float()
+        # Use first batch element for diagnostics (batch dim may be 1 or absent)
+        xyz_2d = xyz_cpu[0] if xyz_cpu.ndim == 3 else xyz_cpu
+        for group in self.candidate_groups:
+            ca_indices = group.tolist()
+            for i in range(len(ca_indices) - 1):
+                idx_a = ca_indices[i]
+                idx_b = ca_indices[i + 1]
+                pos_a = xyz_2d[idx_a]
+                pos_b = xyz_2d[idx_b]
+                dist = float(torch.linalg.norm(pos_b - pos_a).item())
+                if dist > 4.5:
+                    logger.info(
+                        "[motif_unindexing] step=%s chain_break "
+                        "ca_atom_indices=%d-%d distance=%.3f",
+                        step_idx,
+                        idx_a,
+                        idx_b,
+                        dist,
+                    )
+
+    def projection_alpha(self, step_idx: int) -> float:
+        """Return the Kabsch blend weight for this diffusion step.
+
+        Returns 1.0 (full hard Kabsch) unless ``soft_kabsch_enabled=True`` and
+        the current step is within the configured ramp window.  The ramp runs
+        linearly from 1.0 at ``soft_kabsch_ramp_start_step`` down to
+        ``soft_kabsch_alpha_min`` at the final active projection step.
+
+        Step indices count upward from 0 (high noise) to ~num_timesteps-2
+        (low noise / structured), so the ramp alpha *decreases* as step_idx
+        increases toward the end of the projection window.
+        """
+        if not self.config.soft_kabsch_enabled:
+            return 1.0
+        if self.activated_step is None:
+            return 1.0
+        ramp_start = self.config.soft_kabsch_ramp_start_step
+        if ramp_start is None or step_idx < ramp_start:
+            return 1.0
+        # Determine the last step at which projection is active (inclusive).
+        if self.config.post_activation_stop_after is not None:
+            ramp_end = self.config.post_activation_stop_after
+        else:
+            ramp_end = self.activated_step + self.config.post_activation_guidance_steps - 1
+        if ramp_end <= ramp_start:
+            return float(self.config.soft_kabsch_alpha_min)
+        progress = (step_idx - ramp_start) / (ramp_end - ramp_start)
+        progress = max(0.0, min(1.0, progress))
+        return 1.0 + (self.config.soft_kabsch_alpha_min - 1.0) * progress
+
     def apply_boundary_distance_bias(
         self,
         xyz: torch.Tensor,
@@ -1252,6 +1355,15 @@ def build_motif_unindexing_controller(
         raise ValueError("motif_unindexing.bias_stop_after must be non-negative or null")
     if cfg.debug_frequency < 1:
         raise ValueError("motif_unindexing.debug_frequency must be >= 1")
+    if not (0.0 <= cfg.soft_kabsch_alpha_min <= 1.0):
+        raise ValueError(
+            "motif_unindexing.soft_kabsch_alpha_min must be in [0.0, 1.0], "
+            f"got {cfg.soft_kabsch_alpha_min}"
+        )
+    if cfg.soft_kabsch_ramp_start_step is not None and cfg.soft_kabsch_ramp_start_step < 0:
+        raise ValueError(
+            "motif_unindexing.soft_kabsch_ramp_start_step must be non-negative if set"
+        )
     controller = MotifUnindexingController(cfg, f, sample_features=sample_features)
     return controller if controller.enabled() else None
 

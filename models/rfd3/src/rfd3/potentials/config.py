@@ -36,6 +36,10 @@ class PotentialsConfig:
     # Which atoms are used as input to potentials AND receive guidance
     include_atoms: str = "real_heavy"  # "all" | "real" | "real_heavy" | "backbone" | "CA"
 
+    # Optional denoising-step window for applying potentials during inference.
+    guide_start_step: int = 0
+    guide_stop_after: int | None = None
+
     # Safety defaults — fixed and virtual atoms never move
     exclude_fixed_atoms: bool = True
     exclude_virtual_atoms: bool = True
@@ -86,4 +90,13 @@ class PotentialsConfig:
         if self.guide_clip_rms < 0.0:
             raise ValueError(
                 f"guide_clip_rms must be non-negative, got {self.guide_clip_rms!r}"
+            )
+        if self.guide_start_step < 0:
+            raise ValueError(
+                f"guide_start_step must be non-negative, got {self.guide_start_step!r}"
+            )
+        if self.guide_stop_after is not None and self.guide_stop_after < 0:
+            raise ValueError(
+                "guide_stop_after must be non-negative or null, "
+                f"got {self.guide_stop_after!r}"
             )

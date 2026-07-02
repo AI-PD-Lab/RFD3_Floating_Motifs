@@ -1,7 +1,10 @@
 import copy
 import json
 import logging
+import math
 import os
+import random
+import re
 import time
 import warnings
 from contextlib import contextmanager
@@ -42,6 +45,19 @@ from rfd3.inference.symmetry.symmetry_utils import (
     center_symmetric_src_atom_array,
     make_symmetric_atom_array,
 )
+from rfd3.inference.symmetry.atom_array import (
+    add_src_sym_component_annotations,
+    add_sym_annotations,
+    fix_3D_sym_motif_annotations,
+    get_symmetry_unit,
+)
+from rfd3.inference.symmetry.checks import check_symmetry_config
+from rfd3.inference.symmetry.frames import get_symmetry_frames_from_symmetry_id
+from rfd3.model.floating_motif_projection import (
+    FLOATING_MOTIF_REFERENCE_ANNOTATIONS,
+    SUPERMOTIF_ID_ANNOTATION,
+    annotate_floating_motif_reference_coords,
+)
 from rfd3.transforms.conditioning_base import (
     check_has_required_conditioning_annotations,
     convert_existing_annotations_to_bool,
@@ -68,6 +84,337 @@ from foundry.utils.ddp import RankedLogger
 logging.basicConfig(level=logging.DEBUG)
 
 logger = RankedLogger(__name__, rank_zero_only=True)
+
+
+_SCAFFOLD_CONTIG_TOKEN_RE = re.compile(r"^\d+(?:-\d+)?$")
+_AUTO_CONTIG_TOKEN_RE = re.compile(r"^auto$", re.IGNORECASE)
+UNINDEXED_FLOATING_MOTIF_ANNOTATION = "is_motif_atom_unindexed_floating_motif"
+# Keep the original true-unindex implementation on disk for later experiments, but
+# route active unindexed_motifs through inline sampled placement for now.
+UNINDEXED_MOTIFS_USE_LEGACY_TRUE_UNINDEX = False
+AUTO_LENGTH_TOKEN = "auto"
+AUTO_LENGTH_DEFAULT_DISTANCE = 50.0
+AUTO_LENGTH_DEFAULT_RADIUS = 20.0
+AUTO_LENGTH_RESIDUE_VOLUME = 130.0
+AUTO_LENGTH_RANGE_FRACTION = 0.20
+
+
+def _input_selection_from_contig_with_placeholders(
+    contig: str,
+    atom_array: AtomArray,
+    motif_names: set[str] | None = None,
+) -> InputSelection:
+    """Parse only concrete PDB tokens from a contig with placeholders."""
+    motif_names = motif_names or set()
+    direct_parts = []
+    for token in contig.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if (
+            token == "SymMotif"
+            or token in motif_names
+            or _AUTO_CONTIG_TOKEN_RE.match(token)
+            or _SCAFFOLD_CONTIG_TOKEN_RE.match(token)
+        ):
+            continue
+        direct_parts.append(token)
+
+    if not direct_parts:
+        return InputSelection(
+            raw=contig,
+            data={},
+            mask=np.zeros(len(atom_array), dtype=bool),
+            tokens=None,
+        )
+
+    selection = InputSelection.from_any(
+        ",".join(direct_parts),
+        atom_array=atom_array,
+    )
+    return selection.model_copy(update={"raw": contig})
+
+
+def _get_tokens_from_selection_data(selection: InputSelection, atom_array: AtomArray):
+    data = {k: v for k, v in selection.data.items() if v}
+    if not data:
+        return {}
+    return InputSelection.from_any(dict(data), atom_array=atom_array).get_tokens(atom_array)
+
+
+def _shift_floating_motif_reference_coords(atom_array, shift):
+    if shift is None or not all(
+        annotation in atom_array.get_annotation_categories()
+        for annotation in FLOATING_MOTIF_REFERENCE_ANNOTATIONS
+    ):
+        return atom_array
+
+    shift = np.asarray(shift, dtype=np.float32)
+    for axis, annotation in enumerate(FLOATING_MOTIF_REFERENCE_ANNOTATIONS):
+        values = atom_array.get_annotation(annotation).astype(np.float32, copy=True)
+        values -= shift[axis]
+        atom_array.set_annotation(annotation, values)
+    return atom_array
+
+
+def resolve_auto_length(
+    *,
+    potentials,
+    default_distance: float = AUTO_LENGTH_DEFAULT_DISTANCE,
+    default_radius: float = AUTO_LENGTH_DEFAULT_RADIUS,
+    residue_volume: float = AUTO_LENGTH_RESIDUE_VOLUME,
+    range_fraction: float = AUTO_LENGTH_RANGE_FRACTION,
+) -> dict:
+    """Resolve ``length: auto`` to a normal min-max residue range."""
+    if default_distance <= 0:
+        raise ValueError("auto_length_default_distance must be positive.")
+    if default_radius <= 0:
+        raise ValueError("auto_length_default_radius must be positive.")
+    if residue_volume <= 0:
+        raise ValueError("auto_length_residue_volume must be positive.")
+    if range_fraction < 0:
+        raise ValueError("auto_length_range_fraction must be non-negative.")
+
+    potential_specs = _auto_length_guiding_potentials(potentials)
+    distance = _auto_length_distance_from_potentials(
+        potential_specs,
+        default_distance=default_distance,
+    )
+    radius = _auto_length_radius_from_potentials(
+        potential_specs,
+        default_radius=default_radius,
+    )
+
+    semi_major = distance / 2.0
+    volume = (4.0 / 3.0) * math.pi * semi_major * radius * radius
+    median = max(1, int(round(volume / residue_volume)))
+    low = max(1, int(round(median * (1.0 - range_fraction))))
+    high = max(low, int(round(median * (1.0 + range_fraction))))
+
+    return {
+        "length": f"{low}-{high}",
+        "median": median,
+        "min": low,
+        "max": high,
+        "distance": float(distance),
+        "radius": float(radius),
+        "semi_major_axis": float(semi_major),
+        "volume": float(volume),
+        "residue_volume": float(residue_volume),
+        "range_fraction": float(range_fraction),
+        "n_potential_specs": len(potential_specs),
+    }
+
+
+def _auto_length_guiding_potentials(potentials) -> list[dict]:
+    plain = _plain_config(potentials)
+    if plain is None:
+        return []
+    if isinstance(plain, dict):
+        guiding = plain.get("guiding_potentials", [])
+        return [p for p in guiding if isinstance(p, dict)]
+    if isinstance(plain, list):
+        return [p for p in plain if isinstance(p, dict)]
+    return []
+
+
+def _plain_config(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {k: _plain_config(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_config(v) for v in value]
+    if hasattr(value, "items"):
+        return {k: _plain_config(v) for k, v in value.items()}
+    return value
+
+
+def _auto_length_distance_from_potentials(
+    potential_specs: list[dict],
+    *,
+    default_distance: float,
+) -> float:
+    pair_distances = []
+    radial_distances = []
+
+    for spec in potential_specs:
+        ptype = str(spec.get("type", "")).lower()
+        target_values = _numeric_values(spec.get("target_distances"))
+        target_values += _numeric_values(spec.get("target_distance"))
+        if not target_values:
+            continue
+
+        if _is_pair_distance_potential(ptype):
+            pair_distances.extend(target_values)
+        elif _is_com_or_center_distance_potential(ptype):
+            radial_distances.extend(target_values)
+
+    candidates = list(pair_distances)
+    radial_distances = sorted(radial_distances, reverse=True)
+    if len(radial_distances) >= 2:
+        candidates.append(radial_distances[0] + radial_distances[1])
+    elif len(radial_distances) == 1:
+        candidates.append(2.0 * radial_distances[0])
+
+    return max(candidates) if candidates else default_distance
+
+
+def _auto_length_radius_from_potentials(
+    potential_specs: list[dict],
+    *,
+    default_radius: float,
+) -> float:
+    radii = []
+    for spec in potential_specs:
+        ptype = str(spec.get("type", "")).lower()
+        if "bridge" not in ptype:
+            continue
+        radii.extend(_numeric_values(spec.get("max_radius")))
+    return max(radii) if radii else default_radius
+
+
+def _is_pair_distance_potential(ptype: str) -> bool:
+    return ptype in {
+        "motif_distance",
+        "symmetry_motif_distance",
+    }
+
+
+def _is_com_or_center_distance_potential(ptype: str) -> bool:
+    return ptype in {
+        "motif_com_distance",
+        "symmetry_motif_com_distance",
+        "motif_center_distance",
+        "symmetry_motif_center_distance",
+    }
+
+
+def _numeric_values(value) -> list[float]:
+    if value is None or isinstance(value, bool):
+        return []
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return [float(value)]
+    if isinstance(value, (list, tuple)):
+        values = []
+        for item in value:
+            values.extend(_numeric_values(item))
+        return values
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if "," in stripped or "[" in stripped or "]" in stripped:
+            return [
+                float(x)
+                for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", stripped)
+            ]
+        try:
+            return [float(stripped)]
+        except ValueError:
+            return []
+    return []
+
+
+def _parse_length_range(length: Optional[str]) -> tuple[int, int]:
+    if not exists(length):
+        raise ValueError("Contig token 'auto' requires the top-level 'length' field.")
+    length = str(length)
+    if "-" in length:
+        length_min, length_max = map(int, length.split("-"))
+        if length_min > length_max:
+            raise ValueError(f"Invalid length range '{length}'.")
+        return length_min, length_max
+    value = int(length)
+    return value, value
+
+
+def _resolve_contig_auto_tokens(contig: Optional[str], length: Optional[str]) -> tuple[Optional[str], Optional[dict]]:
+    if not exists(contig):
+        return contig, None
+
+    parts = [part.strip() for part in str(contig).split(",")]
+    auto_positions = [
+        idx for idx, part in enumerate(parts) if _AUTO_CONTIG_TOKEN_RE.match(part)
+    ]
+    if not auto_positions:
+        return contig, None
+
+    length_min, length_max = _parse_length_range(length)
+    is_length_range = length_min != length_max
+    fixed_budget = 0
+    resolved_parts = list(parts)
+    for idx, part in enumerate(parts):
+        if idx in auto_positions:
+            continue
+        fixed_budget += _contig_part_max_length(part)
+
+    remaining_min = length_min - fixed_budget
+    remaining_max = length_max - fixed_budget
+    if remaining_min < 0 or remaining_max < 0:
+        raise ValueError(
+            f"Contig token 'auto' has negative remaining length: sampled length "
+            f"{length_min}-{length_max}, fixed/max contig budget {fixed_budget}."
+        )
+
+    min_values = _split_integer_budget(remaining_min, len(auto_positions))
+    max_values = _split_integer_budget(remaining_max, len(auto_positions))
+    auto_lengths = []
+    for idx, min_value, max_value in zip(auto_positions, min_values, max_values):
+        if min_value > max_value:
+            raise ValueError(
+                f"Contig token 'auto' produced invalid range {min_value}-{max_value}."
+            )
+        if is_length_range:
+            value = f"{min_value}-{max_value}"
+        else:
+            value = str(min_value)
+        auto_lengths.append(value)
+        resolved_parts[idx] = value
+
+    resolved = ",".join(resolved_parts)
+    resolved_length = f"{length_min}-{length_max}" if is_length_range else str(length_min)
+    return resolved, {
+        "input_contig": contig,
+        "resolved_contig": resolved,
+        "length": resolved_length,
+        "length_min": length_min,
+        "length_max": length_max,
+        "fixed_budget": fixed_budget,
+        "remaining_length": (
+            f"{remaining_min}-{remaining_max}" if is_length_range else remaining_min
+        ),
+        "auto_lengths": auto_lengths,
+    }
+
+
+def _split_integer_budget(total: int, n_parts: int) -> list[int]:
+    base = total // n_parts
+    extra = total % n_parts
+    return [base + (1 if idx < extra else 0) for idx in range(n_parts)]
+
+
+def _contig_part_max_length(part: str) -> int:
+    if not part or part == "/0":
+        return 0
+
+    numeric = part
+    suffix = numeric[-1] if numeric[-1:] in {"P", "R", "D"} else ""
+    if suffix:
+        numeric = numeric[:-1]
+    if numeric.isdigit():
+        return int(numeric)
+    if "-" in numeric and all(piece.isdigit() for piece in numeric.split("-", 1)):
+        return int(numeric.split("-", 1)[1])
+
+    return len(get_design_pattern_with_constraints(part))
+
+
+def _infer_uniform_coordinate_shift(before, after):
+    finite = np.isfinite(before).all(axis=-1) & np.isfinite(after).all(axis=-1)
+    if not np.any(finite):
+        return None
+    return np.median(before[finite] - after[finite], axis=0)
 
 
 #################################################################################
@@ -130,13 +477,55 @@ class DesignInputSpecification(BaseModel):
     input: Optional[str] =  Field(None, description="Path to input PDB/CIF file")
     # Motif selection from input file
     contig:  Optional[InputSelection] = Field(None, description="Contig specification string (e.g. 'A1-10,B1-5')")
-    unindex: Optional[InputSelection] = Field(None, 
+    unindex: Optional[InputSelection] = Field(None,
         description="Unindexed components selection. Components to fix in the generated structure without specifying sequence index. "\
         "Components must not overlap with `contig` argument. "\
         "E.g. 'A15-20,B6-10' or dict. We recommend specifying unindexed residues as a contig string, "\
         "then using select_fixed_atoms will subset the atoms to the specified atoms")
+    non_fixed_contig: Optional[InputSelection] = Field(None,
+        description="Contig of atoms from input that are included in the design but NOT fixed in 3D space. "
+        "Atoms are still Kabsch-aligned during floating-motif projection (alphabetic src_component, not unindexed). "
+        "Default is is_motif_atom_with_fixed_coord=False for selected atoms; select_fixed_atoms overrides. "
+        "Format identical to 'contig' (e.g. 'A11-20,B1-5'). Must not overlap with 'contig', 'unindex', or 'motifs'.")
+    motifs: Optional[Dict[str, str]] = Field(None,
+        description="Named floating motif definitions. "
+        "Format: {'motif_name': 'contig_str', ...}. A motif is only included in the design if: "
+        "(a) its name appears as a token in 'contig', "
+        "(b) its name appears in 'sequence_unrestrained_motifs', or "
+        "(c) it is assigned via a 'SymMotif' placeholder in a symmetry instances dict. "
+        "Atoms are Kabsch-aligned but coordinate-unfixed by default; select_fixed_atoms overrides.")
+    sequence_unrestrained_motifs: Optional[List[str]] = Field(None,
+        description="Motif names (from the 'motifs' dict) to append as separate floating chains "
+        "when their position in the scaffold chain is not constrained. "
+        "Only motifs listed here are appended; motifs referenced by name in 'contig' or via "
+        "'SymMotif' are placed inline and must NOT also appear here.")
+    unindexed_motifs: Optional[List[str]] = Field(None,
+        description="Motif names (from the 'motifs' dict) to include on the main chain without "
+        "explicitly placing them in 'contig'. These motifs are inserted into a hidden sampled "
+        "inline layout before diffusion, so the model sees a single contiguous chain while the "
+        "motifs remain floating/Kabsch-aligned and internally conserved. Names listed here must "
+        "NOT also appear in 'contig', 'sequence_unrestrained_motifs', or be assigned via "
+        "'SymMotif'.")
+    supermotifs: Optional[Dict[str, Union[str, List[str]]]] = Field(None,
+        description="Named rigid-body super-motifs for groups of non-connected fragments. "
+        "Each entry maps a super-motif name to either a contig string (e.g. 'A1-10,B5-15') "
+        "selecting residues directly, or a list of motif names from the 'motifs' dict. "
+        "All referenced residues must already be included in 'contig', 'motifs', or "
+        "'non_fixed_contig'. Super-motifs do NOT need to appear in 'contig'. "
+        "During floating motif projection the parts of each super-motif are Kabsch-aligned "
+        "together as a single rigid body instead of independently.")
     # Extra args:
-    length:  Optional[str] = Field(None, description="Length range as 'min-max' or int. Constrains length of contig if provided")
+    length:  Optional[str] = Field(None, description="Length range as 'min-max', int, or 'auto'. Constrains length of contig if provided")
+    auto_length_potentials: Optional[Any] = Field(None, exclude=True,
+        description="Hidden sampler potential config used only when length='auto'.")
+    auto_length_default_distance: float = Field(AUTO_LENGTH_DEFAULT_DISTANCE,
+        description="Fallback distance between ellipsoid endpoints for length='auto' (Angstrom).")
+    auto_length_default_radius: float = Field(AUTO_LENGTH_DEFAULT_RADIUS,
+        description="Fallback ellipsoid radius for length='auto' (Angstrom).")
+    auto_length_residue_volume: float = Field(AUTO_LENGTH_RESIDUE_VOLUME,
+        description="Volume per residue for length='auto' (Angstrom^3/residue).")
+    auto_length_range_fraction: float = Field(AUTO_LENGTH_RANGE_FRACTION,
+        description="Fractional range around the auto-length median, e.g. 0.20 gives +/-20%.")
     ligand:  Optional[str] = Field(None, description="Ligand name or index to include in design.")
     allow_ligand_on_existing_chain: bool = Field(False, description="If True, suppress the error when a ligand shares a chain ID with the built atom array. Use with caution — chain ID is leaked to the model.")
     cif_parser_args: Optional[Dict[str, Any]] = Field(None, description="CIF parser arguments")
@@ -241,15 +630,63 @@ class DesignInputSpecification(BaseModel):
         if not (
             exists(data.get("input"))
             or exists(data.get("contig"))
+            or exists(data.get("non_fixed_contig"))
             or exists(data.get("length"))
         ):
-            raise ValueError("Either 'input' or 'contig' / 'length' must be provided.")
+            raise ValueError(
+                "Either 'input' or 'contig' / 'non_fixed_contig' / 'length' must be provided."
+            )
+
+        # SymMotif placeholder requires symmetry.instances to be defined
+        contig_raw = data.get("contig")
+        if isinstance(contig_raw, str) and "SymMotif" in [t.strip() for t in contig_raw.split(",")]:
+            sym = data.get("symmetry") or {}
+            if isinstance(sym, dict):
+                sym_id = sym.get("id")
+                sym_instances = sym.get("instances")
+                sym_mode = sym.get("is_symmetric_motif", True)
+            else:
+                sym_id = getattr(sym, "id", None)
+                sym_instances = getattr(sym, "instances", None)
+                sym_mode = getattr(sym, "is_symmetric_motif", True)
+            if not sym_id:
+                raise ValueError("'SymMotif' placeholder requires 'symmetry.id' to be defined.")
+            if not sym_instances:
+                raise ValueError("'SymMotif' placeholder requires 'symmetry.instances' to be defined.")
+            if sym_mode:
+                raise ValueError(
+                    "'SymMotif' requires 'symmetry.is_symmetric_motif: false' — "
+                    "each instance builds its own motif from the ASU."
+                )
+            if not exists(data.get("motifs")):
+                raise ValueError("'SymMotif' placeholder requires 'motifs' to be defined.")
+
+        # contig and non_fixed_contig are mutually exclusive — combining them leaves the
+        # design position of NFC atoms undefined relative to the scaffold.
+        if exists(data.get("contig")) and exists(data.get("non_fixed_contig")):
+            raise ValueError(
+                "'contig' and 'non_fixed_contig' are mutually exclusive. "
+                "Use 'contig' (which may reference motif names from the 'motifs' dict) to "
+                "position-define the full design chain. Use 'non_fixed_contig' alone when "
+                "you want a fully floating design pattern with no position constraint."
+            )
+
+        # non_fixed_contig, motifs, and supermotifs require an input PDB
+        for field in ("non_fixed_contig", "motifs", "supermotifs"):
+            if exists(data.get(field)) and not (
+                exists(data.get("input")) or exists(data.get("atom_array_input"))
+            ):
+                raise ValueError(
+                    f"'{field}' requires 'input' (or 'atom_array_input') to be provided."
+                )
 
         # unused input check
         if exists(data.get("input")) and not (
             (
                 exists(data.get("contig"))
+                or exists(data.get("non_fixed_contig"))
                 or exists(data.get("unindex"))
+                or exists(data.get("motifs"))
                 or exists(data.get("ligand"))
             )
             or exists(data.get("partial_t"))
@@ -259,10 +696,12 @@ class DesignInputSpecification(BaseModel):
         if not exists(data.get("partial_t")):
             # non-partial diffusion checks
             if exists(data.get("unindex")) and not (
-                exists(data.get("contig")) or exists(data.get("length"))
+                exists(data.get("contig"))
+                or exists(data.get("non_fixed_contig"))
+                or exists(data.get("length"))
             ):
                 raise ValueError(
-                    "Unindex provided but neither a length nor contig was specified."
+                    "Unindex provided but neither a length nor contig/non_fixed_contig was specified."
                 )
         else:
             # partial diffusion checks
@@ -282,6 +721,24 @@ class DesignInputSpecification(BaseModel):
     def canonicalize(cls, data: dict) -> dict:
         # Canonicalize length argument
         data["length"] = str(data["length"]) if exists(data.get("length")) else None
+        if isinstance(data.get("length"), str) and data["length"].lower() == AUTO_LENGTH_TOKEN:
+            auto_info = resolve_auto_length(
+                potentials=data.get("auto_length_potentials"),
+                default_distance=float(
+                    data.get("auto_length_default_distance", AUTO_LENGTH_DEFAULT_DISTANCE)
+                ),
+                default_radius=float(
+                    data.get("auto_length_default_radius", AUTO_LENGTH_DEFAULT_RADIUS)
+                ),
+                residue_volume=float(
+                    data.get("auto_length_residue_volume", AUTO_LENGTH_RESIDUE_VOLUME)
+                ),
+                range_fraction=float(
+                    data.get("auto_length_range_fraction", AUTO_LENGTH_RANGE_FRACTION)
+                ),
+            )
+            data["length"] = auto_info["length"]
+            data["extra"] = data.get("extra", {}) | {"auto_length": auto_info}
 
         # Normalize input to str
         data["input"] = str(data["input"]) if exists(data.get("input")) else None
@@ -291,10 +748,11 @@ class DesignInputSpecification(BaseModel):
     @classmethod
     def load_input(cls, data: dict) -> dict:
         with validator_context("load_input"):
-            # ... Find provided selections
+            # ... Find provided selections (InputSelection-typed fields)
             selections = [
                 # Motif
                 "contig",
+                "non_fixed_contig",
                 "unindex",
                 # Aux
                 "select_fixed_atoms",
@@ -322,7 +780,7 @@ class DesignInputSpecification(BaseModel):
                 return data
 
             # ... Load atom array from input file if provided
-            if exists(data["input"]):
+            if exists(data.get("input")):
                 if exists(data.get("atom_array_input")):
                     raise ValueError(
                         "Both 'input' and 'atom_array_input' provided; please provide only one."
@@ -344,25 +802,235 @@ class DesignInputSpecification(BaseModel):
 
             # ... Set defaults if not provided
             if not exists(data.get("select_fixed_atoms")):
-                data["select_fixed_atoms"] = InputSelection.from_any(
-                    True, atom_array=atom_array
-                )
+                if exists(data.get("non_fixed_contig")):
+                    # NFC standalone: nothing fixed by default.
+                    # select_fixed_atoms can re-fix specific atoms at highest priority.
+                    data["select_fixed_atoms"] = InputSelection.from_any(
+                        False, atom_array=atom_array
+                    )
+                elif exists(data.get("motifs")):
+                    # Motifs present: fix only direct PDB residue tokens in contig.
+                    # Strip both motif-name tokens (floating by the motifs unfix block)
+                    # and scaffold-count tokens (pure digits like "200" — they have no
+                    # corresponding atoms in the input PDB and must not reach InputSelection,
+                    # which could accidentally match a PDB residue with that number).
+                    contig_raw = data.get("contig")
+                    if exists(contig_raw) and isinstance(contig_raw, str):
+                        import re as _re
+                        _pdb_token = _re.compile(r"^[A-Za-z]\d")
+                        motif_keys = set(data["motifs"].keys())
+                        direct_parts = [
+                            t.strip()
+                            for t in contig_raw.split(",")
+                            if t.strip() not in motif_keys
+                            and _pdb_token.match(t.strip())
+                        ]
+                        sfa_value = ",".join(direct_parts) if direct_parts else False
+                    else:
+                        sfa_value = contig_raw or False
+                    data["select_fixed_atoms"] = InputSelection.from_any(
+                        sfa_value, atom_array=atom_array
+                    )
+                else:
+                    data["select_fixed_atoms"] = InputSelection.from_any(
+                        True, atom_array=atom_array
+                    )
             if not exists(data.get("select_unfixed_sequence")):
                 data["select_unfixed_sequence"] = InputSelection.from_any(
                     False, atom_array=atom_array
                 )
 
+            # Validate sequence_unrestrained_motifs: names must all be in motifs
+            if exists(data.get("sequence_unrestrained_motifs")):
+                if not isinstance(data["sequence_unrestrained_motifs"], list):
+                    raise ValueError(
+                        "'sequence_unrestrained_motifs' must be a list of motif name strings."
+                    )
+                motifs_keys = set(data.get("motifs") or {})
+                for name in data["sequence_unrestrained_motifs"]:
+                    if not isinstance(name, str):
+                        raise ValueError(
+                            f"'sequence_unrestrained_motifs' entries must be strings, got {type(name)}."
+                        )
+                    if name not in motifs_keys:
+                        raise ValueError(
+                            f"'sequence_unrestrained_motifs' entry '{name}' not found in 'motifs' dict."
+                        )
+
+            if exists(data.get("unindexed_motifs")):
+                if not isinstance(data["unindexed_motifs"], list):
+                    raise ValueError(
+                        "'unindexed_motifs' must be a list of motif name strings."
+                    )
+                motifs_keys = set(data.get("motifs") or {})
+                for name in data["unindexed_motifs"]:
+                    if not isinstance(name, str):
+                        raise ValueError(
+                            f"'unindexed_motifs' entries must be strings, got {type(name)}."
+                        )
+                    if name not in motifs_keys:
+                        raise ValueError(
+                            f"'unindexed_motifs' entry '{name}' not found in 'motifs' dict."
+                        )
+
+                if exists(data.get("sequence_unrestrained_motifs")):
+                    overlap = set(data["unindexed_motifs"]) & set(
+                        data["sequence_unrestrained_motifs"]
+                    )
+                    if overlap:
+                        raise ValueError(
+                            f"Motif names must not appear in both 'unindexed_motifs' and "
+                            f"'sequence_unrestrained_motifs': {sorted(overlap)}"
+                        )
+
+                contig_raw = data.get("contig")
+                if isinstance(contig_raw, str):
+                    contig_tokens = {t.strip() for t in contig_raw.split(",") if t.strip()}
+                    overlap = set(data["unindexed_motifs"]) & contig_tokens
+                    if overlap:
+                        raise ValueError(
+                            f"Motif names must not appear in both 'contig' and "
+                            f"'unindexed_motifs': {sorted(overlap)}"
+                        )
+
+                    if "SymMotif" in contig_tokens:
+                        sym = data.get("symmetry") or {}
+                        sym_instances = (
+                            sym.get("instances")
+                            if isinstance(sym, dict)
+                            else getattr(sym, "instances", None)
+                        ) or {}
+                        sym_motif_names = set()
+                        if isinstance(sym_instances, dict):
+                            for value in sym_instances.values():
+                                if isinstance(value, list):
+                                    sym_motif_names.update(
+                                        v for v in value if isinstance(v, str)
+                                    )
+                        overlap = set(data["unindexed_motifs"]) & sym_motif_names
+                        if overlap:
+                            raise ValueError(
+                                f"Motif names assigned via 'SymMotif' must not also appear in "
+                                f"'unindexed_motifs': {sorted(overlap)}"
+                            )
+
+            # Validate motifs dict: each value must be a parseable contig string
+            if exists(data.get("motifs")):
+                if not isinstance(data["motifs"], dict):
+                    raise ValueError(
+                        f"'motifs' must be a dict of {{name: contig_str}}, got {type(data['motifs'])}."
+                    )
+                for motif_name, motif_contig in data["motifs"].items():
+                    if not isinstance(motif_contig, str):
+                        raise ValueError(
+                            f"Motif '{motif_name}' contig must be a string, got {type(motif_contig)}."
+                        )
+                    try:
+                        InputSelection.from_any(motif_contig, atom_array=atom_array)
+                    except Exception as e:
+                        raise ValueError(
+                            f"Invalid contig string for motif '{motif_name}': {e}"
+                        ) from e
+
+            # Validate supermotifs dict
+            if exists(data.get("supermotifs")):
+                if not isinstance(data["supermotifs"], dict):
+                    raise ValueError(
+                        f"'supermotifs' must be a dict of {{name: contig_str_or_motif_list}}, "
+                        f"got {type(data['supermotifs'])}."
+                    )
+                motifs_keys = set(data.get("motifs") or {})
+
+                # Build a mask of all residues already included in this specification,
+                # so we can verify each supermotif only references included atoms.
+                included_mask = np.zeros(len(atom_array), dtype=bool)
+                for _f in ("contig", "non_fixed_contig"):
+                    _val = data.get(_f)
+                    if exists(_val):
+                        _raw = _val.raw if hasattr(_val, "raw") else _val
+                        if isinstance(_raw, str):
+                            try:
+                                included_mask |= _input_selection_from_contig_with_placeholders(
+                                    _raw, atom_array=atom_array, motif_names=motifs_keys
+                                ).get_mask()
+                            except Exception:
+                                pass
+                        elif isinstance(_val, InputSelection):
+                            included_mask |= _val.get_mask()
+                for _mc in (data.get("motifs") or {}).values():
+                    try:
+                        included_mask |= InputSelection.from_any(_mc, atom_array=atom_array).get_mask()
+                    except Exception:
+                        pass
+                if exists(data.get("unindex")):
+                    _ui = data["unindex"]
+                    if isinstance(_ui, InputSelection):
+                        included_mask |= _ui.get_mask()
+
+                for sm_name, sm_def in data["supermotifs"].items():
+                    if isinstance(sm_def, list):
+                        # List of motif names — each must exist in motifs
+                        if not sm_def:
+                            raise ValueError(
+                                f"Supermotif '{sm_name}' is an empty list; "
+                                f"provide at least one motif name or a contig string."
+                            )
+                        for motif_name in sm_def:
+                            if not isinstance(motif_name, str):
+                                raise ValueError(
+                                    f"Supermotif '{sm_name}' list entries must be strings, "
+                                    f"got {type(motif_name)}."
+                                )
+                            if motif_name not in motifs_keys:
+                                raise ValueError(
+                                    f"Supermotif '{sm_name}' references motif '{motif_name}' "
+                                    f"which is not defined in 'motifs'."
+                                )
+                    elif isinstance(sm_def, str):
+                        # Contig string — parse and verify all residues are in the included set
+                        try:
+                            sm_mask = InputSelection.from_any(
+                                sm_def, atom_array=atom_array
+                            ).get_mask()
+                        except Exception as e:
+                            raise ValueError(
+                                f"Invalid contig string for supermotif '{sm_name}': {e}"
+                            ) from e
+                        if not np.any(sm_mask):
+                            raise ValueError(
+                                f"Supermotif '{sm_name}' contig '{sm_def}' matched no atoms "
+                                f"in the input structure."
+                            )
+                        if np.any(sm_mask & ~included_mask):
+                            raise ValueError(
+                                f"Supermotif '{sm_name}' references residues that are not "
+                                f"included in 'contig', 'motifs', or 'non_fixed_contig'. "
+                                f"All supermotif parts must already be defined in the input."
+                            )
+                    else:
+                        raise ValueError(
+                            f"Supermotif '{sm_name}' definition must be a contig string or a "
+                            f"list of motif names, got {type(sm_def)}."
+                        )
+
             # Coerce selections
             for sele in selections:
-                if sele in ["contig", "unindexed_breaks"]:
+                if sele in ["contig", "non_fixed_contig", "unindexed_breaks"]:
                     if exists(data[sele]) and not isinstance(data[sele], str):
                         raise ValueError(
                             f"{sele} selection must be a string or None, got {type(data[sele])} instead."
                         )
                 if not isinstance(data.get(sele), InputSelection):
-                    data[sele] = InputSelection.from_any(
-                        data[sele], atom_array=atom_array
-                    )
+                    if sele == "contig" and isinstance(data.get(sele), str):
+                        data[sele] = _input_selection_from_contig_with_placeholders(
+                            data[sele],
+                            atom_array=atom_array,
+                            motif_names=set(data.get("motifs") or {}),
+                        )
+                    else:
+                        data[sele] = InputSelection.from_any(
+                            data[sele], atom_array=atom_array
+                        )
         return data
 
     # ========================================================================
@@ -372,7 +1040,7 @@ class DesignInputSpecification(BaseModel):
     @model_validator(mode="after")
     def assert_exclusivity(self):
         with validator_context("assert_exclusivity"):
-            # ... Assert and indexed do not overlap
+            # ... Assert indexed and unindexed do not overlap
             if exists(self.contig) and exists(self.unindex):
                 indexed_set = set(self.contig.keys())
                 unindexed_set = set(self.unindex.keys())
@@ -381,6 +1049,28 @@ class DesignInputSpecification(BaseModel):
                     raise ValueError(
                         f"Indexed and unindexed components must not overlap, got: {overlap}"
                     )
+
+            # ... Assert contig / non_fixed_contig / motifs are disjoint (atom-level)
+            if exists(self.atom_array_input):
+                _sele_masks: dict[str, np.ndarray] = {}
+                if exists(self.contig):
+                    _sele_masks["contig"] = self.contig.get_mask()
+                if exists(self.non_fixed_contig):
+                    _sele_masks["non_fixed_contig"] = self.non_fixed_contig.get_mask()
+                if exists(self.motifs):
+                    for mname, mcontig in self.motifs.items():
+                        _sele_masks[f"motifs.{mname}"] = InputSelection.from_any(
+                            mcontig, atom_array=self.atom_array_input
+                        ).get_mask()
+                _names = list(_sele_masks.keys())
+                _masks = list(_sele_masks.values())
+                for i in range(len(_names)):
+                    for j in range(i + 1, len(_names)):
+                        if np.any(_masks[i] & _masks[j]):
+                            raise ValueError(
+                                f"Selections '{_names[i]}' and '{_names[j]}' overlap; "
+                                "contig, non_fixed_contig, and motifs must be disjoint."
+                            )
 
             # ... Assert mutual exclusivity of rasa binning
             exclusive_sets = [
@@ -447,6 +1137,36 @@ class DesignInputSpecification(BaseModel):
             aa.set_annotation(name, np.full(aa.array_length(), val, dtype=int))
             for name, val in REQUIRED_CONDITIONING_ANNOTATION_VALUES.items()
         ]
+        aa.set_annotation(
+            UNINDEXED_FLOATING_MOTIF_ANNOTATION,
+            np.zeros(aa.array_length(), dtype=int),
+        )
+
+        # Priority unfix: NFC and named motifs default to floating (is_motif_atom_with_fixed_coord=0).
+        # This runs AFTER global init (which sets all to True) but BEFORE apply_selections,
+        # so that an explicit select_fixed_atoms can still override these atoms to True.
+        if exists(self.non_fixed_contig):
+            nfc_mask = self.non_fixed_contig.get_mask()
+            aa.is_motif_atom_with_fixed_coord[nfc_mask] = 0
+
+        if exists(self.motifs):
+            for _mname, _mcontig in self.motifs.items():
+                _msele = InputSelection.from_any(_mcontig, atom_array=aa)
+                aa.is_motif_atom_with_fixed_coord[_msele.get_mask()] = 0
+
+        if exists(self.unindexed_motifs) and UNINDEXED_MOTIFS_USE_LEGACY_TRUE_UNINDEX:
+            for _mname in self.unindexed_motifs:
+                _mcontig = self.motifs[_mname]
+                _msele = InputSelection.from_any(_mcontig, atom_array=aa)
+                _mask = _msele.get_mask()
+                aa.is_motif_atom_unindexed[_mask] = 1
+                aa.get_annotation(UNINDEXED_FLOATING_MOTIF_ANNOTATION)[_mask] = 1
+        elif exists(self.unindexed_motifs):
+            for _mname in self.unindexed_motifs:
+                _mcontig = self.motifs[_mname]
+                _msele = InputSelection.from_any(_mcontig, atom_array=aa)
+                _mask = _msele.get_mask()
+                aa.get_annotation(UNINDEXED_FLOATING_MOTIF_ANNOTATION)[_mask] = 1
 
         # Application of selections to each token fn;
         def apply_selections(start, end):
@@ -513,6 +1233,11 @@ class DesignInputSpecification(BaseModel):
         # Apply post-processing
         atom_array = self._append_ligand(atom_array, atom_array_input_annotated)
         atom_array = self._apply_symmetry(atom_array, atom_array_input_annotated)
+        atom_array = self._mark_unindexed_named_motifs(
+            atom_array, atom_array_input_annotated
+        )
+        atom_array = annotate_floating_motif_reference_coords(atom_array)
+        atom_array = self._annotate_supermotifs(atom_array, atom_array_input_annotated)
 
         # Apply globals to all tokens (including diffused)
         atom_array = self._set_origin(atom_array)
@@ -545,12 +1270,57 @@ class DesignInputSpecification(BaseModel):
     # ============================================================================
 
     def _build_init(self, atom_array_input_annotated):
-        # ... Fetch tokens
-        indexed_tokens = (
-            self.contig.get_tokens(atom_array_input_annotated)
-            if exists(self.contig)
-            else {}
-        )
+        # Build the design pattern. contig and non_fixed_contig are mutually exclusive.
+        # contig may embed motif-name tokens (keys in self.motifs): those are resolved to
+        # their PDB residue strings and inlined in the main chain at that position.
+        # Motifs NOT referenced by name in contig can either be added as true unindexed
+        # motifs (position-free within the main chain) or appended as separate chains.
+        indexed_tokens: dict = {}
+        _referenced_motifs: set = set()
+
+        if exists(self.contig):
+            # Collect direct PDB tokens. Placeholder and scaffold tokens are retained
+            # in self.contig.raw for design resolution but omitted from selection.data.
+            indexed_tokens.update(
+                _get_tokens_from_selection_data(self.contig, atom_array_input_annotated)
+            )
+            # Resolve motif-name and SymMotif tokens. SymMotif uses instance 0's motif
+            # for the main chain build; _apply_symmetry rebuilds each instance.
+            resolved_parts = []
+            for _tok in self.contig.raw.split(","):
+                _tok = _tok.strip()
+                if _tok == "SymMotif":
+                    # Resolve to instance 0's motif for the main chain build.
+                    # Validated in validate_input_schema: instances["0"] and motifs exist.
+                    _sym_motif_name = (self.symmetry.instances.get("0") or [])[0]
+                    _referenced_motifs.add(_sym_motif_name)
+                    _msele = InputSelection.from_any(
+                        self.motifs[_sym_motif_name], atom_array=atom_array_input_annotated
+                    )
+                    indexed_tokens.update(_msele.get_tokens(atom_array_input_annotated))
+                    resolved_parts.append(self.motifs[_sym_motif_name])
+                elif exists(self.motifs) and _tok in self.motifs:
+                    _referenced_motifs.add(_tok)
+                    _msele = InputSelection.from_any(
+                        self.motifs[_tok], atom_array=atom_array_input_annotated
+                    )
+                    indexed_tokens.update(
+                        _msele.get_tokens(atom_array_input_annotated)
+                    )
+                    resolved_parts.append(self.motifs[_tok])
+                else:
+                    resolved_parts.append(_tok)
+            _design_contig = ",".join(resolved_parts)
+
+        elif exists(self.non_fixed_contig):
+            _design_contig = self.non_fixed_contig.raw
+            indexed_tokens.update(
+                self.non_fixed_contig.get_tokens(atom_array_input_annotated)
+            )
+
+        else:
+            _design_contig = None
+
         unindexed_tokens = (
             self.unindex.get_tokens(atom_array_input_annotated)
             if exists(self.unindex)
@@ -562,13 +1332,58 @@ class DesignInputSpecification(BaseModel):
             for k, tok in unindexed_tokens.items()
         }
         unindexed_components, unindexed_breaks = self.break_unindexed(self.unindex)
+        inline_motif_tokens = {}
+        inline_motif_components = []
+        if UNINDEXED_MOTIFS_USE_LEGACY_TRUE_UNINDEX:
+            (
+                unindexed_motif_tokens,
+                unindexed_motif_components,
+                unindexed_motif_breaks,
+            ) = self._get_unindexed_named_motif_payload(
+                atom_array_input_annotated, excluded_motifs=_referenced_motifs
+            )
+            unindexed_tokens.update(unindexed_motif_tokens)
+            unindexed_components = unindexed_motif_components + unindexed_components
+            unindexed_breaks = unindexed_motif_breaks + unindexed_breaks
+        else:
+            (
+                inline_motif_tokens,
+                inline_motif_components,
+            ) = self._get_inline_named_motif_payload(
+                atom_array_input_annotated, excluded_motifs=_referenced_motifs
+            )
+            indexed_tokens.update(inline_motif_tokens)
 
         if not self.is_partial_diffusion:
             # ... Sample the contig string
-            components_to_accumulate = get_design_pattern_with_constraints(
-                self.contig.raw if exists(self.contig) else self.length,
-                length=self.length,
+            effective_length = self._adjust_length_for_inline_motifs(
+                self.length, inline_motif_components
             )
+            sampling_contig, contig_auto_info = _resolve_contig_auto_tokens(
+                _design_contig,
+                effective_length,
+            )
+            sampling_length = (
+                str(contig_auto_info["length"])
+                if contig_auto_info is not None
+                else effective_length
+            )
+            if exists(_design_contig) or exists(self.length):
+                components_to_accumulate = get_design_pattern_with_constraints(
+                    sampling_contig if sampling_contig else sampling_length,
+                    length=sampling_length,
+                )
+            else:
+                components_to_accumulate = []
+            if contig_auto_info is not None:
+                self.extra["contig_auto"] = contig_auto_info
+
+            if inline_motif_components:
+                components_to_accumulate = self._insert_inline_named_motifs(
+                    components_to_accumulate,
+                    inline_motif_components,
+                )
+
             self.extra["sampled_contig"] = ",".join(
                 [str(x) for x in components_to_accumulate]
             )
@@ -631,11 +1446,336 @@ class DesignInputSpecification(BaseModel):
                 unindexed_breaks=unindexed_breaks,
             )
 
+        # Append motifs listed in sequence_unrestrained_motifs as separate floating chains.
+        # Motifs referenced inline (via contig name-tokens or SymMotif) are already in the
+        # main chain; they must not also appear in sequence_unrestrained_motifs.
+        if exists(self.sequence_unrestrained_motifs) and not self.is_partial_diffusion:
+            to_append = {
+                k: self.motifs[k]
+                for k in self.sequence_unrestrained_motifs
+                if k in (self.motifs or {}) and k not in _referenced_motifs
+            }
+            if to_append:
+                atom_array = self._append_named_motifs(
+                    atom_array, atom_array_input_annotated, motifs_to_append=to_append
+                )
+
         return atom_array
+
+    def _mark_unindexed_named_motifs(self, atom_array, atom_array_input_annotated):
+        """Mark built atoms originating from unindexed_motifs for Kabsch eligibility."""
+        if not exists(self.unindexed_motifs):
+            return atom_array
+
+        atom_array.set_annotation(
+            UNINDEXED_FLOATING_MOTIF_ANNOTATION,
+            np.zeros(atom_array.array_length(), dtype=int),
+        )
+        src = np.asarray(atom_array.src_component).astype(str)
+        marked = atom_array.get_annotation(UNINDEXED_FLOATING_MOTIF_ANNOTATION)
+
+        for motif_name in self.unindexed_motifs:
+            motif_tokens = InputSelection.from_any(
+                self.motifs[motif_name], atom_array=atom_array_input_annotated
+            ).get_tokens(atom_array_input_annotated)
+            if not motif_tokens:
+                continue
+            motif_components = set(motif_tokens.keys())
+            marked[np.isin(src, list(motif_components))] = 1
+
+        atom_array.set_annotation(UNINDEXED_FLOATING_MOTIF_ANNOTATION, marked)
+        return atom_array
+
+    def _annotate_supermotifs(self, atom_array, atom_array_input_annotated):
+        """Tag atoms with their super-motif ID for grouped rigid-body Kabsch alignment.
+
+        Atoms sharing the same non-empty SUPERMOTIF_ID_ANNOTATION value are aligned
+        together as one rigid body by build_floating_motif_references_from_contigs.
+        """
+        n = atom_array.array_length()
+        supermotif_ids = np.empty(n, dtype=object)
+        supermotif_ids[:] = ""
+
+        if exists(self.supermotifs):
+            src = np.asarray(atom_array.src_component).astype(str)
+            for sm_name, sm_def in self.supermotifs.items():
+                # Resolve supermotif definition to a combined contig string
+                if isinstance(sm_def, list):
+                    combined_contig = ",".join(self.motifs[m] for m in sm_def)
+                else:
+                    combined_contig = sm_def
+
+                # Resolve the contig string against the SOURCE atom array to obtain
+                # the set of src_component values covered by this supermotif.
+                try:
+                    sm_tokens = InputSelection.from_any(
+                        combined_contig, atom_array=atom_array_input_annotated
+                    ).get_tokens(atom_array_input_annotated)
+                except Exception as e:
+                    raise ValueError(
+                        f"Failed to resolve supermotif '{sm_name}' against input: {e}"
+                    ) from e
+
+                sm_src_components = set(sm_tokens.keys())
+                mask = np.isin(src, list(sm_src_components))
+
+                # Guard against cross-supermotif atom overlap
+                overlap = mask & (supermotif_ids != "")
+                if np.any(overlap):
+                    conflicting = set(supermotif_ids[overlap].tolist())
+                    raise ValueError(
+                        f"Supermotif '{sm_name}' overlaps with supermotif(s) "
+                        f"{sorted(conflicting)}. Super-motif atom sets must be disjoint."
+                    )
+
+                supermotif_ids[mask] = sm_name
+
+        atom_array.set_annotation(SUPERMOTIF_ID_ANNOTATION, supermotif_ids.astype(str))
+        return atom_array
+
+    def _get_inline_named_motif_payload(
+        self, atom_array_input_annotated, excluded_motifs: Optional[set[str]] = None
+    ) -> tuple[dict, list[list[str]]]:
+        """Return inline motif tokens/components for hidden sampled placement.
+
+        This is the active unindexed_motifs path: motifs are inserted into a sampled
+        inline layout before diffusion, rather than diffused as appended true-unindex
+        guideposts and cleaned up afterward.
+        """
+        if not exists(self.unindexed_motifs):
+            return {}, []
+
+        excluded_motifs = excluded_motifs or set()
+        indexed_tokens = {}
+        inline_components = []
+        for motif_name in self.unindexed_motifs:
+            if motif_name in excluded_motifs:
+                continue
+            motif_contig_str = self.motifs[motif_name]
+            motif_tokens = InputSelection.from_any(
+                motif_contig_str, atom_array=atom_array_input_annotated
+            ).get_tokens(atom_array_input_annotated)
+            indexed_tokens.update(motif_tokens)
+            inline_components.append(
+                get_design_pattern_with_constraints(motif_contig_str)
+            )
+        return indexed_tokens, inline_components
+
+    def _insert_inline_named_motifs(
+        self,
+        components_to_accumulate: list,
+        inline_motif_components: list[list[str]],
+    ) -> list:
+        """Insert unindexed_motifs into a hidden sampled inline layout.
+
+        The base design pattern is first sampled as usual, then expanded to
+        residue-level free components so the motif segments can be inserted at
+        random sequence slots without the user specifying an explicit contig.
+        """
+        if not inline_motif_components:
+            return components_to_accumulate
+
+        expanded_segments = self._expand_components_for_inline_insertion(
+            components_to_accumulate
+        )
+        n_slots = sum(len(segment) + 1 for segment in expanded_segments)
+        if n_slots <= 0:
+            expanded_segments = [[]]
+            n_slots = 1
+
+        slot_indices = sorted(random.choices(range(n_slots), k=len(inline_motif_components)))
+        motif_iter = iter(inline_motif_components)
+        slot_iter = iter(slot_indices)
+        next_slot = next(slot_iter, None)
+        global_slot = 0
+        rebuilt_segments = []
+
+        for segment in expanded_segments:
+            rebuilt = []
+            for local_slot in range(len(segment) + 1):
+                while next_slot == global_slot:
+                    rebuilt.extend(next(motif_iter))
+                    next_slot = next(slot_iter, None)
+                if local_slot < len(segment):
+                    rebuilt.append(segment[local_slot])
+                global_slot += 1
+            rebuilt_segments.append(rebuilt)
+
+        return self._compress_inline_components(rebuilt_segments)
+
+    @staticmethod
+    def _adjust_length_for_inline_motifs(
+        length: Optional[str], inline_motif_components: list[list[str]]
+    ) -> Optional[str]:
+        if not exists(length) or not inline_motif_components:
+            return length
+
+        motif_len = sum(len(components) for components in inline_motif_components)
+        if "-" in length:
+            length_min, length_max = map(int, str(length).split("-"))
+            length_min -= motif_len
+            length_max -= motif_len
+            if length_min < 0 or length_max < 0 or length_min > length_max:
+                raise ValueError(
+                    "Inline unindexed_motifs exceed the available length budget."
+                )
+            return f"{length_min}-{length_max}"
+
+        adjusted = int(length) - motif_len
+        if adjusted < 0:
+            raise ValueError(
+                "Inline unindexed_motifs exceed the available length budget."
+            )
+        return str(adjusted)
+
+    @staticmethod
+    def _expand_components_for_inline_insertion(components_to_accumulate: list) -> list[list]:
+        segments = [[]]
+        for component in components_to_accumulate:
+            comp = str(component)
+            if comp == "/0":
+                segments.append([])
+                continue
+            if comp and comp[0].isdigit():
+                suffix = comp[-1] if comp[-1].isalpha() else ""
+                count = int(comp[:-1] if suffix else comp)
+                unit = f"1{suffix}" if suffix else 1
+                segments[-1].extend([unit] * count)
+            else:
+                segments[-1].append(component)
+        return segments
+
+    @staticmethod
+    def _compress_inline_components(segments: list[list]) -> list:
+        components = []
+        for seg_idx, segment in enumerate(segments):
+            run_suffix = None
+            run_count = 0
+            for component in segment:
+                comp = str(component)
+                if comp.startswith("1") and (len(comp) == 1 or comp[1:].isalpha()):
+                    suffix = comp[1:] if len(comp) > 1 else ""
+                    if run_suffix == suffix:
+                        run_count += 1
+                    else:
+                        if run_count:
+                            components.append(f"{run_count}{run_suffix}" if run_suffix else run_count)
+                        run_suffix = suffix
+                        run_count = 1
+                    continue
+
+                if run_count:
+                    components.append(f"{run_count}{run_suffix}" if run_suffix else run_count)
+                    run_suffix = None
+                    run_count = 0
+                components.append(component)
+
+            if run_count:
+                components.append(f"{run_count}{run_suffix}" if run_suffix else run_count)
+            if seg_idx < len(segments) - 1:
+                components.append("/0")
+        return components
+
+    def _get_unindexed_named_motif_payload(
+        self, atom_array_input_annotated, excluded_motifs: Optional[set[str]] = None
+    ) -> tuple[dict, list, list]:
+        """Return true-unindexed motif tokens/components/breaks for named motifs.
+
+        These motifs follow the regular unindex pathway for position-free sequence placement,
+        but retain a dedicated annotation so floating motif projection still treats them as
+        rigid floating motifs.
+        """
+        if not exists(self.unindexed_motifs):
+            return {}, [], []
+
+        excluded_motifs = excluded_motifs or set()
+        components = []
+        breaks = []
+        unindexed_tokens = {}
+        for motif_name in self.unindexed_motifs:
+            if motif_name in excluded_motifs:
+                continue
+            motif_contig_str = self.motifs[motif_name]
+            motif_components, motif_breaks = get_motif_components_and_breaks(
+                motif_contig_str
+            )
+            components.extend(motif_components)
+            breaks.extend(motif_breaks)
+            motif_tokens = InputSelection.from_any(
+                motif_contig_str, atom_array=atom_array_input_annotated
+            ).get_tokens(atom_array_input_annotated)
+            unindexed_tokens.update(motif_tokens)
+        return unindexed_tokens, components, breaks
 
     # ============================================================================
     # Auxiliary functions
     # ============================================================================
+
+    def _append_named_motifs(
+        self, atom_array, atom_array_input_annotated, motifs_to_append=None
+    ):
+        """Append each entry in motifs_to_append as a separate chain.
+
+        Each motif is built via accumulate_components using alphabetic src_component
+        (so Kabsch alignment picks it up). is_motif_atom_with_fixed_coord is already
+        set to False in _assign_types_to_input; create_motif_residue preserves it.
+        Defaults to self.motifs when motifs_to_append is None.
+        """
+        if motifs_to_append is None:
+            motifs_to_append = self.motifs
+        used_chains = set(np.unique(atom_array.chain_id))
+
+        for motif_name, motif_contig_str in motifs_to_append.items():
+            # Parse contig → components + tokens
+            motif_components = get_design_pattern_with_constraints(motif_contig_str)
+            motif_tokens = InputSelection.from_any(
+                motif_contig_str, atom_array=atom_array_input_annotated
+            ).get_tokens(atom_array_input_annotated)
+
+            next_chain = _next_chain_id(used_chains)
+            used_chains.add(next_chain)
+
+            motif_aa = accumulate_components(
+                motif_components,
+                indexed_tokens=motif_tokens,
+                unindexed_tokens={},
+                atom_array_accum=[],
+                unindexed_breaks=[None] * len(motif_components),
+                start_chain=next_chain,
+                start_resid=1,
+            )
+
+            # Harmonize annotations so struc.concatenate keeps them all
+            all_defaults = {
+                **REQUIRED_CONDITIONING_ANNOTATION_VALUES,
+                **OPTIONAL_CONDITIONING_VALUES,
+            }
+            for annot, default in all_defaults.items():
+                _dtype = np.float64 if isinstance(default, float) else int
+                if (
+                    annot in atom_array.get_annotation_categories()
+                    and annot not in motif_aa.get_annotation_categories()
+                ):
+                    motif_aa.set_annotation(
+                        annot,
+                        np.full(motif_aa.array_length(), default, dtype=_dtype),
+                    )
+                elif (
+                    annot in motif_aa.get_annotation_categories()
+                    and annot not in atom_array.get_annotation_categories()
+                ):
+                    atom_array.set_annotation(
+                        annot,
+                        np.full(atom_array.array_length(), default, dtype=_dtype),
+                    )
+
+            atom_array = struc.concatenate([atom_array, motif_aa])
+            logger.info(
+                f"Appended motif '{motif_name}' ({motif_contig_str}) as chain {next_chain} "
+                f"({motif_aa.array_length()} atoms, floating)."
+            )
+
+        return atom_array
 
     @staticmethod
     def break_unindexed(unindex: InputSelection):
@@ -738,14 +1878,177 @@ class DesignInputSpecification(BaseModel):
 
     def _apply_symmetry(self, atom_array, atom_array_input_annotated):
         """Apply symmetry transformation if specified."""
-        if exists(self.symmetry) and self.symmetry.id:
-            atom_array = make_symmetric_atom_array(
-                atom_array,
-                self.symmetry,
-                sm=self.ligand,
-                src_atom_array=atom_array_input_annotated,
+        if not (exists(self.symmetry) and self.symmetry.id):
+            return atom_array
+        if self._has_sym_motif:
+            return self._apply_sym_motif_symmetry(atom_array, atom_array_input_annotated)
+        return make_symmetric_atom_array(
+            atom_array,
+            self.symmetry,
+            sm=self.ligand,
+            src_atom_array=atom_array_input_annotated,
+        )
+
+    @property
+    def _has_sym_motif(self) -> bool:
+        """True when the contig contains a SymMotif placeholder token."""
+        return (
+            exists(self.contig)
+            and "SymMotif" in [t.strip() for t in self.contig.raw.split(",")]
+        )
+
+    def _apply_sym_motif_symmetry(self, atom_array_instance0, atom_array_input_annotated):
+        """Build one chain per symmetric instance with its specific motif, then apply frames.
+
+        atom_array_instance0 is used only to derive symmetry config; it is then discarded
+        and all instances (including 0) are rebuilt by _build_sym_motif_instance so that
+        each carries its own motif atoms with correct annotations.
+        """
+        if self.ligand:
+            raise NotImplementedError(
+                "Ligands combined with SymMotif symmetry are not yet supported."
             )
-        return atom_array
+
+        sym_conf = check_symmetry_config(
+            atom_array_instance0,
+            self.symmetry,
+            sm=None,
+            has_dist_cond=False,
+            src_atom_array=atom_array_input_annotated,
+        )
+        frames = get_symmetry_frames_from_symmetry_id(sym_conf)
+
+        symmetry_unit_list = []
+        for transform_id, frame in enumerate(frames):
+            instance_aa = self._build_sym_motif_instance(
+                transform_id, atom_array_input_annotated
+            )
+            instance_aa = add_sym_annotations(instance_aa, sym_conf)
+
+            # Motif atoms are already at their native PDB positions (which for a
+            # C2-symmetric complex are already in the correct frame for each instance).
+            # get_symmetry_unit would apply the C2 frame on top of that, double-rotating
+            # motif atoms back to instance-0's position.  Save and restore them so only
+            # the sym_transform annotations are affected, not the coordinates.
+            _is_motif_atom = np.asarray(
+                [bool(c) and c[0].isalpha() for c in instance_aa.src_component]
+            )
+            _saved_motif_coords = instance_aa.coord[_is_motif_atom].copy()
+
+            sym_unit = get_symmetry_unit(instance_aa, transform_id, frame)
+
+            sym_unit.coord[_is_motif_atom] = _saved_motif_coords
+            symmetry_unit_list.append(sym_unit)
+
+        result = struc.concatenate(symmetry_unit_list)
+        if {"_is_motif", "_is_indexed_motif"}.issubset(
+            result.get_annotation_categories()
+        ):
+            result = fix_3D_sym_motif_annotations(result)
+        result = add_src_sym_component_annotations(result)
+        return result
+
+    def _build_sym_motif_instance(self, instance_idx: int, atom_array_input_annotated):
+        """Build one instance's chain with SymMotif resolved to that instance's motif.
+
+        Falls back to instance 0's motif if this instance_idx is not in instances.
+        """
+        instances = self.symmetry.instances or {}
+        motif_names = instances.get(str(instance_idx)) or instances.get("0") or []
+        if not motif_names:
+            raise ValueError(
+                f"SymMotif: no motif defined for instance {instance_idx} and no fallback at '0'."
+            )
+        motif_name = motif_names[0]
+        if motif_name not in (self.motifs or {}):
+            raise ValueError(
+                f"SymMotif instance {instance_idx}: motif '{motif_name}' not in motifs dict."
+            )
+        motif_contig_str = self.motifs[motif_name]
+
+        # Resolve the contig with this instance's motif substituted for SymMotif.
+        resolved_parts = []
+        indexed_tokens: dict = {}
+        referenced_motifs = {motif_name}
+        for _tok in self.contig.raw.split(","):
+            _tok = _tok.strip()
+            if _tok == "SymMotif":
+                resolved_parts.append(motif_contig_str)
+                _msele = InputSelection.from_any(
+                    motif_contig_str, atom_array=atom_array_input_annotated
+                )
+                indexed_tokens.update(_msele.get_tokens(atom_array_input_annotated))
+            elif exists(self.motifs) and _tok in self.motifs:
+                referenced_motifs.add(_tok)
+                resolved_parts.append(self.motifs[_tok])
+                _msele = InputSelection.from_any(
+                    self.motifs[_tok], atom_array=atom_array_input_annotated
+                )
+                indexed_tokens.update(_msele.get_tokens(atom_array_input_annotated))
+            else:
+                resolved_parts.append(_tok)
+
+        resolved_contig = ",".join(resolved_parts)
+        if UNINDEXED_MOTIFS_USE_LEGACY_TRUE_UNINDEX:
+            sampling_contig, _contig_auto_info = _resolve_contig_auto_tokens(
+                resolved_contig,
+                self.length,
+            )
+            sampling_length = (
+                str(_contig_auto_info["length"])
+                if _contig_auto_info is not None
+                else self.length
+            )
+            components = get_design_pattern_with_constraints(
+                sampling_contig, length=sampling_length
+            )
+            (
+                unindexed_motif_tokens,
+                unindexed_motif_components,
+                unindexed_motif_breaks,
+            ) = self._get_unindexed_named_motif_payload(
+                atom_array_input_annotated, excluded_motifs=referenced_motifs
+            )
+            components += unindexed_motif_components
+        else:
+            (
+                inline_motif_tokens,
+                inline_motif_components,
+            ) = self._get_inline_named_motif_payload(
+                atom_array_input_annotated, excluded_motifs=referenced_motifs
+            )
+            effective_length = self._adjust_length_for_inline_motifs(
+                self.length, inline_motif_components
+            )
+            sampling_contig, _contig_auto_info = _resolve_contig_auto_tokens(
+                resolved_contig,
+                effective_length,
+            )
+            sampling_length = (
+                str(_contig_auto_info["length"])
+                if _contig_auto_info is not None
+                else effective_length
+            )
+            components = get_design_pattern_with_constraints(
+                sampling_contig, length=sampling_length
+            )
+            indexed_tokens.update(inline_motif_tokens)
+            components = self._insert_inline_named_motifs(
+                components,
+                inline_motif_components,
+            )
+            unindexed_motif_tokens = {}
+            unindexed_motif_breaks = []
+        return accumulate_components(
+            components,
+            indexed_tokens=indexed_tokens,
+            unindexed_tokens=unindexed_motif_tokens,
+            atom_array_accum=[],
+            unindexed_breaks=([None] * (len(components) - len(unindexed_motif_breaks)))
+            + unindexed_motif_breaks,
+            start_chain="A",
+            start_resid=1,
+        )
 
     def _set_origin(self, atom_array):
         """Set origin token and initialize coordinates."""
@@ -757,15 +2060,27 @@ class DesignInputSpecification(BaseModel):
                     "Partial diffusion with symmetry: skipping COM centering to preserve chain spacing"
                 )
             else:
+                coord_before_origin = atom_array.coord.copy()
                 atom_array = set_com(
                     atom_array, ori_token=None, infer_ori_strategy="com"
                 )
+                atom_array = _shift_floating_motif_reference_coords(
+                    atom_array,
+                    _infer_uniform_coordinate_shift(
+                        coord_before_origin, atom_array.coord
+                    ),
+                )
         else:
             # Standard: set ori token, zero out diffused atoms
+            coord_before_origin = atom_array.coord.copy()
             atom_array = set_com(
                 atom_array,
                 ori_token=self.ori_token,
                 infer_ori_strategy=self.infer_ori_strategy,
+            )
+            atom_array = _shift_floating_motif_reference_coords(
+                atom_array,
+                _infer_uniform_coordinate_shift(coord_before_origin, atom_array.coord),
             )
             # Diffused atoms are always initialized at origin during regular diffusion (all information removed)
             atom_array.coord[
@@ -928,6 +2243,20 @@ def validator_context(validator_name: str, data: dict = None):
         raise e
 
 
+def _next_chain_id(used_chains: set) -> str:
+    """Return the first single- then double-letter chain ID not in used_chains."""
+    import string
+    for c in string.ascii_uppercase:
+        if c not in used_chains:
+            return c
+    for c1 in string.ascii_uppercase:
+        for c2 in string.ascii_uppercase:
+            cc = c1 + c2
+            if cc not in used_chains:
+                return cc
+    raise RuntimeError("Exhausted all chain IDs.")
+
+
 def create_diffused_residues(n, additional_annotations=None):
     if n <= 0:
         raise ValueError(f"Negative/null residue count ({n}) not allowed.")
@@ -964,6 +2293,12 @@ def create_motif_residue(
     token,
     strip_sidechains_by_default: bool,
 ):
+    extra_annotations = {}
+    if UNINDEXED_FLOATING_MOTIF_ANNOTATION in token.get_annotation_categories():
+        extra_annotations[UNINDEXED_FLOATING_MOTIF_ANNOTATION] = token.get_annotation(
+            UNINDEXED_FLOATING_MOTIF_ANNOTATION
+        ).copy()
+
     if strip_sidechains_by_default and token.res_name in STANDARD_AA:
         n_atoms = token.shape[0]
         diffuse_oxygen = False
@@ -997,6 +2332,9 @@ def create_motif_residue(
 
     check_has_required_conditioning_annotations(token)
     token = set_common_annotations(token)
+    for annot, values in extra_annotations.items():
+        if len(values) == token.shape[0]:
+            token.set_annotation(annot, values)
     token.set_annotation("res_id", np.full(token.shape[0], 1))  # Reset to 1
 
     return token

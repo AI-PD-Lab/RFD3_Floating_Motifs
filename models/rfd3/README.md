@@ -53,6 +53,61 @@ Additional unnecessary (but useful!) options are added to the above command:
 - `prevalidate_inputs`: Checks that your inputs are valid before running inference. Helpful if your JSON/YAML has a number of different configs you want to debug / double check are valid before loading the checkpoints.
 - `skip_existing`: Skips any existing files that would be in the same place and have the same name as the calculation being run. If you are testing your setup multiple times, including this option is important so that you actually run RFdiffusion3. 
 
+### Floating motif projection
+
+This checkout includes an optional inference-time floating rigid motif projection. It is disabled by default. When enabled, motif residues derived from the existing contig mapping are still diffused normally at each denoising step, then each non-contiguous motif segment is independently Kabsch-aligned back to its original all-atom PDB geometry.
+
+```bash
+rfd3 design ... inference_sampler.floating_motif_project=True inference_sampler.floating_motif_project_every=5 inference_sampler.floating_motif_burn_in=20
+```
+
+`floating_motif_project_every` controls the projection interval, `floating_motif_burn_in` skips projection for the first N denoising steps, and `floating_motif_stop_after` optionally stops projection after a specific step. In this potentials-enabled checkout, the step order is normal sampler update, external potential guidance, then floating motif Kabsch projection. The projection is an inference-time approximation of floating-anchor diffusion; it does not change training or model architecture.
+
+### Super-motifs (rigid non-connected bodies)
+
+By default, floating motif projection aligns each *contiguous* motif segment independently.  A **super-motif** groups non-connected motif fragments into a single rigid body so that all inter-fragment distances and angles are preserved together by a single Kabsch solve.
+
+Add a `supermotifs` dict to your input JSON alongside the existing `motifs` key.  Each entry maps a name to either:
+- a **list of motif names** from `motifs`, or
+- a **direct contig string** selecting residues from the input PDB.
+
+```json
+{
+    "input": "protein.pdb",
+    "motifs": {
+        "loop_1": "A1-10",
+        "loop_2": "A25-34"
+    },
+    "supermotifs": {
+        "rigid_interface": ["loop_1", "loop_2"]
+    },
+    "contig": "loop_1,15,loop_2",
+    "length": "40-50"
+}
+```
+
+Or with a direct contig string:
+
+```json
+{
+    "supermotifs": {
+        "rigid_interface": "A1-10,A25-34"
+    }
+}
+```
+
+Rules:
+- All residues referenced in `supermotifs` must already appear in `contig`, `motifs`, or `non_fixed_contig` — an error is raised otherwise.
+- Super-motifs do **not** need to appear in `contig` themselves.
+- Super-motif atom sets must be disjoint; overlapping definitions raise an error.
+- Floating motif projection must be enabled for super-motifs to have any effect:
+
+```bash
+rfd3 design ... inference_sampler.floating_motif_project=True
+```
+
+See `docs/examples/supermotifs_test.json` and `run_supermotifs_test.sh` for a minimal working example.
+
 There are various interesting ways you can use RFD3 beyond [Atom14](https://www.biorxiv.org/content/10.1101/2024.08.16.608235v4) design as it's trained on a large array of different tasks.
 For example, you can fix sequence and not structure (prediction-type task), fix the backbone and unfix the sequence (MPNN-type inverse folding) or unfix the sidechains only (PLACER/ChemNet-style):
 
@@ -138,15 +193,16 @@ All potentials support `weight` unless noted. The value is a scalar to maximize,
 | `interface_ncontacts` | `weight=1.0`, `r_0=8.0`, `d_0=2.0` | Maximizes differentiable contacts between generated binder atoms and fixed target atoms. |
 | `monomer_contacts` | `weight=1.0`, `r_0=8.0`, `d_0=2.0` | Maximizes differentiable internal contacts among selected potential atoms, using only upper-triangle pairs. |
 | `atom_pair_distance` | `weight=1.0`, `atom_i=0`, `atom_j=1`, `target_distance=8.0` | Harmonic distance restraint on two flat atom indices. |
-| `motif_distance` | `weight=1.0`, `motif_i=0`, `motif_j=1`, `target_distance=10.0` | Harmonic center-distance restraint between two contiguous motif-token blocks. Motif blocks are inferred from contig order. |
+| `motif_distance` | `weight=1.0`, `motif_i=0`, `motif_j=1`, `target_distance=10.0` | Harmonic COM-distance restraint between two contiguous motif-token blocks. Motif blocks are inferred from contig order, and guidance applies one translation to all atoms in each selected motif block. |
 | `motif_bridge` | `weight=1.0`, `motif_i=0`, `motif_j=1`, `spread_weight=1.0`, `outside_weight=1.0`, `tube_weight=0.2`, `max_radius=12.0`, `atom_filter=guide`, `include_motif_atoms=false` | Encourages generated non-motif atoms to spread evenly between two motif centers. |
 | `motif_rigid` | `weight=1.0`, `k=1.0`, `loss=pseudo_huber`, `group_mode=all`, `atom_filter=potential`, `motif_i=null`, `min_separation=0` | Preserves fixed-sequence and fixed-coordinate motif geometry by matching current motif atom-pair distances to RFD3 reference coordinates. |
+| `motif_radial_orientation` | `weight=1.0`, `motif_offsets=[]`, `origin_atom_filter=real`, `eps=1e-6` | Biases each motif block's rigid-body rotation to preserve (or offset) its input-PDB radial orientation relative to the current protein COM. Invariant to motif radius, angular position on the sphere, and inter-motif distances. Requires at least two motif blocks with distinct reference centres. |
 
 `interface_ncontacts` and `monomer_contacts` use the soft contact function `1 / (1 + ((distance - d_0) / r_0)^6)`.
 
 ### `motif_bridge` guide
 
-`motif_bridge` complements `motif_distance`. `motif_distance` moves only the motif atoms that define the two motif centers. `motif_bridge` instead acts on selected non-motif atoms, usually generated scaffold atoms, and encourages them to occupy the region between the two motif centers.
+`motif_bridge` complements `motif_distance`. `motif_distance` computes each selected motif center from all real motif atoms and applies the same translation to every atom in that motif block, preserving the noisy internal motif geometry for the subsequent floating motif Kabsch projection. `motif_bridge` instead acts on selected non-motif atoms, usually generated scaffold atoms, and encourages them to occupy the region between the two motif centers.
 
 It projects selected atoms onto the axis from `motif_i` to `motif_j`, sorts those projected positions, and penalizes deviation from an even spacing between 0 and 1. It also penalizes atoms outside the two motif endpoints and, optionally, atoms farther than `max_radius` from the motif-motif axis.
 
@@ -229,6 +285,81 @@ guiding_potentials:
   - "type:motif_distance,weight:50.0,guide_scale:0.5,guide_decay:inverse_linear,guide_clip_rms:0.05,motif_i:0,motif_j:1,target_distance:50.0"
   - "type:motif_bridge,weight:5.0,guide_scale:0.5,guide_decay:inverse_linear,guide_clip_rms:0.05,motif_i:0,motif_j:1,spread_weight:1.0,outside_weight:1.0,tube_weight:0.2,max_radius:12.0,atom_filter:guide"
   - "type:motif_rigid,weight:1000.0,guide_scale:1.0,guide_decay:inverse_cosine,guide_clip_rms:0.05,atom_filter:backbone,k:0.25,loss:pseudo_huber,group_mode:all"
+```
+
+### `motif_radial_orientation` guide
+
+`motif_radial_orientation` biases the *rotational pose* of each contig-defined motif block relative to the direction from the current protein center of mass (COM) to the motif's center. This direction is the motif's *radial direction*. The potential asks: "is the motif rotated the same way around its radial axis as it was in the input PDB?"
+
+**What is preserved.** For each motif block, the potential stores a local reference frame at inference start. The frame is built from the motif's reference backbone coordinates expressed relative to the inward/outward radial axis. During diffusion the same frame-relative pose is reconstructed around the *current* radial direction and compared to the current motif atom positions. The loss is the mean squared deviation of centred atom positions from the reconstructed target.
+
+**What is NOT affected.** The potential is invariant by construction to:
+- Radius (distance from COM to motif): the radial direction is normalised and the COM is detached from the gradient graph.
+- Angular position on the sphere: the radial direction that builds the target frame is detached, so no gradient pushes the motif to a specific location around the COM.
+- Inter-motif distances: each block is scored independently.
+- Global translation and rotation: gradient is projected to pure rigid rotation for each motif block.
+
+**Requirement.** At least two motif blocks with distinct reference centre positions are needed. A motif whose reference centre coincides with the global reference centre produces a zero radial vector and is silently skipped.
+
+`motif_radial_orientation` variables:
+
+| Variable | Default | Values | Meaning |
+| --- | --- | --- | --- |
+| `weight` | `1.0` | float | Overall strength of the orientation restraint. |
+| `motif_offsets` | `[]` | list of `[ax, ay, az]` in degrees | Per-motif Euler (ZYX) offsets, indexed in contig order. Missing entries use `[0, 0, 0]`. The input-PDB pose corresponds to `[0, 0, 0]`. Offsets rotate the target inside the motif's local radial frame: axis 0 (x) spins around the radial direction, axes 1–2 (y, z) tilt the motif. |
+| `origin_atom_filter` | `real` | `real`, `potential`, `guide`, `motif`, `all` | Atom selection used to compute the current protein COM. `real` (all non-virtual atoms) is usually appropriate. |
+| `eps` | `1e-6` | float | Denominator clamp for normalisation and frame construction. |
+
+**YAML-only for `motif_offsets`.** Because `motif_offsets` is a list of lists it cannot be expressed in the flat `"type:X,key:val"` string format. Use the YAML dict form:
+
+```yaml
+inference_sampler:
+  potentials:
+    enabled: true
+    apply_mode: atom
+    guide_scale: 0.15
+    guide_decay: inverse_cosine
+    guide_clip_rms: 0.03
+    include_atoms: real_heavy
+    guiding_potentials:
+      # Preserve the input-PDB radial orientation for all motif blocks
+      - type: motif_radial_orientation
+        weight: 5.0
+        guide_scale: 0.2
+        guide_decay: inverse_linear
+        guide_clip_rms: 0.05
+        origin_atom_filter: real
+        motif_offsets: []          # empty list = reproduce input-PDB orientation
+
+      # Same, but spin motif block 0 by 90° around the radial axis and
+      # tilt motif block 1 by 45° around the first tangent axis
+      - type: motif_radial_orientation
+        weight: 5.0
+        origin_atom_filter: real
+        motif_offsets:
+          - [90.0, 0.0, 0.0]       # block 0: 90° spin around radial direction
+          - [0.0, 45.0, 0.0]       # block 1: 45° tilt around tangent axis 1
+```
+
+`motif_radial_orientation` is designed to complement `motif_rigid` (which preserves internal motif geometry) and `motif_distance` / `motif_bridge` (which control inter-motif spacing). A typical multi-motif scaffold design might use all three together:
+
+```yaml
+guiding_potentials:
+  - type: motif_distance
+    weight: 30.0
+    guide_decay: inverse_linear
+    motif_i: 0
+    motif_j: 1
+    target_distance: 40.0
+  - type: motif_radial_orientation
+    weight: 3.0
+    guide_decay: inverse_cosine
+    origin_atom_filter: real
+  - type: motif_rigid
+    weight: 500.0
+    guide_decay: inverse_cosine
+    atom_filter: backbone
+    k: 0.5
 ```
 
 ## Further example JSONs for different applications

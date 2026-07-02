@@ -8,6 +8,9 @@ from lightning_utilities import apply_to_collection
 from omegaconf import DictConfig
 from rfd3.metrics.design_metrics import get_all_backbone_metrics
 from rfd3.metrics.hbonds_hbplus_metrics import get_hbond_metrics
+from rfd3.model.floating_motif_projection import (
+    build_floating_motif_references_from_contigs,
+)
 from rfd3.trainer.recycling import get_recycle_schedule
 from rfd3.trainer.trainer_utils import (
     _build_atom_array_stack,
@@ -220,6 +223,9 @@ class AADesignTrainer(FabricTrainer):
         network_output = model.forward(
             input=network_input,
             coord_atom_lvl_to_be_noised=example["coord_atom_lvl_to_be_noised"],
+            floating_motif_refs=build_floating_motif_references_from_contigs(
+                sample_features=example,
+            ),
         )
 
         assert_no_nans(

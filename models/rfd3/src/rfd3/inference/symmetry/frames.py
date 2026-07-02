@@ -72,6 +72,12 @@ def get_symmetry_frames_from_atom_array(src_atom_array, input_frames):
     # get coordinates
     coords = src_atom_array.coord
 
+    # Single-chain motif: no symmetric copies to Kabsch-fit from.
+    # The caller already has the theoretical frames; return them directly so
+    # make_symmetric_atom_array can generate the N copies normally.
+    if min([len(i) for i in nids_by_entity.values()]) == 1:
+        return list(input_frames)
+
     # get/check multiplicities of subunits
     check_valid_multiplicity(nids_by_entity)
 

@@ -1,6 +1,10 @@
 import numpy as np
 
 from foundry.constants import TIP_BY_RESTYPE
+from rfd3.model.floating_motif_projection import (
+    FLOATING_MOTIF_REFERENCE_ANNOTATIONS,
+    SUPERMOTIF_ID_ANNOTATION,
+)
 
 TIP_BY_RESTYPE
 
@@ -37,8 +41,11 @@ CONDITIONING_VALUES = (
 )
 """Annotations that must be present in the AtomArray at inference time."""
 
-INFERENCE_ANNOTATIONS = REQUIRED_INFERENCE_ANNOTATIONS + list(
-    OPTIONAL_CONDITIONING_VALUES.keys()
+INFERENCE_ANNOTATIONS = (
+    REQUIRED_INFERENCE_ANNOTATIONS
+    + list(OPTIONAL_CONDITIONING_VALUES.keys())
+    + list(FLOATING_MOTIF_REFERENCE_ANNOTATIONS)
+    + [SUPERMOTIF_ID_ANNOTATION]
 )
 """All annotations that might be desired at inference time. Determines what AtomArray annotations will be preserved."""
 

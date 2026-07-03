@@ -31,9 +31,9 @@ RFD3 by passing `dotted.config.path=value` overrides directly on the command
 line (Hydra syntax — same for `rfd3 design` and `run_inference.py`). List
 values need to be a quoted, escaped list, e.g.
 `"inference_sampler.potentials.guiding_potentials=[\"type:binder_ROG,weight:0.5\"]"`
-(see [`examples/run_symmetry_axis_position_phi0.sh`](examples/run_symmetry_axis_position_phi0.sh)
+(see [`models/rfd3/docs/examples/run_symmetry_axis_position_phi0.sh`](models/rfd3/docs/examples/run_symmetry_axis_position_phi0.sh)
 for a full command). You can even pass a whole `inputs=` spec as inline JSON
-instead of a file path — [`examples/run_supermotifs_test.sh`](examples/run_supermotifs_test.sh)
+instead of a file path — [`models/rfd3/docs/examples/run_supermotifs_test.sh`](models/rfd3/docs/examples/run_supermotifs_test.sh)
 does this to drive three different configs out of one JSON file without three
 separate invocations.
 
@@ -127,7 +127,7 @@ Registered potentials:
   the above, for oligomers. See [Symmetry-aware potentials](#symmetry-aware-potentials).
 
 Worked example — hold two motif blocks 50 Å apart while keeping one of them
-rigid, straight out of [`../README.md`](../README.md):
+rigid, straight out of [`models/rfd3/README.md`](models/rfd3/README.md):
 
 ```yaml
 inference_sampler:
@@ -156,9 +156,9 @@ forcing their internal geometry to stay exact between steps. Floating motif
 projection fixes that: after each denoising step, every non-contiguous motif
 fragment is rigidly re-fit — via [Kabsch alignment](https://en.wikipedia.org/wiki/Kabsch_algorithm)
 — back onto its exact input-PDB coordinates (`kabsch_align_all_atom` in
-[`../src/rfd3/model/floating_motif_projection.py`](../src/rfd3/model/floating_motif_projection.py),
+[`models/rfd3/src/rfd3/model/floating_motif_projection.py`](models/rfd3/src/rfd3/model/floating_motif_projection.py),
 verified to recover a random rigid transform to <1e-4 RMSD in
-[`../tests/test_floating_motif_projection.py`](../tests/test_floating_motif_projection.py)).
+[`models/rfd3/tests/test_floating_motif_projection.py`](models/rfd3/tests/test_floating_motif_projection.py)).
 The motif still moves and rotates as a whole with the rest of the design;
 only its internal shape snaps back to ground truth.
 
@@ -231,9 +231,9 @@ preserved too, not just each one's own shape:
 Referenced residues must already appear in `contig`, `motifs`, or
 `non_fixed_contig`; super-motif atom sets can't overlap each other; and
 `floating_motif_project=True` must be set or nothing gets aligned at all.
-Run [`examples/run_supermotifs_test.sh`](examples/run_supermotifs_test.sh)
+Run [`models/rfd3/docs/examples/run_supermotifs_test.sh`](models/rfd3/docs/examples/run_supermotifs_test.sh)
 to compare a super-motif run against an independent-alignment baseline —
-16 unit tests in [`../tests/test_supermotifs.py`](../tests/test_supermotifs.py)
+16 unit tests in [`models/rfd3/tests/test_supermotifs.py`](models/rfd3/tests/test_supermotifs.py)
 cover the grouping/alignment logic directly.
 
 ## Symmetry
@@ -247,7 +247,7 @@ asymmetric unit and mirroring it through a point group (cyclic `Cn` or
 dihedral `Dn`; only these two families are supported). Symmetry frames are
 Kabsch-fit directly from an input symmetric-motif PDB rather than assumed to
 be ideal geometry, with per-subunit RMSD checks
-([`../src/rfd3/inference/symmetry/frames.py`](../src/rfd3/inference/symmetry/frames.py)).
+([`models/rfd3/src/rfd3/inference/symmetry/frames.py`](models/rfd3/src/rfd3/inference/symmetry/frames.py)).
 
 ```json
 {"uncond_C5": {"length": 100, "is_non_loopy": true, "symmetry": {"id": "C5"}}}
@@ -266,8 +266,8 @@ contig/ligand names that should stay asymmetric, e.g. a bound DNA strand) and
 `is_symmetric_motif` (whether the input motif is already symmetric around the
 origin — currently the only supported mode, `true` by default). Worked
 examples for symmetric enzyme active sites, ligand-bound motifs, and DNA-bound
-C3 oligomers are in [`examples/symmetry.json`](examples/symmetry.json) /
-[`examples/symmetry.md`](examples/symmetry.md).
+C3 oligomers are in [`models/rfd3/docs/examples/symmetry.json`](models/rfd3/docs/examples/symmetry.json) /
+[`models/rfd3/docs/examples/symmetry.md`](models/rfd3/docs/examples/symmetry.md).
 
 ### Hetero pseudo-symmetry (`kind=hetero_symmetry`)
 
@@ -278,7 +278,7 @@ sequence/motifs. Hetero pseudo-symmetry uses the same machinery only to
 detected oligomer-interface atoms (plus optional nearby "support" atoms) get
 pulled toward the symmetric pose; motif atoms and their neighbors are never
 touched, regardless of settings
-([`../src/rfd3/inference/symmetry/hetero_pseudo.py`](../src/rfd3/inference/symmetry/hetero_pseudo.py)).
+([`models/rfd3/src/rfd3/inference/symmetry/hetero_pseudo.py`](models/rfd3/src/rfd3/inference/symmetry/hetero_pseudo.py)).
 
 ```yaml
 inference_sampler:
@@ -364,7 +364,7 @@ oligomer-wide mean:
   hetero layouts).
 
 Runnable example — pin every subunit's motif to the middle of its wedge in a
-C3 design ([`examples/run_symmetry_axis_position_phi0.sh`](examples/run_symmetry_axis_position_phi0.sh)):
+C3 design ([`models/rfd3/docs/examples/run_symmetry_axis_position_phi0.sh`](models/rfd3/docs/examples/run_symmetry_axis_position_phi0.sh)):
 
 ```bash
 rfd3 design out_dir=<outdir> inputs=<input.json> n_batches=1 diffusion_batch_size=1 \
@@ -513,7 +513,13 @@ or nested under `inference_sampler:` in YAML).
 ## Further reading
 
 Full upstream option reference (contigs, conditioning, all sampler options):
-[`input.md`](input.md). Branch-specific notes this doc is based on:
-[`../README.md`](../README.md) (potentials) and
-[`../src/rfd3/README.md`](../src/rfd3/README.md)
+[`models/rfd3/docs/input.md`](models/rfd3/docs/input.md). Branch-specific
+notes this doc is based on:
+[`models/rfd3/README.md`](models/rfd3/README.md) (potentials) and
+[`models/rfd3/src/rfd3/README.md`](models/rfd3/src/rfd3/README.md)
 (floating motif / symmetry / hetero-symmetry).
+
+This repo (`rc-foundry`) also ships RF3 (protein folding) and
+ProteinMPNN/LigandMPNN (sequence design) — see
+[`README_foundry.md`](README_foundry.md) for the general Foundry install and
+an overview of those models.

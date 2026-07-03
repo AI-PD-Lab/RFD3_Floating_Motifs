@@ -66,10 +66,26 @@ schedules strength over the course of denoising —
 each with an `inverse_*` counterpart that starts weak and gets *stronger* near
 the end of sampling (useful for pinning down an exact end-state rather than
 biasing the early fold). `guide_clip_rms` caps gradient RMS before scaling, so
-a runaway gradient can't blow up the structure. Any of `guide_scale`,
-`guide_decay`, `guide_clip_rms`, `apply_mode` can be overridden per potential
-inside `guiding_potentials`, and specs can also be written as compact
-RFdiffusion1-style strings (`"type:binder_ROG,weight:0.5"`).
+a runaway gradient can't blow up the structure. `guide_start_step` /
+`guide_stop_after` restrict guidance to a step window (same idea as the
+floating-motif burn-in/stop-after below, but for potentials). Any of
+`guide_scale`, `guide_decay`, `guide_clip_rms`, `apply_mode` can be
+overridden per potential inside `guiding_potentials`, and specs can also be
+written as compact RFdiffusion1-style strings (`"type:binder_ROG,weight:0.5"`).
+
+Potentials don't need a YAML file at all — they're configured entirely at
+inference time, so you can turn a potential on/off or sweep a weight per run
+just by adding `key=value` overrides to the `rfd3 design` command itself:
+
+```bash
+rfd3 design out_dir=logs/inference_outs/potentials_demo/0 inputs=docs/examples/demo.json \
+    skip_existing=False prevalidate_inputs=True \
+    inference_sampler.potentials.enabled=True \
+    inference_sampler.potentials.apply_mode=atom \
+    inference_sampler.potentials.guide_scale=0.25 \
+    inference_sampler.potentials.guide_decay=quadratic \
+    "inference_sampler.potentials.guiding_potentials=[\"type:binder_ROG,weight:0.5\",\"type:interface_ncontacts,weight:1.0\"]"
+```
 
 Registered potentials:
 
@@ -79,15 +95,36 @@ Registered potentials:
   (`1/(1+((d-d_0)/r_0)^6)`), between binder and target, or within the design.
 - **`atom_pair_distance`** / **`motif_distance`** — harmonic distance
   restraint, on two atoms or on two motif-block centers.
+- **`motif_internal_rotation`** — bias one motif block's rigid rotation
+  toward a target Euler offset from its input-PDB pose (`angle_x/y/z`);
+  `[0,0,0]` reproduces the input orientation.
+- **`motif_relative_pose`** (alias `rigid_pose`) — bias the
+  origin→motif_i / origin→motif_j / motif_i→motif_j triangle-edge directions
+  around the recentered inference origin, via `angle_x/y/z`.
+- **`motif_rigid_body_pose`** (alias `rigid_body_pose`) — frame-invariant
+  version of the above: builds motif_i's own Kabsch-fit local frame first, so
+  it's unaffected by RFD3's per-step global recentering/rotation
+  (`pair_weight`, `origin_weight`, `distance_weight`, `origin_atom_filter`).
 - **`motif_bridge`** — spreads scaffold atoms evenly between two motif
-  centers, for designing a linker or pocket between them.
+  centers with a soft cylindrical tube penalty, for designing a linker or
+  pocket between them.
+- **`motif_bridge2`** — variant of `motif_bridge` with a rounded-end capped
+  cylinder instead of a tube (`radius`, `end_padding`, `end_bias` for
+  clustering atoms toward the ends rather than spreading them evenly).
 - **`motif_rigid`** — keeps a motif's internal geometry close to the input
   PDB via pairwise-distance matching (`pseudo_huber`/`mse`/`l1` loss).
+- **`motif_com_distance`** — harmonic restraint on each motif block's
+  distance from the protein center of mass (`target_distances`, one entry
+  per motif block).
+- **`motif_spherical_position`** — constrains each motif's angular position
+  (latitude/longitude) on the sphere around the protein COM, ignoring radial
+  distance entirely; complements `motif_radial_orientation` below (position
+  vs. facing direction).
 - **`motif_radial_orientation`** — preserves a motif's rotation relative to
   the direction from the protein's center of mass, invariant to radius,
   angular position, and inter-motif distance.
-- **`symmetry_motif_*`** (11 variants) — per-subunit versions of the above,
-  for oligomers. See [Symmetry-aware potentials](#symmetry-aware-potentials).
+- **`symmetry_motif_*`** (12 variants) — per-subunit versions of several of
+  the above, for oligomers. See [Symmetry-aware potentials](#symmetry-aware-potentials).
 
 Worked example — hold two motif blocks 50 Å apart while keeping one of them
 rigid, straight out of [`../README.md`](../README.md):
@@ -256,6 +293,45 @@ If floating motif projection is also on, `hetero_require_per_copy_floating_motif
 geometry across every symmetry copy — set it `false` only if that's actually
 what you want.
 
+**Building a hetero-oligomer with a different motif per copy.** `kind=hetero_symmetry`
+only controls *sampling*; you still need to tell RFD3 which named motif each
+symmetry copy actually gets. Set `symmetry.mode: heterotypic` and
+`symmetry.instances` to map copy index → motif name(s), place a `SymMotif`
+placeholder in `contig` where that per-copy motif goes, and set
+`is_symmetric_motif: false` (the copies are related by shape, not by an
+already-symmetric input motif):
+
+```json
+{
+    "hetero_C2_receptor": {
+        "input": "receptor_dimer.pdb",
+        "motifs": {"motif_fgfr": "A1-59", "motif_her2": "B1-65"},
+        "symmetry": {
+            "id": "C2",
+            "is_symmetric_motif": false,
+            "mode": "heterotypic",
+            "instances": {"0": ["motif_fgfr"], "1": ["motif_her2"]}
+        },
+        "contig": "SymMotif,150",
+        "length": null
+    }
+}
+```
+
+`SymMotif` resolves to `motif_fgfr` for copy 0 and `motif_her2` for copy 1
+(falling back to instance `"0"`'s motif if a copy index is missing). Motif
+names assigned this way must not also appear in `sequence_unrestrained_motifs`
+or be duplicated elsewhere in `contig`. `independent` mode (fully separate
+per-copy contigs) is defined in the schema but reserved for future use —
+`heterotypic` is the one that actually runs today.
+
+```bash
+rfd3 design out_dir=logs/inference_outs/hetero_demo/0 inputs=<your_hetero_input.json> \
+    diffusion_batch_size=1 skip_existing=False prevalidate_inputs=True \
+    inference_sampler.kind=hetero_symmetry \
+    inference_sampler.hetero_post_init_symmetry=interface_only
+```
+
 ### Symmetry-aware potentials
 
 The potentials above treat the whole structure as one unit; the
@@ -267,6 +343,11 @@ oligomer-wide mean:
 
 - **`symmetry_motif_distance`** / **`symmetry_motif_bridge`** /
   **`symmetry_single_motif_bridge`** — per-subunit versions of `motif_distance`/`motif_bridge`.
+- **`symmetry_ellipsoid_bridge`** — like `symmetry_single_motif_bridge`, but
+  spreads scaffold atoms inside a subunit-shaped ellipsoid (axes anchored at
+  the subunit COM: one toward the motif, two toward the left/right
+  neighboring subunits) instead of a radius from the motif alone — covers the
+  non-motif-facing half of the subunit too.
 - **`symmetry_motif_center_distance`** / **`symmetry_motif_com_distance`** —
   distance from each subunit's motif to the symmetry axis, or to the current
   center of mass.
@@ -316,6 +397,118 @@ rfd3 design out_dir=logs/inference_outs/combined_demo/0 inputs=<your_input.json>
     inference_sampler.potentials.guide_decay=inverse_linear \
     "inference_sampler.potentials.guiding_potentials=[\"type:symmetry_motif_inter_instance_distance,weight:3.0,target_distance:30.0\"]"
 ```
+
+## Reference: every new input-spec field
+
+Everything below is new on this branch (confirmed against `git diff origin/production`),
+on top of stock RFD3 fields like `contig`, `unindex`, `select_fixed_atoms`.
+All go inside a design entry in your `inputs=` JSON/YAML, alongside `contig`/`length`/etc.
+
+- **`motifs`** (`dict[str, str]`, default `None`) — named floating motif
+  definitions, `{"name": "contig_str"}`. A motif is only included if its name
+  appears in `contig`, in `sequence_unrestrained_motifs`, or via a `SymMotif`
+  placeholder.
+- **`non_fixed_contig`** (contig string or dict, default `None`) — contig of
+  atoms included in the design but not fixed in 3D space (Kabsch-aligned like
+  a motif instead). Mutually exclusive with `contig`; must not overlap
+  `unindex` or `motifs`.
+- **`sequence_unrestrained_motifs`** (`list[str]`, default `None`) — motif
+  names (from `motifs`) to append as separate floating chains when their
+  position in the scaffold isn't constrained. Only listed motifs are
+  appended; motifs placed inline via `contig` or `SymMotif` must not also
+  appear here.
+- **`unindexed_motifs`** (`list[str]`, default `None`) — motif names (from
+  `motifs`) to include on the main chain at a sampled position instead of an
+  explicit `contig` slot. Must not also appear in `contig`,
+  `sequence_unrestrained_motifs`, or a `SymMotif` assignment.
+- **`supermotifs`** (`dict[str, str | list[str]]`, default `None`) — named
+  rigid-body groups of non-connected motif fragments, Kabsch-aligned together
+  as one unit during floating motif projection. Value is either a contig
+  string or a list of names from `motifs`.
+- **`length: "auto"`** (string literal) — resolves to a `"min-max"` range
+  from an ellipsoid-volume estimate. Tuning fields (all optional floats):
+  `auto_length_default_distance` (default `50.0` Å), `auto_length_default_radius`
+  (default `20.0` Å), `auto_length_residue_volume` (default `130.0` Å³/residue),
+  `auto_length_range_fraction` (default `0.20`, i.e. ±20%).
+- **`auto` contig token** — usable inside a `contig` string (e.g.
+  `"A1-59,auto,B1-65"`) when a top-level `length` is set; resolves to the
+  remaining length after subtracting fixed motif residues and other scaffold
+  ranges.
+- **`symmetry.mode`** (`str`, default `None`) — hetero-symmetry mode for the
+  `hetero_symmetry` sampler. `"heterotypic"`: each symmetric copy engages a
+  different named motif (requires `symmetry.instances`). `"independent"`:
+  reserved for future use.
+- **`symmetry.instances`** (`dict[str, Any]`, default `None`) — per-instance
+  motif assignment for `heterotypic` mode: `{"0": ["motif_a"], "1": ["motif_b"]}`.
+- **`SymMotif`** (contig placeholder token) — inside `contig`, resolves to
+  the motif assigned to the current symmetry copy via `symmetry.instances`
+  (falling back to instance `"0"`'s motif). Requires `symmetry.id`,
+  `symmetry.instances`, and `motifs` to all be defined, and
+  `symmetry.is_symmetric_motif: false`.
+
+## Reference: every new sampler config flag
+
+All go under `inference_sampler.` (as a CLI override, `inference_sampler.<flag>=<value>`,
+or nested under `inference_sampler:` in YAML).
+
+**Sampler kind**
+- `kind` (`"default" | "symmetry" | "hetero_symmetry"`, default `"default"`)
+
+**Floating motif projection**
+- `floating_motif_project` (`bool`, default `false`) — master on/off switch.
+  CLI shorthand: bare `--floating_motif_project` (no `=True` needed).
+- `floating_motif_project_every` (`int`, default `1`) — project every N steps.
+- `floating_motif_burn_in` (`int`, default `0`) — skip projection for the
+  first N steps.
+- `floating_motif_stop_after` (`int | null`, default `null`) — stop
+  projecting after step N.
+
+**Normal symmetry**
+- `full_symmetry_stop_after` (`int | null`, default `null`) — stop full
+  homomeric symmetry projection after step N (independent of
+  `floating_motif_stop_after`).
+
+**Hetero pseudo-symmetry**
+- `hetero_post_init_symmetry` (`"interface_only" | "initialization_only"`,
+  default `"interface_only"`)
+- `hetero_projection_enabled` (`bool`, default `true`)
+- `hetero_projection_hard` (`bool`, default `false`)
+- `hetero_projection_weight` (`float`, default `1.0`)
+- `hetero_projection_start_step` (`int`, default `0`)
+- `hetero_projection_stop_after` (`int | null`, default `null`)
+- `hetero_projection_schedule` (`"constant" | "linear_decay"`, default `"constant"`)
+- `hetero_interface_distance_cutoff` (`float`, default `8.0` Å)
+- `hetero_interface_sequence_buffer` (`int`, default `2`)
+- `hetero_interface_include_sidechains` (`bool`, default `true`)
+- `hetero_motif_contact_exclusion_enabled` (`bool`, default `true`)
+- `hetero_motif_contact_distance_cutoff` (`float`, default `8.0` Å)
+- `hetero_motif_contact_sequence_buffer` (`int`, default `1`)
+- `hetero_support_enabled` (`bool`, default `true`)
+- `hetero_support_distance_cutoff` (`float`, default `12.0` Å)
+- `hetero_support_weight` (`float`, default `0.3`)
+- `hetero_support_sequence_buffer` (`int`, default `2`)
+- `hetero_recenter_enabled` (`bool`, default `true`)
+- `hetero_motif_follow_scaffold_frame` (`bool`, default `true`)
+- `hetero_debug` (`bool`, default `false`)
+- `hetero_diagnostics_interval` (`int`, default `0`)
+- `hetero_require_per_copy_floating_motifs` (`bool`, default `true`)
+- `hetero_init_floating_motifs_from_reference` (`bool`, default `true`)
+
+**Potentials** — under `inference_sampler.potentials.`
+- `enabled` (`bool`, default `false`)
+- `guiding_potentials` (`list`, default `[]`)
+- `apply_mode` (`"token_translation" | "atom" | "hybrid"`, default `"token_translation"`)
+- `atom_guidance_fraction` (`float`, default `0.25`) — used by `hybrid`.
+- `guide_scale` (`float`, default `0.25`)
+- `guide_decay` (see the 16 schedules listed above, default `"quadratic"`)
+- `guide_clip_rms` (`float`, default `0.02`)
+- `guide_start_step` (`int`, default `0`) — first step guidance is applied.
+- `guide_stop_after` (`int | null`, default `null`) — last step guidance is applied.
+- `include_atoms` (`"all" | "real" | "real_heavy" | "backbone" | "CA"`, default `"real_heavy"`)
+- `exclude_fixed_atoms` (`bool`, default `true`)
+- `exclude_virtual_atoms` (`bool`, default `true`)
+- `guide_only_generated` (`bool`, default `true`)
+- `debug` (`bool`, default `false`)
 
 ## Further reading
 

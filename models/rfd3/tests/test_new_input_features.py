@@ -292,6 +292,118 @@ def test_contig_auto_range_subtracts_max_of_other_ranges_from_both_bounds():
     )
 
 
+# ---------------------------------------------------------------------------
+# contig 'auto-gap' token tests (gap size from autocontigmap's Ca-Ca estimator,
+# not an even split of the remaining length budget)
+# ---------------------------------------------------------------------------
+
+
+def _make_two_chain_input_with_known_gap(gap_angstrom):
+    """Two-chain input (A: 20 residues, B: 15 residues) with A's last CA and B's
+    first CA placed exactly gap_angstrom apart -- everything else is unconstrained
+    jitter, since only the flanking residues' distance matters for auto-gap."""
+    aa = _make_two_chain_input()
+    rng = np.random.default_rng(1)
+    aa.coord = (rng.standard_normal((len(aa), 3)) * 2).astype(np.float32)
+    a_last_ca = (aa.chain_id == "A") & (aa.res_id == 20) & (aa.atom_name == "CA")
+    b_first_ca = (aa.chain_id == "B") & (aa.res_id == 1) & (aa.atom_name == "CA")
+    aa.coord[a_last_ca] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    aa.coord[b_first_ca] = np.array([float(gap_angstrom), 0.0, 0.0], dtype=np.float32)
+    return aa
+
+
+@pytest.mark.fast
+def test_auto_gap_token_uses_gap_estimator():
+    """A contig-level auto-gap token should resolve via the measured Ca-Ca distance,
+    not an even split of the remaining length budget."""
+    from autocontigmap import estimate_gap_fill
+
+    aa_in = _make_two_chain_input_with_known_gap(30.0)
+    spec = DesignInputSpecification(
+        atom_array_input=aa_in,
+        contig="A1-20,auto-gap,B1-15",
+        length="80-120",
+        select_fixed_atoms=False,
+    )
+    _, metadata = spec.build(return_metadata=True)
+    info = metadata["extra"]["contig_auto"]
+
+    assert len(info["auto_gap"]) == 1
+    gap = info["auto_gap"][0]
+    assert gap["prev_token"] == "A1-20"
+    assert gap["next_token"] == "B1-15"
+    assert gap["gap_angstrom"] == pytest.approx(30.0, abs=1.0)
+
+    expected_lo, expected_hi = estimate_gap_fill(gap["gap_angstrom"], 80, 120)
+    assert (gap["min"], gap["max"]) == (expected_lo, expected_hi)
+    assert info["resolved_contig"] == f"A1-20,{expected_lo}-{expected_hi},B1-15"
+
+
+@pytest.mark.fast
+def test_auto_gap_token_recomputes_length_from_motif_and_estimate():
+    """The final 'length' must come from motif residues + the gap estimate, not the
+    naive top-level length passed in (which may just be a geometric approximation
+    used only as the estimator's lookup window)."""
+    aa_in = _make_two_chain_input_with_known_gap(30.0)
+    spec = DesignInputSpecification(
+        atom_array_input=aa_in,
+        contig="A1-20,auto-gap,B1-15",
+        length="80-120",
+        select_fixed_atoms=False,
+    )
+    _, metadata = spec.build(return_metadata=True)
+    info = metadata["extra"]["contig_auto"]
+    gap = info["auto_gap"][0]
+
+    expected_min = 20 + gap["min"] + 15
+    expected_max = 20 + gap["max"] + 15
+    assert info["length"] == f"{expected_min}-{expected_max}"
+    assert info["length"] != "80-120"
+
+
+@pytest.mark.fast
+def test_auto_gap_and_auto_together():
+    """auto-gap must resolve before plain auto, so auto's remaining budget already
+    accounts for the estimated gap range as a fixed contribution."""
+    aa_in = _make_two_chain_input_with_known_gap(30.0)
+    spec = DesignInputSpecification(
+        atom_array_input=aa_in,
+        contig="A1-20,auto-gap,B1-15,auto",
+        length="100-140",
+        select_fixed_atoms=False,
+    )
+    _, metadata = spec.build(return_metadata=True)
+    info = metadata["extra"]["contig_auto"]
+    gap = info["auto_gap"][0]
+
+    fixed_budget = 20 + 15 + gap["max"]
+    assert info["fixed_budget"] == fixed_budget
+    assert info["auto_lengths"] == [f"{100 - fixed_budget}-{140 - fixed_budget}"]
+    assert "auto-gap" not in info["resolved_contig"]
+
+
+@pytest.mark.fast
+def test_auto_gap_requires_concrete_flanking_token():
+    """auto-gap needs a concrete motif token on both sides -- a scaffold range or the
+    start/end of the contig must raise, not silently misbehave."""
+    aa_in = _make_two_chain_input_with_known_gap(30.0)
+    with pytest.raises(ValueError, match="auto-gap"):
+        DesignInputSpecification(
+            atom_array_input=aa_in,
+            contig="auto-gap,A1-20,B1-15",
+            length="80-120",
+            select_fixed_atoms=False,
+        ).build(return_metadata=True)
+
+    with pytest.raises(ValueError, match="auto-gap"):
+        DesignInputSpecification(
+            atom_array_input=aa_in,
+            contig="A1-20,10-15,auto-gap,B1-15",
+            length="80-120",
+            select_fixed_atoms=False,
+        ).build(return_metadata=True)
+
+
 @pytest.mark.fast
 def test_motif_appended_as_separate_chain():
     """motifs must be appended as additional chains separate from the scaffold chain."""

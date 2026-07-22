@@ -81,7 +81,6 @@ from autocontigmap import load_pickle as load_gap_checkpoint
 
 from foundry.common import exists
 from foundry.utils.components import (
-    extract_pn_unit_info,
     fetch_mask_from_idx,
     get_design_pattern_with_constraints,
     get_motif_components_and_breaks,
@@ -275,6 +274,18 @@ def _auto_length_distance_from_potentials(
     return max(candidates) if candidates else default_distance
 
 
+def _resolve_auto_gap_distance(auto_length_potentials, auto_length_default_distance) -> float:
+    """Same target-distance approximation used by length='auto' (see
+    resolve_auto_length() / _auto_length_distance_from_potentials() below) -- shared
+    here since floating motifs are only guided toward this distance during diffusion,
+    not placed at it in the input structure, so it's the best available stand-in for
+    an 'auto-gap' token's gap distance."""
+    return _auto_length_distance_from_potentials(
+        _auto_length_guiding_potentials(auto_length_potentials),
+        default_distance=auto_length_default_distance,
+    )
+
+
 def _auto_length_radius_from_potentials(
     potential_specs: list[dict],
     *,
@@ -364,40 +375,26 @@ def _adjacent_concrete_token(parts: list[str], idx: int, offset: int) -> str:
     return token
 
 
-def _measure_auto_gap_distance(prev_token: str, next_token: str, atom_array: AtomArray) -> float:
-    """Cα-Cα distance (Å) between the motif residue nearest the gap on each side."""
-    prev_chain, _prev_start, prev_end = extract_pn_unit_info(prev_token)
-    next_chain, next_start, _next_end = extract_pn_unit_info(next_token)
-
-    prev_mask = fetch_mask_from_idx(f"{prev_chain}{prev_end}", atom_array=atom_array)
-    next_mask = fetch_mask_from_idx(f"{next_chain}{next_start}", atom_array=atom_array)
-    prev_ca = atom_array.coord[prev_mask & (atom_array.atom_name == "CA")]
-    next_ca = atom_array.coord[next_mask & (atom_array.atom_name == "CA")]
-    if len(prev_ca) == 0 or len(next_ca) == 0:
-        raise ValueError(
-            f"Contig token 'auto-gap': couldn't find a CA atom for flanking residue "
-            f"'{prev_chain}{prev_end}' or '{next_chain}{next_start}'."
-        )
-    return float(np.linalg.norm(prev_ca[0] - next_ca[0]))
-
-
 def _resolve_auto_gap_tokens(
     parts: list[str],
     auto_gap_positions: list[int],
     length_min: int,
     length_max: int,
-    atom_array: Optional[AtomArray],
+    gap_distance: float,
 ) -> list[dict]:
     """Resolve each 'auto-gap' position in `parts` in place to a concrete 'lo-hi' range,
-    estimated from the flanking motifs' real Cα-Cα distance via autocontigmap. Uses the
-    (already-resolved) length_min-length_max as the checkpoint lookup window -- e.g. the
-    geometric approximation from `length: auto`, if that's how length was specified."""
-    if atom_array is None:
-        raise ValueError(
-            "Contig token 'auto-gap' requires the loaded input structure, which wasn't "
-            "available at this call site."
-        )
+    estimated from gap_distance via autocontigmap. Uses the (already-resolved)
+    length_min-length_max as the checkpoint lookup window -- e.g. the geometric
+    approximation from `length: auto`, if that's how length was specified.
 
+    gap_distance is NOT measured from the input structure's coordinates: these are
+    floating motifs, free to move during diffusion and only guided toward a target
+    distance by potentials, so whatever distance the flanking residues happen to sit
+    at in the input PDB is arbitrary and not the design's actual gap. gap_distance is
+    instead the same guided/approximate target distance used for `length: auto`
+    itself (see _auto_length_distance_from_potentials()) -- the best approximation
+    available for "how far apart will these motifs actually end up."
+    """
     gap_size_data = load_gap_checkpoint(AUTO_GAP_CHECKPOINT)
     threshold = gap_size_percentile_threshold(
         length_min, length_max, percentile=AUTO_GAP_WARN_PERCENTILE, gap_size_data=gap_size_data
@@ -407,14 +404,13 @@ def _resolve_auto_gap_tokens(
     for idx in auto_gap_positions:
         prev_token = _adjacent_concrete_token(parts, idx, -1)
         next_token = _adjacent_concrete_token(parts, idx, +1)
-        gap_ang = _measure_auto_gap_distance(prev_token, next_token, atom_array)
         aa_low, aa_high = estimate_gap_fill(
-            gap_ang, length_min, length_max, gap_size_data=gap_size_data
+            gap_distance, length_min, length_max, gap_size_data=gap_size_data
         )
-        if threshold is not None and gap_ang > threshold:
+        if threshold is not None and gap_distance > threshold:
             logger.warning(
                 f"Contig token 'auto-gap' at position {idx} (between '{prev_token}' and "
-                f"'{next_token}'): measured gap is {gap_ang:.1f} Å, beyond the "
+                f"'{next_token}'): approximate gap is {gap_distance:.1f} Å, beyond the "
                 f"{int(AUTO_GAP_WARN_PERCENTILE * 100)}th percentile ({threshold} Å) of gap "
                 f"sizes seen in the checkpoint data for {length_min}-{length_max}-residue "
                 f"proteins -- a bigger design length range is probably necessary."
@@ -425,7 +421,7 @@ def _resolve_auto_gap_tokens(
             "position": idx,
             "prev_token": prev_token,
             "next_token": next_token,
-            "gap_angstrom": gap_ang,
+            "gap_angstrom": gap_distance,
             "min": aa_low,
             "max": aa_high,
         })
@@ -434,7 +430,7 @@ def _resolve_auto_gap_tokens(
 
 
 def _resolve_contig_auto_tokens(
-    contig: Optional[str], length: Optional[str], atom_array: Optional[AtomArray] = None
+    contig: Optional[str], length: Optional[str], gap_distance: Optional[float] = None
 ) -> tuple[Optional[str], Optional[dict]]:
     if not exists(contig):
         return contig, None
@@ -455,8 +451,14 @@ def _resolve_contig_auto_tokens(
 
     auto_gap_info = []
     if auto_gap_positions:
+        if gap_distance is None:
+            raise ValueError(
+                "Contig token 'auto-gap' requires a gap_distance (the same "
+                "guiding-potentials/auto_length_default_distance approximation used "
+                "for length='auto'), which wasn't available at this call site."
+            )
         auto_gap_info = _resolve_auto_gap_tokens(
-            resolved_parts, auto_gap_positions, length_min, length_max, atom_array
+            resolved_parts, auto_gap_positions, length_min, length_max, gap_distance
         )
 
     fixed_budget = 0
@@ -1513,7 +1515,7 @@ class DesignInputSpecification(BaseModel):
             sampling_contig, contig_auto_info = _resolve_contig_auto_tokens(
                 _design_contig,
                 effective_length,
-                atom_array_input_annotated,
+                _resolve_auto_gap_distance(self.auto_length_potentials, self.auto_length_default_distance),
             )
             sampling_length = (
                 str(contig_auto_info["length"])
@@ -2145,7 +2147,7 @@ class DesignInputSpecification(BaseModel):
             sampling_contig, _contig_auto_info = _resolve_contig_auto_tokens(
                 resolved_contig,
                 self.length,
-                atom_array_input_annotated,
+                _resolve_auto_gap_distance(self.auto_length_potentials, self.auto_length_default_distance),
             )
             sampling_length = (
                 str(_contig_auto_info["length"])
@@ -2176,7 +2178,7 @@ class DesignInputSpecification(BaseModel):
             sampling_contig, _contig_auto_info = _resolve_contig_auto_tokens(
                 resolved_contig,
                 effective_length,
-                atom_array_input_annotated,
+                _resolve_auto_gap_distance(self.auto_length_potentials, self.auto_length_default_distance),
             )
             sampling_length = (
                 str(_contig_auto_info["length"])

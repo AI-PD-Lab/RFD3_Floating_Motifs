@@ -141,6 +141,7 @@ Below is a table of all of the inputs that the `InputSpecification` accepts. Use
 | `plddt_enhanced`                                               | `bool`            | Default `True`. Enables pLDDT (predicted Local Distance Difference Test) enhancement. |
 | `is_non_loopy`                                                 | `bool \| None`            | Default `None`. If `True`/`False`, produces output structures with fewer/more loops.|
 | `partial_t`                                                    | `float`           | Noise (Å) for partial diffusion, enables partial diffusion (sets the noise level.) Recommended values are 5.0-15.0 Å. See [Partial Diffusion](#partial-diffusion) for more information. |
+| `supermotifs`                                                  | `dict[str, str \| list[str]]` | Named rigid-body super-motifs for groups of non-connected fragments. See [Super-motifs](#super-motifs) for details. |
 
 
 A few notes on the above:
@@ -261,6 +262,38 @@ Below is an example of what the output should look like (diffusion outputs in te
 :alt: Partial diffusion.
 :width: 650px
 ```
+
+(super-motifs)=
+### Super-motifs
+
+A **super-motif** groups non-connected motif fragments into a single rigid body. During floating motif projection all fragments in the group are Kabsch-aligned together as one unit, preserving their inter-fragment distances and angles. Without this, each contiguous segment is aligned independently and the relative geometry between segments is free to drift.
+
+`supermotifs` is a dictionary where each key is a name and the value is either:
+- a **list of motif names** defined in the `motifs` field, or
+- a **contig string** directly selecting residues from the input PDB.
+
+```json
+{
+    "input": "protein.pdb",
+    "motifs": {
+        "loop_1": "A1-10",
+        "loop_2": "A25-34"
+    },
+    "supermotifs": {
+        "rigid_interface": ["loop_1", "loop_2"]
+    },
+    "contig": "loop_1,15,loop_2",
+    "length": "40-50"
+}
+```
+
+Constraints:
+- All referenced residues must already be included somewhere in `contig`, `motifs`, or `non_fixed_contig`.
+- Super-motifs do not need to appear in `contig` themselves.
+- Atom sets across different super-motifs must be disjoint.
+- Floating motif projection must be enabled: `inference_sampler.floating_motif_project=True`.
+
+See `docs/examples/supermotifs_test.json` and `run_supermotifs_test.sh` for a working test example.
 
 (cif-parser-options)=
 ### CIF Parser Options

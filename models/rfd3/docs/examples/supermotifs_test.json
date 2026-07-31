@@ -1,0 +1,35 @@
+{
+    "supermotif_by_motif_names": {
+        "input": "./supermotifs_test.pdb",
+        "motifs": {
+            "loop_1": "A1-10",
+            "loop_2": "A25-34"
+        },
+        "supermotifs": {
+            "rigid_interface": ["loop_1", "loop_2"]
+        },
+        "contig": "loop_1,15,loop_2",
+        "length": "40-50"
+    },
+    "supermotif_by_contig_string": {
+        "input": "./supermotifs_test.pdb",
+        "motifs": {
+            "loop_1": "A1-10",
+            "loop_2": "A25-34"
+        },
+        "supermotifs": {
+            "rigid_interface": "A1-10,A25-34"
+        },
+        "contig": "loop_1,15,loop_2",
+        "length": "40-50"
+    },
+    "no_supermotif_baseline": {
+        "input": "./supermotifs_test.pdb",
+        "motifs": {
+            "loop_1": "A1-10",
+            "loop_2": "A25-34"
+        },
+        "contig": "loop_1,15,loop_2",
+        "length": "40-50"
+    }
+}

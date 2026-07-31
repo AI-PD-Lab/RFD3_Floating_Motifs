@@ -34,6 +34,63 @@ logging.basicConfig(level=logging.INFO)
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
 
 
+def _log_inter_motif_axis(step_num, t_hat, sources, floating_motif_refs, eps=1e-6):
+    """Log the motif->motif axis from several coordinate sources (diagnostic).
+
+    Emits one parseable ``[axis_diag] {...}`` line per step per design.  For each
+    source (e.g. the noisy post-step coordinates and the denoiser's x0
+    prediction) we record the unit vector from motif 0's centroid to motif 1's
+    centroid and that separation's length.  The reference axis from the input
+    PDB is logged too so the analysis can be done without re-reading inputs.
+
+    Purely observational: nothing here feeds back into sampling.
+    """
+    if len(floating_motif_refs) < 2:
+        return
+
+    def _axis(xyz, refs):
+        # xyz: [D, L, 3] -> unit axis [D, 3] and length [D]
+        c0 = xyz[:, refs[0].sample_atom_indices.to(xyz.device), :].mean(dim=1)
+        c1 = xyz[:, refs[1].sample_atom_indices.to(xyz.device), :].mean(dim=1)
+        d = (c1 - c0).float()
+        n = d.norm(dim=-1)
+        return d / n.clamp_min(eps).unsqueeze(-1), n
+
+    # Reference axis (constant across steps) from the stored input geometry.
+    ref_axes = []
+    for ref in floating_motif_refs[:2]:
+        m = ref.reference_atom_mask.bool() & torch.isfinite(ref.reference_xyz).all(-1)
+        ref_axes.append(ref.reference_xyz[m].float().mean(dim=0))
+    d_ref = ref_axes[1] - ref_axes[0]
+    n_ref = float(d_ref.norm())
+    u_ref = (d_ref / max(n_ref, eps)).tolist()
+
+    computed = {name: _axis(xyz, floating_motif_refs) for name, xyz in sources.items()}
+    n_designs = next(iter(computed.values()))[0].shape[0]
+
+    # Atom counts behind each centroid — these set the noise suppression
+    # (centroid noise ~ t_hat / sqrt(n)), so log them rather than assuming.
+    n_atoms = [int(r.sample_atom_indices.numel()) for r in floating_motif_refs[:2]]
+
+    for d_i in range(n_designs):
+        rec = {
+            "step": int(step_num),
+            "t_hat": round(float(t_hat), 4),
+            "design": int(d_i),
+            "n_atoms": n_atoms,
+            "ref_len": round(n_ref, 4),
+            "ref_axis": [round(v, 6) for v in u_ref],
+        }
+        for name, (u, n) in computed.items():
+            rec[f"{name}_len"] = round(float(n[d_i]), 4)
+            rec[f"{name}_axis"] = [round(float(v), 6) for v in u[d_i]]
+        # NOTE: this module's loggers do not reach the SLURM log (even
+        # ranked_logger's own "Initializing ConditionalDiffusionSampler" line is
+        # swallowed).  Print to stderr like potentials/integration.py:172 does.
+        ranked_logger.info("[axis_diag] %s", rec)
+        print(f"[axis_diag] {rec}", file=sys.stderr, flush=True)
+
+
 @dataclass(kw_only=True)
 class SampleDiffusionConfig:
     kind: Literal["default", "symmetry", "hetero_symmetry"] = "default"
@@ -69,6 +126,13 @@ class SampleDiffusionConfig:
     floating_motif_project_every: int = 1
     floating_motif_burn_in: int = 0
     floating_motif_stop_after: int | None = None
+
+    # Diagnostic only: per-step log of the inter-motif axis computed from both
+    # the post-step noisy coordinates (what potentials currently see) and the
+    # denoiser's x0 prediction.  Used to find the earliest step at which the
+    # axis is trustworthy enough to reference an orientation potential to.
+    # No effect on sampling.
+    axis_diag: bool = False
 
     # Recycling
     n_recycle: int | None = None  # Override model default n_recycle for inference
@@ -510,6 +574,31 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
 
             # Update the coordinates, scaled by the step size
             X_L = X_noisy_L + step_scale * d_t * delta_L
+
+            # ── inter-motif axis diagnostic (no effect on sampling) ───────────
+            # X_L is the noisy post-step state the potentials currently see;
+            # X_denoised_L is the model's x0 prediction for the same step.  Log
+            # the motif->motif axis from both so we can measure when each
+            # becomes a trustworthy reference direction.
+            if step_num == 0:
+                # One line per run so a silent diagnostic is self-diagnosing:
+                # tells us whether the hydra flag arrived and whether there are
+                # floating motif refs to measure an axis between.
+                print(
+                    "[axis_diag_setup] "
+                    f"axis_diag={getattr(self, 'axis_diag', None)!r} "
+                    f"n_floating_refs={len(floating_motif_refs) if floating_motif_refs else 0}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if getattr(self, "axis_diag", False) and floating_motif_refs:
+                _log_inter_motif_axis(
+                    step_num=step_num,
+                    t_hat=float(t_hat),
+                    sources={"noisy": X_L, "x0": X_denoised_L},
+                    floating_motif_refs=floating_motif_refs,
+                )
+            # ─────────────────────────────────────────────────────────────────
 
             # potential guidance hook
             # Applied after the normal sampler step, before X_L is stored.

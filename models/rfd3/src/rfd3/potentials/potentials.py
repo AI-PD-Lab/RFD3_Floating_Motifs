@@ -8,6 +8,7 @@ gradients, which are then used to update the sampler trajectory.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import torch
 
@@ -4693,6 +4694,353 @@ class MotifPairAxisDot(BasePotential):
         return transformed
 
 
+def _load_chain_atoms(
+    pdb_path: str,
+    chain_id: str,
+    atom_selection: str = "CA",
+    max_atoms: int | None = None,
+) -> torch.Tensor:
+    """Load one chain's atom coordinates from a PDB/mmCIF file.
+
+    Used by MinimalOverlapPotential to bring in chains that are never part of
+    the diffused structure -- the same situation MotifPairAxisDot documents for
+    its receptor axis ("The receptor itself is never part of the RFD3 contig or
+    the sampled structure"), just generalised from a single axis vector to a
+    full point cloud so steric overlap can be measured.
+
+    ``atom_selection``: 'CA' (default -- cheap and sufficient as a steric
+    proxy), 'backbone' (N, CA, C, O), or 'heavy' (all non-hydrogen atoms).
+    ``max_atoms``: optional uniform-stride subsample cap so a very large chain
+    can't blow up the pairwise-overlap cost; deterministic, not random.
+
+    Biotite is imported lazily here (not at module scope) so importing
+    potentials.py stays cheap for callers that never touch this potential.
+    """
+    import biotite.structure as struc
+    import biotite.structure.io as strucio
+    import numpy as np
+
+    path = Path(pdb_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"minimal_overlap chain_pdb not found: {pdb_path}")
+
+    atom_array = strucio.load_structure(str(path), model=1)
+
+    chain_mask = atom_array.chain_id == str(chain_id)
+    if atom_selection == "CA":
+        sel_mask = atom_array.atom_name == "CA"
+    elif atom_selection == "backbone":
+        sel_mask = np.isin(atom_array.atom_name, ["N", "CA", "C", "O"])
+    elif atom_selection == "heavy":
+        element = atom_array.element
+        if element is None or getattr(element, "size", 0) == 0:
+            atom_array = atom_array.copy()
+            atom_array.element = struc.infer_elements(atom_array)
+            element = atom_array.element
+        sel_mask = np.asarray(element) != "H"
+    else:
+        raise ValueError(
+            "minimal_overlap atom_selection must be one of 'CA', 'backbone', "
+            f"'heavy', got {atom_selection!r}"
+        )
+
+    coords = atom_array.coord[chain_mask & sel_mask]
+    if coords.shape[0] == 0:
+        raise ValueError(
+            f"minimal_overlap: no atoms found for chain_id={chain_id!r} "
+            f"atom_selection={atom_selection!r} in {pdb_path}"
+        )
+    if max_atoms is not None and coords.shape[0] > int(max_atoms):
+        stride = max(1, coords.shape[0] // int(max_atoms))
+        coords = coords[::stride][: int(max_atoms)]
+    return torch.as_tensor(np.asarray(coords), dtype=torch.float32)
+
+
+def _pairwise_clash_overlap(
+    xyz_a: torch.Tensor,  # [D, Na, 3]
+    xyz_b: torch.Tensor,  # [D, Nb, 3]
+    clash_distance: float,
+) -> torch.Tensor:
+    """Soft steric overlap: sum of squared sphere-overlap depths.
+
+    Zero wherever the closest a-b atom pair is >= clash_distance apart; grows
+    smoothly (gradient defined everywhere, including exactly at the cutoff) as
+    atoms interpenetrate. Not normalised by atom count -- callers combine
+    several such terms and only normalise (via `.mean()` over the batch dim)
+    at the very end, same as the rest of this file's potentials.
+    """
+    if xyz_a.shape[1] == 0 or xyz_b.shape[1] == 0:
+        return xyz_a.new_zeros(())
+    dists = torch.cdist(xyz_a, xyz_b)  # [D, Na, Nb]
+    overlap = (clash_distance - dists).clamp_min(0.0).pow(2)
+    return overlap.sum(dim=(-2, -1)).mean()
+
+
+class MinimalOverlapPotential(BasePotential):
+    """Minimise steric overlap of external chains rigidly attached to motifs.
+
+    Generalises MotifPairAxisDot's "Fake-Kabsch" trick from a single body-frame
+    axis vector to a full external chain's atom cloud. For each entry in
+    ``motif_chains`` (one motif -> one attached chain, e.g. a bound receptor or
+    other context chain that is *never* part of the diffused structure):
+
+      1. Load the chain's atoms once from ``chain_pdb`` / ``chain_id``
+         (``_load_chain_atoms``).  By default (``align=False``) these are
+         assumed already co-registered in the same coordinate frame as the
+         design's own reference/input PDB -- the common case where the chain
+         lives in the same combined input structure as the motifs, just
+         outside the contig.  Opt in with ``align=True`` (+ ``align_chain_id``)
+         when the chain instead comes from a *different* structure (the
+         MotifPairAxisDot receptor case): on first use this automatically
+         Kabsch-fits ``align_chain_id`` atoms in that same file onto the
+         motif's own reference atoms (``_kabsch_ref_to_current_rotation``),
+         automating the offline superposition that had to be done by hand to
+         produce MotifPairAxisDot's ``motif_axes``.  Either way the result is a
+         constant point cloud in the design's reference frame, cached after
+         first use (the reference geometry is fixed for the whole run, same
+         assumption ``motif_axes`` already makes).
+      2. Every step, transport that constant cloud into current-step world
+         coordinates with the *same* per-motif rigid transform that tracks the
+         motif's own atoms -- rotate about the motif's own reference COM (not
+         the chain's own centroid, which would collapse the physical offset
+         between them), then translate to the motif's current COM:
+         ``current = (chain_ref - motif_ref_com) @ R_i + current_com_i`` --
+         this is "aligning the chain to the Kabsch alignment".
+      3. Accumulate soft steric overlap (``_pairwise_clash_overlap``) (a)
+         between every pair of configured chains and (b) between each chain and
+         the rest of the currently-generated structure (``protein_atom_filter``,
+         excluding that chain's own parent motif atoms).
+
+    Returns ``-weight * total_overlap`` (maximised => overlap minimised), the
+    same sign convention as every other potential in this file.
+
+    Gradient is projected to pure rigid rotation per motif (no translation),
+    so this only ever changes *orientation* -- never fights
+    motif_distance / motif_spherical_position -- matching MotifPairAxisDot /
+    MotifPairOrientation.
+
+    Registered as both ``minimal_overlap`` and ``minimal_clashes`` (same
+    class).
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_chains: list | None = None,
+        clash_distance: float = 4.0,
+        protein_atom_filter: str = "CA",
+        chain_chain_weight: float = 1.0,
+        chain_protein_weight: float = 1.0,
+        eps: float = 1e-6,
+        debug_log: bool = False,
+    ):
+        super().__init__(weight)
+        if not motif_chains:
+            raise ValueError(
+                "minimal_overlap requires motif_chains=[{motif_index, chain_pdb, "
+                "chain_id, ...}, ...] -- the external chain(s) rigidly attached "
+                "to each floating motif whose steric overlap should be minimised"
+            )
+        resolved: list[dict] = []
+        for i, spec in enumerate(motif_chains):
+            missing = [k for k in ("motif_index", "chain_pdb", "chain_id") if k not in spec]
+            if missing:
+                raise ValueError(
+                    f"minimal_overlap: motif_chains[{i}] is missing {missing}"
+                )
+            entry = {
+                "motif_index": int(spec["motif_index"]),
+                "chain_pdb": str(spec["chain_pdb"]),
+                "chain_id": str(spec["chain_id"]),
+                "atom_selection": str(spec.get("atom_selection", "CA")),
+                "max_atoms": spec.get("max_atoms"),
+                "align": bool(spec.get("align", False)),
+                "align_chain_id": spec.get("align_chain_id"),
+                "align_atom_selection": str(spec.get("align_atom_selection", "CA")),
+            }
+            if entry["align"] and not entry["align_chain_id"]:
+                raise ValueError(
+                    f"minimal_overlap: motif_chains[{i}] sets align=True but is "
+                    "missing 'align_chain_id'"
+                )
+            resolved.append(entry)
+        self.motif_chains = resolved
+
+        valid_filters = ("all", "real", "potential", "backbone", "CA")
+        if protein_atom_filter not in valid_filters:
+            raise ValueError(
+                f"minimal_overlap protein_atom_filter must be one of {valid_filters}"
+            )
+        self.protein_atom_filter = protein_atom_filter
+        self.clash_distance = float(clash_distance)
+        self.chain_chain_weight = float(chain_chain_weight)
+        self.chain_protein_weight = float(chain_protein_weight)
+        self.eps = float(eps)
+        self.debug_log = bool(debug_log)
+
+        # Populated lazily on first compute(): per-entry constant chain point
+        # cloud, expressed in the *design's* reference frame (same frame as
+        # ref_xyz_i -- NOT re-centred on the chain's own centroid, since the
+        # whole point is to preserve the chain's physical offset from its
+        # parent motif). Loading and the optional offline alignment only need
+        # to happen once -- the reference geometry is constant across the
+        # batch and across the whole trajectory.
+        self._chain_ref_xyz: dict[int, torch.Tensor] = {}
+        self.skip_reason: str | None = None
+        self.skip_detail: dict | None = None
+
+    def _resolve_chain_ref_xyz(self, idx, spec, ref_xyz_i, device, dtype):
+        if idx in self._chain_ref_xyz:
+            return self._chain_ref_xyz[idx]
+
+        chain_xyz = _load_chain_atoms(
+            spec["chain_pdb"], spec["chain_id"], spec["atom_selection"], spec["max_atoms"]
+        ).to(device=device, dtype=dtype)
+
+        if spec["align"]:
+            align_xyz = _load_chain_atoms(
+                spec["chain_pdb"], spec["align_chain_id"], spec["align_atom_selection"], None
+            ).to(device=device, dtype=dtype)
+            if align_xyz.shape[0] != ref_xyz_i.shape[0]:
+                raise ValueError(
+                    f"minimal_overlap: motif_chains[{idx}] align_chain_id="
+                    f"{spec['align_chain_id']!r} has {align_xyz.shape[0]} atoms "
+                    f"but the design's motif reference has {ref_xyz_i.shape[0]} "
+                    "-- align_atom_selection must produce a 1:1 atom "
+                    "correspondence (same count and order) with the contig "
+                    "motif block"
+                )
+            R_align = _kabsch_ref_to_current_rotation(
+                align_xyz, ref_xyz_i.unsqueeze(0), self.eps
+            )
+            if R_align is None:
+                raise ValueError(
+                    f"minimal_overlap: motif_chains[{idx}] offline alignment is "
+                    "degenerate (too few or co-linear align atoms)"
+                )
+            align_com = align_xyz.mean(dim=0)
+            chain_xyz = (chain_xyz - align_com) @ R_align[0] + ref_xyz_i.mean(dim=0)
+
+        self._chain_ref_xyz[idx] = chain_xyz
+        return chain_xyz
+
+    def compute(self, xyz, masks, metadata):
+        self.skip_reason = None
+        self.skip_detail = None
+
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        self.skip_detail = {"n_motif_blocks": len(motif_blocks)}
+        if not motif_blocks:
+            self.skip_reason = "no_motif_blocks"
+            return xyz.new_zeros(())
+
+        device, dtype = xyz.device, xyz.dtype
+        current_chains: list[torch.Tensor] = []  # transported to this step, [D, N, 3]
+        own_motif_masks: list[torch.Tensor] = []
+
+        for idx, spec in enumerate(self.motif_chains):
+            motif_i = spec["motif_index"]
+            if motif_i < 0 or motif_i >= len(motif_blocks):
+                self.skip_reason = f"motif_chains_{idx}_index_out_of_range"
+                continue
+            block_mask = motif_blocks[motif_i]
+            current_xyz_i, ref_xyz_i = _motif_block_current_and_reference_xyz(
+                xyz, masks, metadata, block_mask
+            )
+            if current_xyz_i is None or ref_xyz_i is None or ref_xyz_i.shape[0] < 3:
+                self.skip_reason = f"motif_chains_{idx}_coords_missing"
+                continue
+            R = _kabsch_ref_to_current_rotation(ref_xyz_i, current_xyz_i, self.eps)
+            if R is None:
+                self.skip_reason = f"motif_chains_{idx}_frame_degenerate"
+                continue
+
+            chain_ref_xyz = self._resolve_chain_ref_xyz(idx, spec, ref_xyz_i, device, dtype)
+            motif_ref_com = ref_xyz_i.mean(dim=0)  # [3] -- the pivot, not the chain's own COM
+            current_com_i = current_xyz_i.mean(dim=1)  # [D, 3]
+            # "Align the additional chain to this Kabsch alignment": the same
+            # per-motif rigid transform that tracks the motif's own atoms
+            # (rotate about the motif's reference COM, translate to its
+            # current COM) is applied to the chain's constant body-frame
+            # point cloud, preserving its physical offset from the motif.
+            transported = (
+                (chain_ref_xyz - motif_ref_com).unsqueeze(0) @ R
+            ) + current_com_i.unsqueeze(1)  # [D, N_chain, 3]
+            current_chains.append(transported)
+            own_motif_masks.append(block_mask)
+
+        if len(current_chains) == 0:
+            self.skip_reason = self.skip_reason or "no_active_chains"
+            return xyz.new_zeros(())
+
+        total = xyz.new_zeros(())
+        n_terms = 0
+
+        # (a) chain vs chain
+        for i in range(len(current_chains)):
+            for j in range(i + 1, len(current_chains)):
+                total = total + self.chain_chain_weight * _pairwise_clash_overlap(
+                    current_chains[i], current_chains[j], self.clash_distance
+                )
+                n_terms += 1
+
+        # (b) chain vs the rest of the currently-generated structure (own
+        # parent motif excluded -- a chain rigidly riding on its motif isn't
+        # meaningfully "clashing" with the thing it's attached to)
+        protein_mask = _atom_filter_mask(self.protein_atom_filter, masks, device)
+        for i, chain_xyz in enumerate(current_chains):
+            other_mask = protein_mask & ~own_motif_masks[i]
+            other_xyz = xyz[:, other_mask, :]
+            total = total + self.chain_protein_weight * _pairwise_clash_overlap(
+                chain_xyz, other_xyz, self.clash_distance
+            )
+            n_terms += 1
+
+        if self.debug_log:
+            print(
+                "[minimal_overlap] "
+                + repr({"total_overlap": round(float(total), 4), "n_terms": n_terms}),
+                file=sys.stderr,
+                flush=True,
+            )
+
+        return -self.weight * total
+
+    def guide_atom_mask(self, masks, metadata, device):
+        motif_blocks = _motif_distance_blocks(masks, metadata, device)
+        if not motif_blocks:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        guide_mask = torch.zeros_like(motif_blocks[0], dtype=torch.bool, device=device)
+        for spec in self.motif_chains:
+            motif_i = spec["motif_index"]
+            if 0 <= motif_i < len(motif_blocks):
+                guide_mask = guide_mask | motif_blocks[motif_i]
+        return guide_mask
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        if not motif_blocks:
+            return torch.zeros_like(atom_grad)
+        transformed = torch.zeros_like(atom_grad)
+        seen: set[int] = set()
+        for spec in self.motif_chains:
+            motif_i = spec["motif_index"]
+            if not (0 <= motif_i < len(motif_blocks)) or motif_i in seen:
+                continue
+            seen.add(motif_i)
+            block_mask = motif_blocks[motif_i]
+            if block_mask.sum().item() < 3:
+                continue
+            transformed[:, block_mask, :] = _project_gradient_to_rigid_body(
+                atom_grad[:, block_mask, :],
+                xyz[:, block_mask, :],
+                allow_translation=False,
+                allow_rotation=True,
+            )
+        return transformed
+
+
 POTENTIAL_REGISTRY: dict[str, type[BasePotential]] = {
     "binder_ROG": BinderROG,
     "monomer_ROG": MonomerROG,
@@ -4715,6 +5063,8 @@ POTENTIAL_REGISTRY: dict[str, type[BasePotential]] = {
     "motif_forbidden_radial_orientation_compact": MotifForbiddenRadialOrientationCompact,
     "motif_pair_orientation": MotifPairOrientation,
     "motif_pair_axis_dot": MotifPairAxisDot,
+    "minimal_overlap": MinimalOverlapPotential,
+    "minimal_clashes": MinimalOverlapPotential,
     "symmetry_motif_distance": SymmetryAwareMotifDistance,
     "symmetry_motif_bridge": SymmetryAwareMotifBridge,
     "symmetry_single_motif_bridge": SymmetryAwareSingleMotifBridge,

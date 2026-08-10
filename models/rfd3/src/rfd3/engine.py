@@ -35,6 +35,7 @@ from rfd3.utils.io import (
     extract_example_id_from_path,
     find_files_with_extension,
 )
+from rfd3.utils.receptor_grafting import graft_receptor_chains
 
 logging.basicConfig(level=logging.INFO)
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
@@ -326,13 +327,23 @@ class RFD3InferenceEngine(BaseInferenceEngine):
                 denoised_trajectory_stack = None
                 noisy_trajectory_stack = None
 
+            prediction_metadata_idx = (
+                output_val["prediction_metadata"][idx]
+                if self.dump_prediction_metadata_json
+                else {}
+            )
+            atom_array_i = graft_receptor_chains(
+                output_val["predicted_atom_array_stack"][idx],
+                (self.inference_sampler_overrides.get("potentials") or {}).get(
+                    "guiding_potentials", []
+                ),
+                prediction_metadata_idx.get("diffused_index_map"),
+            )
             outputs.append(
                 RFD3Output(
                     example_id=f"{pipeline_output['example_id']}_model_{idx}",
-                    atom_array=output_val["predicted_atom_array_stack"][idx],
-                    metadata=output_val["prediction_metadata"][idx]
-                    if self.dump_prediction_metadata_json
-                    else {},
+                    atom_array=atom_array_i,
+                    metadata=prediction_metadata_idx,
                     denoised_trajectory_stack=denoised_trajectory_stack,
                     noisy_trajectory_stack=noisy_trajectory_stack,
                 )

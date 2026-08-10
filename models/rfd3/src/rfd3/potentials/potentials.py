@@ -5239,7 +5239,16 @@ class TargetAnchorDistance(BasePotential):
         anchor_ref = self._resolve_anchor_ref(idx, spec, ref_xyz_i, device, dtype)
         motif_ref_com = ref_xyz_i.mean(dim=0)
         current_com_i = current_xyz_i.mean(dim=1)  # [D, 3]
-        anchor_current = (anchor_ref - motif_ref_com) @ R[0] + current_com_i  # [D, 3]
+        # R is [D, 3, 3] -- genuinely different per design in the batch (each
+        # design has its own current pose). The offset must be rotated by
+        # EACH design's own R, not a single shared one -- broadcast [1, 1, 3]
+        # against [D, 3, 3] to get a per-design [D, 1, 3] result, mirroring
+        # MinimalOverlapPotential's own (chain_ref_xyz - motif_ref_com).unsqueeze(0) @ R
+        # pattern. A prior version of this line used R[0] (design 0's
+        # rotation only) for every design in the batch -- correct only by
+        # coincidence when D=1, and silently wrong for D>1.
+        anchor_offset = (anchor_ref - motif_ref_com).unsqueeze(0).unsqueeze(0)  # [1, 1, 3]
+        anchor_current = (anchor_offset @ R).squeeze(1) + current_com_i  # [D, 3]
         return anchor_current, block_mask
 
     def compute(self, xyz, masks, metadata):

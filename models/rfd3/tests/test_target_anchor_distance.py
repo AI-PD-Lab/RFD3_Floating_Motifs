@@ -185,6 +185,79 @@ def test_target_anchor_distance_transports_receptor_anchor_with_motif(tmp_path):
 
 
 @pytest.mark.fast
+def test_target_anchor_distance_uses_each_designs_own_rotation(tmp_path):
+    """Regression test for a real bug: _transported_anchor used R[0] (design
+    0's own per-step Kabsch rotation) for every design in the batch, instead
+    of each design's own rotation. Only detectable with D>=2 -- every other
+    test in this file uses D=1 (`.unsqueeze(0)`), where R[0] is indistinguishable
+    from correct behavior. Build 2 designs (D=2) with DIFFERENT rigid
+    transforms applied to the SAME motif reference, and verify each design's
+    anchor lands according to ITS OWN transform, not design 0's for both."""
+    rng = np.random.default_rng(4)
+    masks, metadata, motif0_ref, motif1_ref = _two_motif_setup()
+
+    # Two independent rigid transforms per motif -- one per design in the batch.
+    r0_a, r0_b = _random_rotation(rng), _random_rotation(rng)
+    r1_a, r1_b = _random_rotation(rng), _random_rotation(rng)
+    com0_a, com0_b = np.array([10.0, 0.0, 0.0]), np.array([-40.0, 15.0, 5.0])
+    com1_a, com1_b = np.array([0.0, 20.0, 0.0]), np.array([25.0, -10.0, 30.0])
+
+    def transform(ref, r, com):
+        return (ref.numpy() - ref.numpy().mean(axis=0)) @ r + com
+
+    motif0_a, motif0_b = transform(motif0_ref, r0_a, com0_a), transform(motif0_ref, r0_b, com0_b)
+    motif1_a, motif1_b = transform(motif1_ref, r1_a, com1_a), transform(motif1_ref, r1_b, com1_b)
+
+    xyz = torch.as_tensor(
+        np.stack(
+            [
+                np.concatenate([motif0_a, motif1_a], axis=0),
+                np.concatenate([motif0_b, motif1_b], axis=0),
+            ],
+            axis=0,
+        ),
+        dtype=torch.float32,
+    )  # [2, 8, 3] -- D=2
+
+    lever0 = np.array([3.0, 1.0, 0.0])
+    lever1 = np.array([0.0, 4.0, 2.0])
+    anchor0 = motif0_ref.numpy().mean(axis=0) + lever0
+    anchor1 = motif1_ref.numpy().mean(axis=0) + lever1
+    chain_pdb0 = _save_chain_pdb(tmp_path, "rg", [("B", 1, "CA", anchor0)])
+    chain_pdb1 = _save_chain_pdb(tmp_path, "rh", [("C", 1, "CA", anchor1)])
+
+    pot = TargetAnchorDistance(
+        weight=1.0,
+        target_distance=0.0,
+        motif_chains=[
+            {"motif_index": 0, "chain_pdb": chain_pdb0, "chain_id": "B", "target_residue": 1},
+            {"motif_index": 1, "chain_pdb": chain_pdb1, "chain_id": "C", "target_residue": 1},
+        ],
+    )
+    anchor0_current, _ = pot._transported_anchor(
+        0, pot.motif_chains[0], xyz, masks, metadata, xyz.device, xyz.dtype
+    )
+    anchor1_current, _ = pot._transported_anchor(
+        1, pot.motif_chains[1], xyz, masks, metadata, xyz.device, xyz.dtype
+    )
+
+    expected0_a = lever0 @ r0_a + com0_a
+    expected0_b = lever0 @ r0_b + com0_b
+    expected1_a = lever1 @ r1_a + com1_a
+    expected1_b = lever1 @ r1_b + com1_b
+
+    assert torch.allclose(anchor0_current[0], torch.as_tensor(expected0_a, dtype=torch.float32), atol=1e-3)
+    assert torch.allclose(anchor0_current[1], torch.as_tensor(expected0_b, dtype=torch.float32), atol=1e-3)
+    assert torch.allclose(anchor1_current[0], torch.as_tensor(expected1_a, dtype=torch.float32), atol=1e-3)
+    assert torch.allclose(anchor1_current[1], torch.as_tensor(expected1_b, dtype=torch.float32), atol=1e-3)
+    # the two designs' transforms are deliberately different -- if design 1
+    # accidentally used design 0's rotation (the bug), these would be equal
+    # to anchor0_current's OWN cross-design pair instead of their true values.
+    assert not torch.allclose(anchor0_current[1], torch.as_tensor(expected0_a, dtype=torch.float32), atol=1e-2)
+    assert not torch.allclose(anchor1_current[1], torch.as_tensor(expected1_a, dtype=torch.float32), atol=1e-2)
+
+
+@pytest.mark.fast
 def test_target_anchor_distance_align_false_is_wrong_when_frame_shifted(tmp_path):
     """Sanity guard: with align=False, a raw anchor point from a genuinely
     shifted frame must NOT happen to give the same (correct) answer -- proves

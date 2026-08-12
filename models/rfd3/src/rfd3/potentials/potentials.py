@@ -4566,10 +4566,31 @@ class MotifPairAxisDot(BasePotential):
     antiparallel extreme and zero at the target.  Bounded and dimensionless
     ((dot-target)^2 <= ~4), so `weight` is a plain gain with no Angstrom^2 scale.
 
-    ``motif_axes`` gives the two body-frame axis unit vectors, in motif-block
-    (contig) order.  ``target_dot`` defaults to a_i . a_j, which is the input
-    geometry's own dot product -- so R = I reproduces the control exactly and no
-    separate target has to be supplied.
+    ``motif_axes`` gives the two body-frame axis unit vectors directly, in
+    motif-block (contig) order -- computed offline by hand from a reference
+    structure. As an alternative, ``motif_chains`` computes the same body-frame
+    vectors internally: each entry is ``{motif_index, chain_pdb, chain_id,
+    receptor_residues: [proximal_resid, distal_resid], align, align_chain_id,
+    align_atom_selection}`` -- the same shape as MinimalOverlapPotential's own
+    ``motif_chains`` (chain_pdb is never part of the diffused structure or
+    necessarily even the design's own input PDB, see that class's docstring).
+    ``receptor_residues``' two residues' CA atoms (``atom_name`` overrides "CA")
+    give a raw-frame vector ``distal - proximal``; with ``align=True`` that
+    vector is rotated (translation does not apply to a direction) by the same
+    offline Kabsch fit ``align_chain_id`` -> the design's own motif reference
+    already uses elsewhere in this file, landing it in the motif's body frame
+    with no further correction needed. Exactly one of ``motif_axes`` /
+    ``motif_chains`` must be given. ``target_dot`` defaults to a_i . a_j, which
+    is the input geometry's own dot product -- so R = I reproduces the control
+    exactly and no separate target has to be supplied.
+
+    ``motif_i`` / ``motif_j`` select which two motif blocks (in contig order)
+    are being compared. With ``motif_chains``, this is redundant with each
+    entry's own ``motif_index`` and does not need to be given -- it is derived
+    automatically from ``motif_chains``' two ``motif_index`` values (in list
+    order). Only needed explicitly when using ``motif_axes`` (default 0, 1),
+    or to override the derived values (which must then still match one of
+    ``motif_chains``' own ``motif_index`` entries).
 
     Gradient is projected to pure rigid rotation per motif (no translation), so
     this never fights motif_distance / motif_spherical_position.
@@ -4579,19 +4600,87 @@ class MotifPairAxisDot(BasePotential):
         self,
         weight: float = 1.0,
         motif_axes: list | None = None,
-        motif_i: int = 0,
-        motif_j: int = 1,
+        motif_chains: list | None = None,
+        motif_i: int | None = None,
+        motif_j: int | None = None,
         target_dot: float | None = None,
         eps: float = 1e-6,
         debug_log: bool = False,
     ):
         super().__init__(weight)
-        if motif_axes is None or len(motif_axes) < 2:
+        if (motif_axes is None) == (motif_chains is None):
             raise ValueError(
-                "motif_pair_axis_dot requires motif_axes=[[x,y,z],[x,y,z]] -- the "
-                "receptor axis unit vectors in each motif's body frame"
+                "motif_pair_axis_dot requires exactly one of motif_axes=[[x,y,z],"
+                "[x,y,z]] (the receptor axis unit vectors in each motif's body "
+                "frame, given directly) or motif_chains=[{motif_index, chain_pdb, "
+                "chain_id, receptor_residues: [proximal_resid, distal_resid], "
+                "...}, {...}] (computed internally from two residues per motif)"
             )
-        self.motif_axes = [[float(c) for c in a[:3]] for a in motif_axes[:2]]
+        if motif_axes is not None:
+            if len(motif_axes) < 2:
+                raise ValueError("motif_pair_axis_dot: motif_axes needs 2 entries")
+            self.motif_axes = [[float(c) for c in a[:3]] for a in motif_axes[:2]]
+            self._motif_chain_by_index = None
+            # motif_i/motif_j have no self-describing source here (motif_axes
+            # is just 2 raw vectors, positionally paired) -- default to the
+            # historical 0/1 convention, same as before this param became
+            # optional.
+            motif_i = 0 if motif_i is None else motif_i
+            motif_j = 1 if motif_j is None else motif_j
+        else:
+            if len(motif_chains) != 2:
+                raise ValueError(
+                    "motif_pair_axis_dot: motif_chains must have exactly 2 entries "
+                    f"(one per motif), got {len(motif_chains)}"
+                )
+            resolved: dict[int, dict] = {}
+            for i, spec in enumerate(motif_chains):
+                missing = [
+                    k for k in ("motif_index", "chain_pdb", "chain_id", "receptor_residues")
+                    if k not in spec
+                ]
+                if missing:
+                    raise ValueError(f"motif_pair_axis_dot: motif_chains[{i}] is missing {missing}")
+                residues = spec["receptor_residues"]
+                if len(residues) != 2:
+                    raise ValueError(
+                        f"motif_pair_axis_dot: motif_chains[{i}] receptor_residues "
+                        "must be [proximal_resid, distal_resid] (exactly 2)"
+                    )
+                entry = {
+                    "chain_pdb": str(spec["chain_pdb"]),
+                    "chain_id": str(spec["chain_id"]),
+                    "proximal_residue": int(residues[0]),
+                    "distal_residue": int(residues[1]),
+                    "atom_name": str(spec.get("atom_name", "CA")),
+                    "align": bool(spec.get("align", False)),
+                    "align_chain_id": spec.get("align_chain_id"),
+                    "align_atom_selection": str(spec.get("align_atom_selection", "CA")),
+                }
+                if entry["align"] and not entry["align_chain_id"]:
+                    raise ValueError(
+                        f"motif_pair_axis_dot: motif_chains[{i}] sets align=True "
+                        "but is missing 'align_chain_id'"
+                    )
+                resolved[int(spec["motif_index"])] = entry
+            self.motif_axes = None
+            self._motif_chain_by_index = resolved
+            # motif_chains already self-describes which two motif blocks are
+            # being compared via each entry's own motif_index -- redundant to
+            # also require motif_i/motif_j. Derive them (in the given list's
+            # order) when not explicitly overridden; if they ARE given, they
+            # must actually match one of the motif_chains entries or the
+            # later dict lookup in _resolve_axis would silently make no sense.
+            derived_i, derived_j = (int(spec["motif_index"]) for spec in motif_chains)
+            motif_i = derived_i if motif_i is None else motif_i
+            motif_j = derived_j if motif_j is None else motif_j
+            if motif_i not in resolved or motif_j not in resolved:
+                raise ValueError(
+                    f"motif_pair_axis_dot: motif_i={motif_i}, motif_j={motif_j} must "
+                    f"each match one of motif_chains' own motif_index values "
+                    f"({sorted(resolved)})"
+                )
+        self._axis_cache: dict[int, torch.Tensor] = {}
         self.motif_i = int(motif_i)
         self.motif_j = int(motif_j)
         self.target_dot = None if target_dot is None else float(target_dot)
@@ -4600,9 +4689,50 @@ class MotifPairAxisDot(BasePotential):
         self.skip_reason: str | None = None
         self.skip_detail: dict | None = None
 
-    def _axes(self, device, dtype):
-        a = torch.tensor(self.motif_axes, device=device, dtype=dtype)  # [2, 3]
-        return a / a.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+    def _resolve_axis(self, slot, motif_i, ref_xyz_i, device, dtype):
+        if self.motif_axes is not None:
+            a = torch.tensor(self.motif_axes[slot], device=device, dtype=dtype)
+            return a / a.norm().clamp_min(self.eps)
+
+        if motif_i in self._axis_cache:
+            return self._axis_cache[motif_i]
+        spec = self._motif_chain_by_index[motif_i]
+        proximal = _load_chain_residue_atom(
+            spec["chain_pdb"], spec["chain_id"], spec["proximal_residue"], spec["atom_name"]
+        ).to(device=device, dtype=dtype)
+        distal = _load_chain_residue_atom(
+            spec["chain_pdb"], spec["chain_id"], spec["distal_residue"], spec["atom_name"]
+        ).to(device=device, dtype=dtype)
+        raw_vector = distal - proximal
+
+        if spec["align"]:
+            align_xyz = _load_chain_atoms(
+                spec["chain_pdb"], spec["align_chain_id"], spec["align_atom_selection"], None
+            ).to(device=device, dtype=dtype)
+            if align_xyz.shape[0] != ref_xyz_i.shape[0]:
+                raise ValueError(
+                    f"motif_pair_axis_dot: motif_chains[motif_index={motif_i}] "
+                    f"align_chain_id={spec['align_chain_id']!r} has "
+                    f"{align_xyz.shape[0]} atoms but the design's motif reference "
+                    f"has {ref_xyz_i.shape[0]} -- align_atom_selection must "
+                    "produce a 1:1 atom correspondence (same count and order) "
+                    "with the contig motif block"
+                )
+            R_align = _kabsch_ref_to_current_rotation(align_xyz, ref_xyz_i.unsqueeze(0), self.eps)
+            if R_align is None:
+                raise ValueError(
+                    f"motif_pair_axis_dot: motif_chains[motif_index={motif_i}] "
+                    "offline alignment is degenerate (too few or co-linear "
+                    "align atoms)"
+                )
+            # A vector (unlike a point) transforms by rotation alone -- the
+            # translation/COM terms MinimalOverlapPotential's own point-based
+            # align needs cancel out exactly when differencing two points.
+            raw_vector = raw_vector @ R_align[0]
+
+        axis = raw_vector / raw_vector.norm().clamp_min(self.eps)
+        self._axis_cache[motif_i] = axis
+        return axis
 
     def compute(self, xyz, masks, metadata):
         self.skip_reason = None
@@ -4618,13 +4748,7 @@ class MotifPairAxisDot(BasePotential):
             self.skip_reason = "motif_index_out_of_range"
             return xyz.new_zeros(())
 
-        axes = self._axes(xyz.device, xyz.dtype)  # [2, 3]
-        target = (
-            float((axes[0] * axes[1]).sum())
-            if self.target_dot is None
-            else self.target_dot
-        )
-
+        axes = []
         vecs = []
         for slot, motif_i in enumerate((self.motif_i, self.motif_j)):
             block_mask = motif_blocks[motif_i]
@@ -4638,9 +4762,17 @@ class MotifPairAxisDot(BasePotential):
             if R is None:
                 self.skip_reason = f"motif_{motif_i}_frame_degenerate"
                 return xyz.new_zeros(())
+            axis = self._resolve_axis(slot, motif_i, ref_xyz_i, xyz.device, xyz.dtype)
+            axes.append(axis)
             # Row convention: a vector in the reference frame maps to a @ R.
-            v = torch.einsum("j,djk->dk", axes[slot], R)  # [D, 3]
+            v = torch.einsum("j,djk->dk", axis, R)  # [D, 3]
             vecs.append(v / v.norm(dim=-1, keepdim=True).clamp_min(self.eps))
+
+        target = (
+            float((axes[0] * axes[1]).sum())
+            if self.target_dot is None
+            else self.target_dot
+        )
 
         dot = (vecs[0] * vecs[1]).sum(dim=-1).clamp(-1.0, 1.0)  # [D]
         loss = (dot - target).pow(2)

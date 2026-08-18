@@ -34,6 +34,33 @@ class FloatingMotifReference:
     reference_xyz: torch.Tensor
     reference_atom_mask: torch.Tensor
     source_components: tuple[str, ...] = ()
+    # Per-sample-atom original residue id (parsed from src_component, e.g.
+    # "D3" -> 3), aligned 1:1 with sample_atom_indices; -1 where unparseable.
+    # Lets a downstream align step map a contig motif block back to the exact
+    # residues to select on an external align/receptor chain.
+    source_res_ids: torch.Tensor | None = None
+
+
+_SRC_COMPONENT_RESID_RE = re.compile(r"^[A-Za-z]+(-?\d+)")
+
+
+def _res_ids_from_src_components(src_component_values) -> np.ndarray:
+    """Parse the integer residue id out of each src_component identifier
+    (e.g. "D3" -> 3, "A56" -> 56); returns -1 for any value that doesn't parse.
+
+    src_component is RFD3's original per-atom {chain}{res_id} identifier (the
+    same key space as diffused_index_map). Carrying the residue id forward lets
+    a potential narrow an align/receptor chain that spans MORE residues than the
+    contig kept (e.g. a full-length receptor template) down to the contig
+    motif's residues, before the atom-for-atom Kabsch fit that requires a strict
+    1:1 correspondence.
+    """
+    out = np.full(len(src_component_values), -1, dtype=np.int64)
+    for i, value in enumerate(src_component_values):
+        match = _SRC_COMPONENT_RESID_RE.match(str(value))
+        if match:
+            out[i] = int(match.group(1))
+    return out
 
 
 def annotate_floating_motif_reference_coords(atom_array: struc.AtomArray):
@@ -165,6 +192,10 @@ def build_floating_motif_references_from_contigs(
                     source_components=tuple(
                         dict.fromkeys(str(c) for c in src_components[sm_atom_indices])
                     ),
+                    source_res_ids=torch.as_tensor(
+                        _res_ids_from_src_components(src_components[sm_atom_indices]),
+                        dtype=torch.long,
+                    ),
                 )
             )
             supermotif_src_components.update(str(c) for c in src_components[sm_mask])
@@ -190,6 +221,10 @@ def build_floating_motif_references_from_contigs(
                 ).bool(),
                 source_components=tuple(
                     dict.fromkeys(str(x) for x in src_components[atom_indices_np])
+                ),
+                source_res_ids=torch.as_tensor(
+                    _res_ids_from_src_components(src_components[atom_indices_np]),
+                    dtype=torch.long,
                 ),
             )
         )

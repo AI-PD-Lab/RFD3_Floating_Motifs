@@ -134,6 +134,7 @@ def graft_receptor_chains(
         return atom_array
 
     blocks = _motif_blocks_from_diffused_index_map(atom_array, diffused_index_map)
+    block_orig_resids = _motif_block_orig_resids(diffused_index_map)
     _log(f"detected {len(blocks)} motif block(s), sizes {[len(b) for b in blocks]}")
     if blocks and max(len(b) for b in blocks) > _MAX_PLAUSIBLE_BLOCK_FRACTION * len(
         atom_array
@@ -198,7 +199,14 @@ def graft_receptor_chains(
         # selection needed.
         ca_ref_xyz = ref_xyz if spec.get("align") else None
 
-        receptor_aa = _transport_receptor_chain(spec, ref_xyz, cur_xyz, ca_ref_xyz)
+        motif_res_ids = (
+            block_orig_resids[motif_i]
+            if 0 <= motif_i < len(block_orig_resids)
+            else None
+        )
+        receptor_aa = _transport_receptor_chain(
+            spec, ref_xyz, cur_xyz, ca_ref_xyz, motif_res_ids
+        )
         if receptor_aa is None:
             continue
 
@@ -281,6 +289,34 @@ def _motif_blocks_from_diffused_index_map(
     return blocks
 
 
+def _motif_block_orig_resids(
+    diffused_index_map: dict[str, str]
+) -> list[set[int]]:
+    """Original residue ids per motif block, grouped by ORIGINAL chain in
+    first-appearance (contig) order -- index-parallel to
+    `_motif_blocks_from_diffused_index_map` (same grouping, same order).
+
+    These are the residues the contig actually kept. Restricting `align_chain_id`
+    to them lets the offline alignment fit succeed when the align chain (e.g. a
+    full-length receptor-template chain) spans residues the contig trimmed away;
+    without it the whole-chain count won't match the motif block and the
+    alignment correction is silently skipped, grafting the receptor in the
+    chain_pdb's raw (un-re-registered) frame.
+    """
+    order: list[str] = []
+    resids_by_orig_chain: dict[str, set[int]] = {}
+    for orig_key in diffused_index_map:
+        parsed = _parse_chain_resid(orig_key)
+        if parsed is None:
+            continue
+        orig_chain, orig_resid = parsed
+        if orig_chain not in resids_by_orig_chain:
+            resids_by_orig_chain[orig_chain] = set()
+            order.append(orig_chain)
+        resids_by_orig_chain[orig_chain].add(orig_resid)
+    return [resids_by_orig_chain[chain] for chain in order]
+
+
 def _select_atoms(atom_array: AtomArray, selection: str) -> np.ndarray:
     """Boolean atom mask for 'CA' / 'backbone' / 'heavy' / 'all', mirroring
     potentials.py's `_load_chain_atoms` selection semantics exactly -- needed
@@ -316,6 +352,7 @@ def _transport_receptor_chain(
     ref_xyz: np.ndarray,
     cur_xyz: np.ndarray,
     ca_ref_xyz: np.ndarray | None = None,
+    motif_res_ids: set[int] | None = None,
 ) -> AtomArray | None:
     """Mirrors MinimalOverlapPotential's own `align`/`align_chain_id` offline
     registration (potentials.py's `_resolve_chain_ref_xyz`): by default
@@ -416,6 +453,17 @@ def _transport_receptor_chain(
         else:
             chain_mask_align = np.asarray(full.chain_id) == align_chain_id
             align_mask = chain_mask_align & _select_atoms(full, align_sel)
+            # Restrict the align chain to exactly the contig motif's residues.
+            # ca_ref_xyz is the motif block (only the residues the contig kept);
+            # an align chain that carries extra residues (e.g. a full-length
+            # receptor-template chain) would otherwise fail the 1:1 count check
+            # below and silently skip the alignment correction. Matches on
+            # res_id, which is shared because align_chain_id and the motif come
+            # from the same source numbering.
+            if motif_res_ids is not None:
+                align_mask = align_mask & np.isin(
+                    np.asarray(full.res_id), sorted(motif_res_ids)
+                )
             align_xyz_np = np.asarray(full.coord)[align_mask]
             if align_xyz_np.shape[0] != ca_ref_xyz.shape[0]:
                 _log(

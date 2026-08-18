@@ -3936,6 +3936,32 @@ def _motif_block_current_and_reference_xyz(
     return current_xyz[:, valid, :], ref_xyz[valid]
 
 
+def _motif_block_res_ids(
+    metadata: dict,
+    block_mask: torch.Tensor,
+) -> "set[int] | None":
+    """Original residue ids of one contig motif block, from
+    ``metadata['motif_atom_res_id']`` (populated by the potentials adapter from
+    each floating-motif reference's src_component).
+
+    Returns None when the mapping isn't available (older inputs / non
+    floating-motif runs), so callers fall back to their previous behaviour of
+    loading the whole align chain. Used by the offline align path (align=True)
+    to restrict an external align chain to exactly this motif's residues before
+    the 1:1 Kabsch fit -- fixing the case where the align chain (e.g. a
+    full-length receptor template) spans residues the contig trimmed away.
+    """
+    res_id_map = metadata.get("motif_atom_res_id")
+    if res_id_map is None:
+        return None
+    res_id_map = res_id_map.to(device=block_mask.device)
+    block_res = res_id_map[block_mask]
+    block_res = block_res[block_res >= 0]
+    if block_res.numel() == 0:
+        return None
+    return {int(r) for r in torch.unique(block_res).tolist()}
+
+
 def _motif_block_current_com(
     xyz: torch.Tensor,
     block_mask: torch.Tensor,
@@ -4689,7 +4715,7 @@ class MotifPairAxisDot(BasePotential):
         self.skip_reason: str | None = None
         self.skip_detail: dict | None = None
 
-    def _resolve_axis(self, slot, motif_i, ref_xyz_i, device, dtype):
+    def _resolve_axis(self, slot, motif_i, ref_xyz_i, device, dtype, align_residues=None):
         if self.motif_axes is not None:
             a = torch.tensor(self.motif_axes[slot], device=device, dtype=dtype)
             return a / a.norm().clamp_min(self.eps)
@@ -4707,7 +4733,8 @@ class MotifPairAxisDot(BasePotential):
 
         if spec["align"]:
             align_xyz = _load_chain_atoms(
-                spec["chain_pdb"], spec["align_chain_id"], spec["align_atom_selection"], None
+                spec["chain_pdb"], spec["align_chain_id"], spec["align_atom_selection"], None,
+                residue_whitelist=align_residues,
             ).to(device=device, dtype=dtype)
             if align_xyz.shape[0] != ref_xyz_i.shape[0]:
                 raise ValueError(
@@ -4762,7 +4789,10 @@ class MotifPairAxisDot(BasePotential):
             if R is None:
                 self.skip_reason = f"motif_{motif_i}_frame_degenerate"
                 return xyz.new_zeros(())
-            axis = self._resolve_axis(slot, motif_i, ref_xyz_i, xyz.device, xyz.dtype)
+            axis = self._resolve_axis(
+                slot, motif_i, ref_xyz_i, xyz.device, xyz.dtype,
+                align_residues=_motif_block_res_ids(metadata, block_mask),
+            )
             axes.append(axis)
             # Row convention: a vector in the reference frame maps to a @ R.
             v = torch.einsum("j,djk->dk", axis, R)  # [D, 3]
@@ -4831,6 +4861,7 @@ def _load_chain_atoms(
     chain_id: str,
     atom_selection: str = "CA",
     max_atoms: int | None = None,
+    residue_whitelist: "set[int] | None" = None,
 ) -> torch.Tensor:
     """Load one chain's atom coordinates from a PDB/mmCIF file.
 
@@ -4844,6 +4875,11 @@ def _load_chain_atoms(
     proxy), 'backbone' (N, CA, C, O), or 'heavy' (all non-hydrogen atoms).
     ``max_atoms``: optional uniform-stride subsample cap so a very large chain
     can't blow up the pairwise-overlap cost; deterministic, not random.
+    ``residue_whitelist``: optional set of residue ids; when given, only atoms
+    whose ``res_id`` is in the set are kept. Used by the offline align path to
+    narrow an align chain that spans MORE residues than the contig motif kept
+    (e.g. a full-length receptor template) down to the contig motif's residues,
+    so the two point clouds regain their 1:1 correspondence for Kabsch.
 
     Biotite is imported lazily here (not at module scope) so importing
     potentials.py stays cheap for callers that never touch this potential.
@@ -4884,11 +4920,21 @@ def _load_chain_atoms(
             f"'heavy', got {atom_selection!r}"
         )
 
-    coords = atom_array.coord[chain_mask & sel_mask]
+    final_mask = chain_mask & sel_mask
+    if residue_whitelist is not None:
+        res_id = np.asarray(atom_array.res_id)
+        keep = np.isin(res_id, np.asarray(sorted(residue_whitelist), dtype=res_id.dtype))
+        final_mask = final_mask & keep
+    coords = atom_array.coord[final_mask]
     if coords.shape[0] == 0:
         raise ValueError(
             f"minimal_overlap: no atoms found for chain_id={chain_id!r} "
             f"atom_selection={atom_selection!r} in {pdb_path}"
+            + (
+                f" (residue_whitelist={sorted(residue_whitelist)})"
+                if residue_whitelist is not None
+                else ""
+            )
         )
     if max_atoms is not None and coords.shape[0] > int(max_atoms):
         stride = max(1, coords.shape[0] // int(max_atoms))
@@ -5064,7 +5110,7 @@ class MinimalOverlapPotential(BasePotential):
         self.skip_reason: str | None = None
         self.skip_detail: dict | None = None
 
-    def _resolve_chain_ref_xyz(self, idx, spec, ref_xyz_i, device, dtype):
+    def _resolve_chain_ref_xyz(self, idx, spec, ref_xyz_i, device, dtype, align_residues=None):
         if idx in self._chain_ref_xyz:
             return self._chain_ref_xyz[idx]
 
@@ -5074,7 +5120,8 @@ class MinimalOverlapPotential(BasePotential):
 
         if spec["align"]:
             align_xyz = _load_chain_atoms(
-                spec["chain_pdb"], spec["align_chain_id"], spec["align_atom_selection"], None
+                spec["chain_pdb"], spec["align_chain_id"], spec["align_atom_selection"], None,
+                residue_whitelist=align_residues,
             ).to(device=device, dtype=dtype)
             if align_xyz.shape[0] != ref_xyz_i.shape[0]:
                 raise ValueError(
@@ -5130,7 +5177,10 @@ class MinimalOverlapPotential(BasePotential):
                 self.skip_reason = f"motif_chains_{idx}_frame_degenerate"
                 continue
 
-            chain_ref_xyz = self._resolve_chain_ref_xyz(idx, spec, ref_xyz_i, device, dtype)
+            chain_ref_xyz = self._resolve_chain_ref_xyz(
+                idx, spec, ref_xyz_i, device, dtype,
+                align_residues=_motif_block_res_ids(metadata, block_mask),
+            )
             motif_ref_com = ref_xyz_i.mean(dim=0)  # [3] -- the pivot, not the chain's own COM
             current_com_i = current_xyz_i.mean(dim=1)  # [D, 3]
             # "Align the additional chain to this Kabsch alignment": the same
@@ -5320,7 +5370,7 @@ class TargetAnchorDistance(BasePotential):
         self._anchor_ref: dict[int, torch.Tensor] = {}
         self.skip_reason: str | None = None
 
-    def _resolve_anchor_ref(self, idx, spec, ref_xyz_i, device, dtype):
+    def _resolve_anchor_ref(self, idx, spec, ref_xyz_i, device, dtype, align_residues=None):
         if idx in self._anchor_ref:
             return self._anchor_ref[idx]
 
@@ -5330,7 +5380,8 @@ class TargetAnchorDistance(BasePotential):
 
         if spec["align"]:
             align_xyz = _load_chain_atoms(
-                spec["chain_pdb"], spec["align_chain_id"], spec["align_atom_selection"], None
+                spec["chain_pdb"], spec["align_chain_id"], spec["align_atom_selection"], None,
+                residue_whitelist=align_residues,
             ).to(device=device, dtype=dtype)
             if align_xyz.shape[0] != ref_xyz_i.shape[0]:
                 raise ValueError(
@@ -5368,7 +5419,10 @@ class TargetAnchorDistance(BasePotential):
         if R is None:
             return None, None
 
-        anchor_ref = self._resolve_anchor_ref(idx, spec, ref_xyz_i, device, dtype)
+        anchor_ref = self._resolve_anchor_ref(
+            idx, spec, ref_xyz_i, device, dtype,
+            align_residues=_motif_block_res_ids(metadata, block_mask),
+        )
         motif_ref_com = ref_xyz_i.mean(dim=0)
         current_com_i = current_xyz_i.mean(dim=1)  # [D, 3]
         # R is [D, 3, 3] -- genuinely different per design in the batch (each

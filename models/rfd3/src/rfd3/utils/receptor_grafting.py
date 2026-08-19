@@ -210,7 +210,7 @@ def graft_receptor_chains(
         if receptor_aa is None:
             continue
 
-        receptor_aa = _assign_fresh_chain_id(receptor_aa, spec["chain_id"], used_chains)
+        receptor_aa = _assign_fresh_chain_id(receptor_aa, used_chains)
         used_chains.add(str(receptor_aa.chain_id[0]))
         result = _harmonize_and_concatenate(result, receptor_aa)
         _log(
@@ -509,12 +509,24 @@ def _transport_receptor_chain(
 
 
 def _assign_fresh_chain_id(
-    receptor_aa: AtomArray, original_chain_id: str, used_chains: set[str]
+    receptor_aa: AtomArray, used_chains: set[str]
 ) -> AtomArray:
-    candidates = [original_chain_id] + [
-        c for c in _CHAIN_ID_ALPHABET if c != original_chain_id
-    ]
-    for candidate in candidates:
+    """Assign the first unused letter in the fixed A-Z,a-z alphabet -- NOT the
+    receptor's own source-PDB chain_id.
+
+    Downstream, the AF3-JSON builder (run_mpnn_alphafast.py's write_af3_json)
+    always labels the design's own chain "A" first, then labels every other
+    chain alphabetically BY ITS CURRENT chain_id -- not by grafting/append
+    order (confirmed against a real run: RFD3 output order was A, D, B by
+    first appearance, yet AF3 assigned B->"B" and D->"C", i.e. alphabetically
+    by letter, ignoring append order entirely). Always taking the first free
+    letter here (so the two grafted receptors land on "B" then "C") therefore
+    makes the RFD3 output chain_id and the eventual AF3 chain_id identical for
+    every grafted receptor, regardless of what chain letter the source PDB
+    happened to use -- a caller no longer needs to track two different
+    letters per receptor.
+    """
+    for candidate in _CHAIN_ID_ALPHABET:
         if candidate not in used_chains:
             receptor_aa.set_annotation(
                 "chain_id",

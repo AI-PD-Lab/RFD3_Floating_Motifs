@@ -292,6 +292,161 @@ def test_contig_auto_range_subtracts_max_of_other_ranges_from_both_bounds():
     )
 
 
+# ---------------------------------------------------------------------------
+# contig 'auto-gap' token tests (gap size from autocontigmap's estimator, using
+# the SAME target-distance approximation as length='auto' -- NOT a distance
+# measured from the input structure's coordinates. These are floating motifs:
+# they're free to move during diffusion and only guided toward a target
+# distance by potentials, so whatever distance the flanking residues happen to
+# sit at in the input PDB is arbitrary and not the design's actual gap.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.fast
+def test_auto_gap_token_uses_target_distance_not_input_coordinates():
+    """auto-gap must use auto_length_default_distance (the same approximation
+    length='auto' uses), not whatever distance the input structure's flanking
+    residues happen to be placed at."""
+    from autocontigmap import estimate_gap_fill
+
+    aa_in = _make_two_chain_input()  # random coordinates -- irrelevant to auto-gap
+    spec = DesignInputSpecification(
+        atom_array_input=aa_in,
+        contig="A1-20,auto-gap,B1-15",
+        length="80-120",
+        auto_length_default_distance=30.0,
+        select_fixed_atoms=False,
+    )
+    _, metadata = spec.build(return_metadata=True)
+    info = metadata["extra"]["contig_auto"]
+
+    assert len(info["auto_gap"]) == 1
+    gap = info["auto_gap"][0]
+    assert gap["prev_token"] == "A1-20"
+    assert gap["next_token"] == "B1-15"
+    assert gap["gap_angstrom"] == 30.0
+
+    expected_lo, expected_hi = estimate_gap_fill(30.0, 80, 120)
+    assert (gap["min"], gap["max"]) == (expected_lo, expected_hi)
+    assert info["resolved_contig"] == f"A1-20,{expected_lo}-{expected_hi},B1-15"
+
+
+@pytest.mark.fast
+def test_auto_gap_ignores_input_coordinates():
+    """Placing the input structure's chains at wildly different distances must not
+    change auto-gap's result -- only auto_length_default_distance/potentials should."""
+    aa_near = _make_two_chain_input()
+    aa_near.coord = np.zeros_like(aa_near.coord)  # everything at the origin
+
+    aa_far = _make_two_chain_input()
+    aa_far.coord = aa_far.coord.copy()
+    b_mask = aa_far.chain_id == "B"
+    aa_far.coord[b_mask] = aa_far.coord[b_mask] + np.array([500.0, 0.0, 0.0], dtype=np.float32)
+
+    kwargs = dict(
+        contig="A1-20,auto-gap,B1-15",
+        length="80-120",
+        auto_length_default_distance=30.0,
+        select_fixed_atoms=False,
+    )
+    _, metadata_near = DesignInputSpecification(atom_array_input=aa_near, **kwargs).build(
+        return_metadata=True
+    )
+    _, metadata_far = DesignInputSpecification(atom_array_input=aa_far, **kwargs).build(
+        return_metadata=True
+    )
+
+    assert metadata_near["extra"]["contig_auto"]["auto_gap"] == metadata_far["extra"]["contig_auto"]["auto_gap"]
+
+
+@pytest.mark.fast
+def test_auto_gap_uses_guiding_potentials_target_distance():
+    """auto-gap should read the target distance from guiding potentials, exactly like
+    length='auto' does, when auto_length_potentials is provided."""
+    aa_in = _make_two_chain_input()
+    spec = DesignInputSpecification(
+        atom_array_input=aa_in,
+        contig="A1-20,auto-gap,B1-15",
+        length="80-120",
+        auto_length_potentials={
+            "guiding_potentials": [
+                {"type": "motif_distance", "target_distance": 45.0},
+            ]
+        },
+        select_fixed_atoms=False,
+    )
+    _, metadata = spec.build(return_metadata=True)
+    gap = metadata["extra"]["contig_auto"]["auto_gap"][0]
+    assert gap["gap_angstrom"] == 45.0
+
+
+@pytest.mark.fast
+def test_auto_gap_token_recomputes_length_from_motif_and_estimate():
+    """The final 'length' must come from motif residues + the gap estimate, not the
+    naive top-level length passed in (which may just be a geometric approximation
+    used only as the estimator's lookup window)."""
+    aa_in = _make_two_chain_input()
+    spec = DesignInputSpecification(
+        atom_array_input=aa_in,
+        contig="A1-20,auto-gap,B1-15",
+        length="80-120",
+        auto_length_default_distance=30.0,
+        select_fixed_atoms=False,
+    )
+    _, metadata = spec.build(return_metadata=True)
+    info = metadata["extra"]["contig_auto"]
+    gap = info["auto_gap"][0]
+
+    expected_min = 20 + gap["min"] + 15
+    expected_max = 20 + gap["max"] + 15
+    assert info["length"] == f"{expected_min}-{expected_max}"
+    assert info["length"] != "80-120"
+
+
+@pytest.mark.fast
+def test_auto_gap_and_auto_together():
+    """auto-gap must resolve before plain auto, so auto's remaining budget already
+    accounts for the estimated gap range as a fixed contribution."""
+    aa_in = _make_two_chain_input()
+    spec = DesignInputSpecification(
+        atom_array_input=aa_in,
+        contig="A1-20,auto-gap,B1-15,auto",
+        length="100-140",
+        auto_length_default_distance=30.0,
+        select_fixed_atoms=False,
+    )
+    _, metadata = spec.build(return_metadata=True)
+    info = metadata["extra"]["contig_auto"]
+    gap = info["auto_gap"][0]
+
+    fixed_budget = 20 + 15 + gap["max"]
+    assert info["fixed_budget"] == fixed_budget
+    assert info["auto_lengths"] == [f"{100 - fixed_budget}-{140 - fixed_budget}"]
+    assert "auto-gap" not in info["resolved_contig"]
+
+
+@pytest.mark.fast
+def test_auto_gap_requires_concrete_flanking_token():
+    """auto-gap needs a concrete motif token on both sides -- a scaffold range or the
+    start/end of the contig must raise, not silently misbehave."""
+    aa_in = _make_two_chain_input()
+    with pytest.raises(ValueError, match="auto-gap"):
+        DesignInputSpecification(
+            atom_array_input=aa_in,
+            contig="auto-gap,A1-20,B1-15",
+            length="80-120",
+            select_fixed_atoms=False,
+        ).build(return_metadata=True)
+
+    with pytest.raises(ValueError, match="auto-gap"):
+        DesignInputSpecification(
+            atom_array_input=aa_in,
+            contig="A1-20,10-15,auto-gap,B1-15",
+            length="80-120",
+            select_fixed_atoms=False,
+        ).build(return_metadata=True)
+
+
 @pytest.mark.fast
 def test_motif_appended_as_separate_chain():
     """motifs must be appended as additional chains separate from the scaffold chain."""

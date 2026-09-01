@@ -226,6 +226,7 @@ class AADesignTrainer(FabricTrainer):
             floating_motif_refs=build_floating_motif_references_from_contigs(
                 sample_features=example,
             ),
+            sample_features=example,
         )
 
         assert_no_nans(

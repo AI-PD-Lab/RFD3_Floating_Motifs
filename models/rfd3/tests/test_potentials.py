@@ -26,6 +26,8 @@ from rfd3.potentials.potentials import (
     MotifBridge2,
     MotifCOMDistance,
     MotifDistance,
+    MotifForbiddenRadialOrientation,
+    MotifForbiddenRadialOrientationCompact,
     MotifRadialOrientationPotential,
     MotifRigid,
     MotifSphericalPosition,
@@ -1455,6 +1457,404 @@ def test_motif_radial_orientation_axis_weights_free_radial_spin():
     val_full_rot = pot_full.compute(xyz_rot, masks, metadata).item()
     assert val_full_rot < -1e-3, (
         f"Full-weight potential must penalise 90° r-rotation, got {val_full_rot:.6f}"
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MotifForbiddenRadialOrientation tests
+# Reuses _make_radial_orientation_setup: 2 blocks centred at ±5 on x-axis, so
+# the shared motif-motif axis is the x-axis and a 180-degree flip about it is
+# (x, y, z) -> (x, -y, -z) relative to each motif's own centre.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _flip_block0_about_radial_axis(ref_pos: torch.Tensor, angle_deg: float) -> torch.Tensor:
+    """Rotate block 0 (atoms 0-3) by `angle_deg` about its own radial (x) axis."""
+    cur = ref_pos.clone()
+    c0 = ref_pos[:4].mean(dim=0)  # [-5, 0, 0]
+    centred = ref_pos[:4] - c0
+    theta = torch.deg2rad(torch.tensor(float(angle_deg)))
+    cos_t, sin_t = torch.cos(theta), torch.sin(theta)
+    rotated = torch.stack(
+        [
+            centred[:, 0],
+            centred[:, 1] * cos_t - centred[:, 2] * sin_t,
+            centred[:, 1] * sin_t + centred[:, 2] * cos_t,
+        ],
+        dim=-1,
+    )
+    cur[:4] = rotated + c0
+    return cur
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_zero_at_forbidden_pose():
+    """At the 180-degree-flipped pose the potential must be ~0 (the bump's minimum)."""
+    _, masks, ref_pos, metadata = _make_radial_orientation_setup()
+    cur = _flip_block0_about_radial_axis(ref_pos, 180.0)
+
+    xyz = cur.unsqueeze(0)
+    pot = MotifForbiddenRadialOrientation(weight=1.0, sigma=3.0, motif_indices=[0])
+    value = pot.compute(xyz, masks, metadata)
+
+    assert value.ndim == 0
+    assert abs(value.item()) < 1e-4, (
+        f"Potential should be ~0 at the forbidden pose, got {value.item():.6f}"
+    )
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_saturated_at_allowed_pose():
+    """Far from the forbidden pose (the ordinary input-PDB pose) the bump must saturate near `weight`."""
+    _, masks, ref_pos, metadata = _make_radial_orientation_setup()
+    xyz = ref_pos.unsqueeze(0)  # unrotated -> maximally far from the forbidden (180-degree) target
+
+    pot = MotifForbiddenRadialOrientation(weight=2.0, sigma=0.3, motif_indices=[0])
+    value = pot.compute(xyz, masks, metadata)
+
+    assert value.item() > 2.0 - 1e-3, (
+        f"Bump should saturate near weight far from the forbidden pose, got {value.item():.6f}"
+    )
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_guidance_moves_away_from_forbidden_pose():
+    """A guidance step near the forbidden pose must increase the potential value,
+    i.e. push the sampler away from the forbidden configuration (opposite
+    direction from the attractive potential's guidance test)."""
+    _, masks, ref_pos, metadata = _make_radial_orientation_setup()
+    xyz = _flip_block0_about_radial_axis(ref_pos, 170.0).unsqueeze(0)
+
+    manager = _make_manager(
+        [MotifForbiddenRadialOrientation(weight=1.0, sigma=3.0, motif_indices=[0])],
+        guide_clip_rms=1e6,
+    )
+    guidance, _ = compute_potential_guidance(
+        xyz_t=xyz,
+        potential_manager=manager,
+        t=1.0,
+        T=1.0,
+        masks=masks,
+        metadata=metadata,
+        apply_mode="atom",
+        atom_guidance_fraction=0.0,
+    )
+    xyz_new = xyz + 0.01 * guidance
+
+    pot = MotifForbiddenRadialOrientation(weight=1.0, sigma=3.0, motif_indices=[0])
+    val_before = pot.compute(xyz, masks, metadata).item()
+    val_after = pot.compute(xyz_new, masks, metadata).item()
+    assert val_after > val_before, (
+        f"Guidance should increase distance from the forbidden pose: "
+        f"{val_before:.6f} -> {val_after:.6f}"
+    )
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_invariant_to_translation():
+    """Translating the whole assembly rigidly must not change the value."""
+    _, masks, ref_pos, metadata = _make_radial_orientation_setup()
+    cur = _flip_block0_about_radial_axis(ref_pos, 170.0)
+
+    pot = MotifForbiddenRadialOrientation(weight=1.0, sigma=3.0, motif_indices=[0])
+    val_close = pot.compute(cur.unsqueeze(0), masks, metadata)
+
+    cur_translated = cur + torch.tensor([13.0, -7.0, 4.0])
+    val_translated = pot.compute(cur_translated.unsqueeze(0), masks, metadata)
+
+    assert abs(val_close.item() - val_translated.item()) < 1e-4, (
+        f"Potential must be invariant to a rigid translation of the whole assembly: "
+        f"{val_close.item():.6f} vs {val_translated.item():.6f}"
+    )
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_parsing():
+    """The potential must be instantiated correctly from a dict spec."""
+    specs = [
+        {
+            "type": "motif_forbidden_radial_orientation",
+            "weight": 3.0,
+            "sigma": 2.5,
+            "motif_indices": [0, 1],
+            "motif_axis_weights": [[1.0, 0.0, 0.0], [0.5, 0.5, 1.0]],
+            "origin_atom_filter": "real",
+        }
+    ]
+    pots = parse_potentials(specs)
+    assert len(pots) == 1
+    pot = pots[0]
+    assert isinstance(pot, MotifForbiddenRadialOrientation)
+    assert pot.weight == 3.0
+    assert pot.sigma == 2.5
+    assert pot.motif_indices == [0, 1]
+    assert pot.origin_atom_filter == "real"
+    assert len(pot.motif_axis_weights) == 2
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_sigma_must_be_positive():
+    """sigma <= 0 must raise ValueError, mirroring MotifRigid's k <= 0 guard."""
+    with pytest.raises(ValueError):
+        MotifForbiddenRadialOrientation(sigma=0.0)
+    with pytest.raises(ValueError):
+        MotifForbiddenRadialOrientation(sigma=-1.0)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MotifForbiddenRadialOrientationCompact tests
+# Reuses the same fixture/helper as MotifForbiddenRadialOrientation above: 2
+# blocks centred at +/-5 on the x-axis, S^2=1 (each block's 4 atoms sit at
+# tangential radius 1), so mean_loss(theta) = 2*(1+cos(theta)) exactly for the
+# rotated block, verified numerically against the real implementation before
+# writing these tests (max abs difference < 1e-5 across theta=0..180).
+# ════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_compact_zero_at_forbidden_pose():
+    """At the 180-degree-flipped pose the potential must be ~0 (the bump's minimum)."""
+    _, masks, ref_pos, metadata = _make_radial_orientation_setup()
+    cur = _flip_block0_about_radial_axis(ref_pos, 180.0)
+
+    xyz = cur.unsqueeze(0)
+    pot = MotifForbiddenRadialOrientationCompact(weight=1.0, cutoff=0.5, motif_indices=[0])
+    value = pot.compute(xyz, masks, metadata)
+
+    assert value.ndim == 0
+    assert abs(value.item()) < 1e-4, (
+        f"Potential should be ~0 at the forbidden pose, got {value.item():.6f}"
+    )
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_compact_flat_beyond_cutoff():
+    """Beyond the hard cutoff the bump must equal `weight` EXACTLY (not just
+    approximately close, unlike the Gaussian-tailed sibling's asymptotic saturation)."""
+    _, masks, ref_pos, metadata = _make_radial_orientation_setup()
+    xyz = ref_pos.unsqueeze(0)  # unrotated -> mean_loss=4, far beyond cutoff=0.5
+
+    pot = MotifForbiddenRadialOrientationCompact(weight=2.0, cutoff=0.5, motif_indices=[0])
+    value = pot.compute(xyz, masks, metadata)
+
+    assert value.item() == pytest.approx(2.0, abs=1e-6), (
+        f"Bump should equal weight EXACTLY beyond cutoff, got {value.item():.6f}"
+    )
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_compact_guidance_moves_away_from_forbidden_pose():
+    """A guidance step near the forbidden pose must increase the potential value,
+    i.e. push the sampler away from the forbidden configuration."""
+    _, masks, ref_pos, metadata = _make_radial_orientation_setup()
+    xyz = _flip_block0_about_radial_axis(ref_pos, 170.0).unsqueeze(0)
+
+    manager = _make_manager(
+        [MotifForbiddenRadialOrientationCompact(weight=1.0, cutoff=1.0, motif_indices=[0])],
+        guide_clip_rms=1e6,
+    )
+    guidance, _ = compute_potential_guidance(
+        xyz_t=xyz,
+        potential_manager=manager,
+        t=1.0,
+        T=1.0,
+        masks=masks,
+        metadata=metadata,
+        apply_mode="atom",
+        atom_guidance_fraction=0.0,
+    )
+    xyz_new = xyz + 0.01 * guidance
+
+    pot = MotifForbiddenRadialOrientationCompact(weight=1.0, cutoff=1.0, motif_indices=[0])
+    val_before = pot.compute(xyz, masks, metadata).item()
+    val_after = pot.compute(xyz_new, masks, metadata).item()
+    assert val_after > val_before, (
+        f"Guidance should increase distance from the forbidden pose: "
+        f"{val_before:.6f} -> {val_after:.6f}"
+    )
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_compact_invariant_to_translation():
+    """Translating the whole assembly rigidly must not change the value."""
+    _, masks, ref_pos, metadata = _make_radial_orientation_setup()
+    cur = _flip_block0_about_radial_axis(ref_pos, 170.0)
+
+    pot = MotifForbiddenRadialOrientationCompact(weight=1.0, cutoff=1.0, motif_indices=[0])
+    val_close = pot.compute(cur.unsqueeze(0), masks, metadata)
+
+    cur_translated = cur + torch.tensor([13.0, -7.0, 4.0])
+    val_translated = pot.compute(cur_translated.unsqueeze(0), masks, metadata)
+
+    assert abs(val_close.item() - val_translated.item()) < 1e-4, (
+        f"Potential must be invariant to a rigid translation of the whole assembly: "
+        f"{val_close.item():.6f} vs {val_translated.item():.6f}"
+    )
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_compact_parsing():
+    """The potential must be instantiated correctly from a dict spec."""
+    specs = [
+        {
+            "type": "motif_forbidden_radial_orientation_compact",
+            "weight": 3.0,
+            "cutoff": 2.5,
+            "motif_indices": [0, 1],
+            "motif_axis_weights": [[1.0, 0.0, 0.0], [0.5, 0.5, 1.0]],
+            "origin_atom_filter": "real",
+        }
+    ]
+    pots = parse_potentials(specs)
+    assert len(pots) == 1
+    pot = pots[0]
+    assert isinstance(pot, MotifForbiddenRadialOrientationCompact)
+    assert pot.weight == 3.0
+    assert pot.cutoff == 2.5
+    assert pot.motif_indices == [0, 1]
+    assert pot.origin_atom_filter == "real"
+    assert len(pot.motif_axis_weights) == 2
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_compact_cutoff_must_be_positive():
+    """cutoff <= 0 must raise ValueError, mirroring the sigma guard on the sibling class."""
+    with pytest.raises(ValueError):
+        MotifForbiddenRadialOrientationCompact(cutoff=0.0)
+    with pytest.raises(ValueError):
+        MotifForbiddenRadialOrientationCompact(cutoff=-1.0)
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_compact_no_preference_among_far_poses():
+    """Core new property: different poses that are all beyond the cutoff must be
+    treated IDENTICALLY (bump == weight exactly for every one of them), unlike the
+    Gaussian-tailed sibling whose asymptotic tail always prefers whichever pose is
+    farthest from forbidden."""
+    _, masks, ref_pos, metadata = _make_radial_orientation_setup()
+
+    values = []
+    for theta_deg in (30.0, 90.0, 150.0):  # mean_loss = 3.73, 2.0, 0.27 -- all > cutoff=0.2
+        xyz = _flip_block0_about_radial_axis(ref_pos, theta_deg).unsqueeze(0)
+        pot = MotifForbiddenRadialOrientationCompact(weight=1.0, cutoff=0.2, motif_indices=[0])
+        values.append(pot.compute(xyz, masks, metadata).item())
+
+    for theta_deg, v in zip((30.0, 90.0, 150.0), values):
+        assert v == pytest.approx(1.0, abs=1e-6), (
+            f"theta={theta_deg}: expected exactly weight=1.0 beyond cutoff, got {v:.8f}"
+        )
+    assert values[0] == pytest.approx(values[1], abs=1e-6) == pytest.approx(values[2], abs=1e-6), (
+        f"Different far poses must be treated identically, got {values}"
+    )
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_compact_gradient_flat_beyond_cutoff():
+    """Stronger than the value-equality test above: the autograd gradient itself
+    must be exactly zero beyond the cutoff, not just the forward value."""
+    _, masks, ref_pos, metadata = _make_radial_orientation_setup()
+
+    for theta_deg in (30.0, 90.0, 150.0):
+        xyz = (
+            _flip_block0_about_radial_axis(ref_pos, theta_deg)
+            .unsqueeze(0)
+            .clone()
+            .requires_grad_(True)
+        )
+        pot = MotifForbiddenRadialOrientationCompact(weight=1.0, cutoff=0.2, motif_indices=[0])
+        value = pot.compute(xyz, masks, metadata)
+        value.backward()
+        assert xyz.grad is not None
+        assert torch.allclose(xyz.grad, torch.zeros_like(xyz.grad), atol=1e-6), (
+            f"theta={theta_deg}: gradient must be exactly zero beyond cutoff, "
+            f"got max abs {xyz.grad.abs().max().item():.8f}"
+        )
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_compact_min_across_motifs_dead_zone():
+    """Regression test for the rejected 'average-then-shape' design: with both
+    motifs active, block 0 at its OWN forbidden pose while block 1 sits at its
+    own correct/reference pose (far from ITS forbidden pose) must still report
+    ~0 overall -- the min-combination must catch the at-risk motif regardless of
+    the other motif's state. Averaging raw losses first (mean_loss_0=0,
+    mean_loss_1=4, averaged=2, cutoff=0.5) would incorrectly report bump=1
+    (fully safe); this test would have failed under that rejected design."""
+    _, masks, ref_pos, metadata = _make_radial_orientation_setup()
+    cur = _flip_block0_about_radial_axis(ref_pos, 180.0)  # block 0 -> its own forbidden pose
+    xyz = cur.unsqueeze(0)  # block 1 untouched -> its own correct/reference pose
+
+    pot = MotifForbiddenRadialOrientationCompact(weight=1.0, cutoff=0.5, motif_indices=None)
+    value = pot.compute(xyz, masks, metadata)
+
+    assert abs(value.item()) < 1e-4, (
+        f"min-combination must catch motif 0 at its own forbidden pose even though "
+        f"motif 1 is far from its own, got {value.item():.6f}"
+    )
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_compact_no_nan_at_boundaries():
+    """No NaN/Inf in forward value or backward gradient at or near either
+    transition boundary (mean_loss=0 and mean_loss=cutoff)."""
+    _, masks, ref_pos, metadata = _make_radial_orientation_setup()
+    cutoff = 0.5
+
+    # theta=180 -> mean_loss=0 exactly (t=0 boundary).
+    # theta solved via mean_loss(theta)=2*(1+cos(theta))=cutoff -> t=1 boundary exactly.
+    theta_t1_boundary = torch.rad2deg(
+        torch.acos(torch.tensor(cutoff / 2.0 - 1.0))
+    ).item()
+
+    for theta_deg in (180.0, theta_t1_boundary, theta_t1_boundary - 2.0, theta_t1_boundary + 2.0):
+        xyz = (
+            _flip_block0_about_radial_axis(ref_pos, theta_deg)
+            .unsqueeze(0)
+            .clone()
+            .requires_grad_(True)
+        )
+        pot = MotifForbiddenRadialOrientationCompact(weight=1.0, cutoff=cutoff, motif_indices=[0])
+        value = pot.compute(xyz, masks, metadata)
+        value.backward()
+
+        assert torch.isfinite(value), f"theta={theta_deg}: value is not finite: {value.item()}"
+        assert torch.isfinite(xyz.grad).all(), (
+            f"theta={theta_deg}: gradient contains NaN/Inf: {xyz.grad}"
+        )
+
+    # Exactly at both boundaries the gradient must be (near-)zero, per the exact
+    # algebraic zero-derivative property of the quintic smootherstep.
+    for theta_deg in (180.0, theta_t1_boundary):
+        xyz = (
+            _flip_block0_about_radial_axis(ref_pos, theta_deg)
+            .unsqueeze(0)
+            .clone()
+            .requires_grad_(True)
+        )
+        pot = MotifForbiddenRadialOrientationCompact(weight=1.0, cutoff=cutoff, motif_indices=[0])
+        value = pot.compute(xyz, masks, metadata)
+        value.backward()
+        assert xyz.grad.abs().max().item() < 1e-4, (
+            f"theta={theta_deg}: gradient should vanish at the exact boundary, "
+            f"got max abs {xyz.grad.abs().max().item():.8f}"
+        )
+
+
+@pytest.mark.fast
+def test_motif_forbidden_radial_orientation_compact_monotonic_within_transition_band():
+    """Within the transition band (0 < mean_loss < cutoff), the bump must be
+    monotonically increasing as mean_loss increases (theta decreases from 180)."""
+    _, masks, ref_pos, metadata = _make_radial_orientation_setup()
+    cutoff = 2.0  # mean_loss(100deg)=1.65 < cutoff, so all sampled points stay in-band
+
+    values = []
+    for theta_deg in (180.0, 160.0, 140.0, 120.0, 100.0):
+        xyz = _flip_block0_about_radial_axis(ref_pos, theta_deg).unsqueeze(0)
+        pot = MotifForbiddenRadialOrientationCompact(weight=1.0, cutoff=cutoff, motif_indices=[0])
+        values.append(pot.compute(xyz, masks, metadata).item())
+
+    assert all(values[i] < values[i + 1] for i in range(len(values) - 1)), (
+        f"Bump must be monotonically increasing as mean_loss increases, got {values}"
     )
 
 

@@ -72,6 +72,7 @@ class RFD3(nn.Module):
         input: dict,
         coord_atom_lvl_to_be_noised: torch.Tensor = None,
         floating_motif_refs=None,
+        sample_features=None,
         n_cycle=None,
         **_,
     ) -> dict:
@@ -102,6 +103,8 @@ class RFD3(nn.Module):
                 coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised,
                 # Forwarded as **kwargs:
                 initializer_outputs=initializer_outputs,
+                initializer_fn=self.token_initializer,
                 ref_initializer_outputs=ref_initializer_outputs,  # for cfg
                 floating_motif_refs=floating_motif_refs,
+                sample_features=sample_features,
             )

@@ -19,6 +19,8 @@ from rfd3.model.floating_motif_projection import (
     remove_floating_motif_atoms_from_fixed_mask,
     should_project_floating_motifs,
 )
+from rfd3.model.motif_unindexing import build_motif_unindexing_controller
+from rfd3.model.motif_backbone_bias import build_motif_backbone_bias_controller
 
 from foundry.common import exists
 from foundry.utils.alignment import weighted_rigid_align
@@ -30,6 +32,63 @@ from foundry.utils.rotation_augmentation import (
 
 logging.basicConfig(level=logging.INFO)
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
+
+
+def _log_inter_motif_axis(step_num, t_hat, sources, floating_motif_refs, eps=1e-6):
+    """Log the motif->motif axis from several coordinate sources (diagnostic).
+
+    Emits one parseable ``[axis_diag] {...}`` line per step per design.  For each
+    source (e.g. the noisy post-step coordinates and the denoiser's x0
+    prediction) we record the unit vector from motif 0's centroid to motif 1's
+    centroid and that separation's length.  The reference axis from the input
+    PDB is logged too so the analysis can be done without re-reading inputs.
+
+    Purely observational: nothing here feeds back into sampling.
+    """
+    if len(floating_motif_refs) < 2:
+        return
+
+    def _axis(xyz, refs):
+        # xyz: [D, L, 3] -> unit axis [D, 3] and length [D]
+        c0 = xyz[:, refs[0].sample_atom_indices.to(xyz.device), :].mean(dim=1)
+        c1 = xyz[:, refs[1].sample_atom_indices.to(xyz.device), :].mean(dim=1)
+        d = (c1 - c0).float()
+        n = d.norm(dim=-1)
+        return d / n.clamp_min(eps).unsqueeze(-1), n
+
+    # Reference axis (constant across steps) from the stored input geometry.
+    ref_axes = []
+    for ref in floating_motif_refs[:2]:
+        m = ref.reference_atom_mask.bool() & torch.isfinite(ref.reference_xyz).all(-1)
+        ref_axes.append(ref.reference_xyz[m].float().mean(dim=0))
+    d_ref = ref_axes[1] - ref_axes[0]
+    n_ref = float(d_ref.norm())
+    u_ref = (d_ref / max(n_ref, eps)).tolist()
+
+    computed = {name: _axis(xyz, floating_motif_refs) for name, xyz in sources.items()}
+    n_designs = next(iter(computed.values()))[0].shape[0]
+
+    # Atom counts behind each centroid — these set the noise suppression
+    # (centroid noise ~ t_hat / sqrt(n)), so log them rather than assuming.
+    n_atoms = [int(r.sample_atom_indices.numel()) for r in floating_motif_refs[:2]]
+
+    for d_i in range(n_designs):
+        rec = {
+            "step": int(step_num),
+            "t_hat": round(float(t_hat), 4),
+            "design": int(d_i),
+            "n_atoms": n_atoms,
+            "ref_len": round(n_ref, 4),
+            "ref_axis": [round(v, 6) for v in u_ref],
+        }
+        for name, (u, n) in computed.items():
+            rec[f"{name}_len"] = round(float(n[d_i]), 4)
+            rec[f"{name}_axis"] = [round(float(v), 6) for v in u[d_i]]
+        # NOTE: this module's loggers do not reach the SLURM log (even
+        # ranked_logger's own "Initializing ConditionalDiffusionSampler" line is
+        # swallowed).  Print to stderr like potentials/integration.py:172 does.
+        ranked_logger.info("[axis_diag] %s", rec)
+        print(f"[axis_diag] {rec}", file=sys.stderr, flush=True)
 
 
 @dataclass(kw_only=True)
@@ -68,11 +127,27 @@ class SampleDiffusionConfig:
     floating_motif_burn_in: int = 0
     floating_motif_stop_after: int | None = None
 
+    # Diagnostic only: per-step log of the inter-motif axis computed from both
+    # the post-step noisy coordinates (what potentials currently see) and the
+    # denoiser's x0 prediction.  Used to find the earliest step at which the
+    # axis is trustworthy enough to reference an orientation potential to.
+    # No effect on sampling.
+    axis_diag: bool = False
+
     # Recycling
     n_recycle: int | None = None  # Override model default n_recycle for inference
 
     # External differentiable potentials (disabled by default; no overhead when empty)
     potentials: dict = field(default_factory=dict)
+
+    # External-reference motif unindexing.  Disabled by default and independent
+    # of the legacy unindexed-token input path.
+    motif_unindexing: dict = field(default_factory=dict)
+
+    # Backbone-bias-only motif guidance: soft gradient pull during diffusion,
+    # single hard backbone paste after the loop.  No Kabsch per-step, no
+    # token-type modification.
+    motif_backbone_bias: dict = field(default_factory=dict)
 
     # Normal symmetry remains true homomeric symmetry.  By default it follows
     # the existing sym_step_frac schedule; this optional step cutoff is an
@@ -205,9 +280,11 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
         diffusion_batch_size: int,
         coord_atom_lvl_to_be_noised: Float[torch.Tensor, "D L 3"],
         initializer_outputs,
+        initializer_fn=None,
         ref_initializer_outputs: dict[str, Any] | None,
         f_ref: dict[str, Any] | None,
         floating_motif_refs=None,
+        sample_features: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         # Motif setup to recenter the motif at every step
         is_motif_atom_with_fixed_coord = f["is_motif_atom_with_fixed_coord"]
@@ -240,6 +317,22 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised.clone(),
             is_motif_atom_with_fixed_coord=fixed_coord_noise_mask,
         )  # (D, L, 3)
+
+        motif_unindexing_controller = build_motif_unindexing_controller(
+            self.motif_unindexing,
+            f,
+            sample_features=sample_features,
+        )
+        ranked_logger.info(
+            "[motif_unindexing] sampler_config enabled=%s controller=%s",
+            bool((self.motif_unindexing or {}).get("enabled", False)),
+            "built" if motif_unindexing_controller is not None else "disabled",
+        )
+        promoted_initializer_outputs = None
+
+        motif_backbone_bias_controller = build_motif_backbone_bias_controller(
+            self.motif_backbone_bias, f, sample_features=sample_features
+        )
 
         # Build the potential adapter once (masks are static across steps)
         potential_adapter = None
@@ -301,6 +394,85 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             # Compute the value of t_hat
             t_hat = c_t_minus_1 * (gamma + 1)
 
+            f_step = f_diffusion
+            initializer_outputs_step = initializer_outputs
+            if motif_unindexing_controller is not None:
+                f_step = motif_unindexing_controller.promoted_feature_dict(
+                    f_diffusion,
+                    X_L.detach(),
+                    step_num,
+                )
+                cache_rebuild_reason = motif_unindexing_controller.static_cache_rebuild_reason(step_num)
+                if (
+                    motif_unindexing_controller.config.rebuild_static_cache_at_projection_stop
+                    and 158 <= step_num <= 161
+                ):
+                    ranked_logger.info(
+                        "[motif_unindexing] step=%s projection_stop_cache_trace reason=%s promoted=%s initializer_fn=%s cache_built=%s activated_step=%s post_activation_stop_after=%s",
+                        step_num,
+                        cache_rebuild_reason,
+                        f_step is not f_diffusion,
+                        initializer_fn is not None,
+                        promoted_initializer_outputs is not None,
+                        motif_unindexing_controller.activated_step,
+                        motif_unindexing_controller.config.post_activation_stop_after,
+                    )
+                if cache_rebuild_reason is not None and promoted_initializer_outputs is None:
+                    ranked_logger.info(
+                        "[motif_unindexing] step=%s static_cache_rebuild_requested reason=%s promoted=%s initializer_fn=%s activated_step=%s post_activation_stop_after=%s",
+                        step_num,
+                        cache_rebuild_reason,
+                        f_step is not f_diffusion,
+                        initializer_fn is not None,
+                        motif_unindexing_controller.activated_step,
+                        motif_unindexing_controller.config.post_activation_stop_after,
+                    )
+                if f_step is not f_diffusion and initializer_fn is not None:
+                    # Rebuild the static pairwise cache (C_L / _sl_cached / _sm_cached)
+                    # once for one of the explicit cache-promotion modes.
+                    #
+                    # The immediate-activation experiment must use f_step, not
+                    # feature_dict_for_initializer: f_step contains Kabsch-aligned
+                    # ref_pos in the same frame used by runtime conditioning.
+                    if promoted_initializer_outputs is None:
+                        if cache_rebuild_reason is not None:
+                            ranked_logger.info(
+                                "[motif_unindexing] step=%s rebuilding_static_cache_from_promoted_step reason=%s activated_step=%s post_activation_stop_after=%s",
+                                step_num,
+                                cache_rebuild_reason,
+                                motif_unindexing_controller.activated_step,
+                                motif_unindexing_controller.config.post_activation_stop_after,
+                            )
+                            if cache_rebuild_reason == "assignment_lock_motif_pos_only":
+                                f_init = motif_unindexing_controller.feature_dict_for_motif_pos_only_initializer(
+                                    f_diffusion
+                                )
+                                promoted_initializer_outputs = initializer_fn(
+                                    f_init if f_init is not None else f_step
+                                )
+                            elif cache_rebuild_reason == "assignment_lock_mask_only":
+                                f_init = motif_unindexing_controller.feature_dict_for_mask_only_initializer(
+                                    f_diffusion
+                                )
+                                promoted_initializer_outputs = initializer_fn(
+                                    f_init if f_init is not None else f_step
+                                )
+                            else:
+                                promoted_initializer_outputs = initializer_fn(f_step)
+                        elif (
+                            motif_unindexing_controller.config.promote_to_motif_on_activation
+                            and motif_unindexing_controller.activated_step is not None
+                        ):
+                            f_init = motif_unindexing_controller.feature_dict_for_initializer(
+                                f_diffusion
+                            )
+                            if f_init is not None:
+                                promoted_initializer_outputs = initializer_fn(f_init)
+                            else:
+                                promoted_initializer_outputs = initializer_fn(f_step)
+                    if promoted_initializer_outputs is not None:
+                        initializer_outputs_step = promoted_initializer_outputs
+
             # Noise the coordinates with scaled Gaussian noise
             epsilon_L = (
                 self.noise_scale
@@ -314,21 +486,21 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
 
             # Denoise the coordinates
             # Handle chunked mode vs standard mode
-            if "chunked_pairwise_embedder" in initializer_outputs:
+            if "chunked_pairwise_embedder" in initializer_outputs_step:
                 # Chunked mode: explicitly provide P_LL=None
                 tic = time.time()
-                chunked_embedder = initializer_outputs[
+                chunked_embedder = initializer_outputs_step[
                     "chunked_pairwise_embedder"
                 ]  # Don't pop, just get
                 other_outputs = {
                     k: v
-                    for k, v in initializer_outputs.items()
+                    for k, v in initializer_outputs_step.items()
                     if k != "chunked_pairwise_embedder"
                 }
                 outs = diffusion_module(
                     X_noisy_L=X_noisy_L,
                     t=t_hat.tile(D),
-                    f=f_diffusion,
+                    f=f_step,
                     P_LL=None,  # Not used in chunked mode
                     chunked_pairwise_embedder=chunked_embedder,
                     initializer_outputs=other_outputs,
@@ -344,9 +516,9 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 outs = diffusion_module(
                     X_noisy_L=X_noisy_L,
                     t=t_hat.tile(D),
-                    f=f_diffusion,
+                    f=f_step,
                     n_recycle=self.n_recycle,
-                    **initializer_outputs,
+                    **initializer_outputs_step,
                 )
 
             X_denoised_L = outs["X_L"] if "X_L" in outs else outs
@@ -403,6 +575,31 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             # Update the coordinates, scaled by the step size
             X_L = X_noisy_L + step_scale * d_t * delta_L
 
+            # ── inter-motif axis diagnostic (no effect on sampling) ───────────
+            # X_L is the noisy post-step state the potentials currently see;
+            # X_denoised_L is the model's x0 prediction for the same step.  Log
+            # the motif->motif axis from both so we can measure when each
+            # becomes a trustworthy reference direction.
+            if step_num == 0:
+                # One line per run so a silent diagnostic is self-diagnosing:
+                # tells us whether the hydra flag arrived and whether there are
+                # floating motif refs to measure an axis between.
+                print(
+                    "[axis_diag_setup] "
+                    f"axis_diag={getattr(self, 'axis_diag', None)!r} "
+                    f"n_floating_refs={len(floating_motif_refs) if floating_motif_refs else 0}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if getattr(self, "axis_diag", False) and floating_motif_refs:
+                _log_inter_motif_axis(
+                    step_num=step_num,
+                    t_hat=float(t_hat),
+                    sources={"noisy": X_L, "x0": X_denoised_L},
+                    floating_motif_refs=floating_motif_refs,
+                )
+            # ─────────────────────────────────────────────────────────────────
+
             # potential guidance hook
             # Applied after the normal sampler step, before X_L is stored.
             # torch.enable_grad() is used internally; we exit before the next
@@ -415,6 +612,11 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                     T=float(noise_schedule[0]),
                     step_idx=step_num,
                 )
+            if motif_unindexing_controller is not None:
+                X_L = motif_unindexing_controller.apply_pre_activation_bias(
+                    X_L,
+                    step_num,
+                )
             if should_project_floating_motifs(
                 step_num,
                 enabled=self.floating_motif_project,
@@ -423,6 +625,34 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 stop_after=self.floating_motif_stop_after,
             ):
                 X_L = project_floating_motifs_all_atom(X_L, floating_motif_refs)
+            if motif_unindexing_controller is not None:
+                dynamic_refs = motif_unindexing_controller.active_floating_motif_refs(
+                    step_num
+                )
+                # ── TEMPORARY DIAGNOSTIC ─────────────────────────────────────
+                ranked_logger.info(
+                    "[sampler_diag] step=%d activated_step=%s n_dynamic_refs=%d "
+                    "is_post_active=%s alpha=%.4f",
+                    step_num,
+                    motif_unindexing_controller.activated_step,
+                    len(dynamic_refs),
+                    motif_unindexing_controller.is_post_activation_active(step_num),
+                    motif_unindexing_controller.projection_alpha(step_num),
+                )
+                # ─────────────────────────────────────────────────────────────
+                if dynamic_refs:
+                    X_L = project_floating_motifs_all_atom(
+                        X_L,
+                        dynamic_refs,
+                        alpha=motif_unindexing_controller.projection_alpha(step_num),
+                    )
+                X_L = motif_unindexing_controller.apply_boundary_distance_bias(
+                    X_L,
+                    step_num,
+                )
+                motif_unindexing_controller.log_diagnostics(X_L, step_num)
+            if motif_backbone_bias_controller is not None:
+                X_L = motif_backbone_bias_controller.apply_bias(X_L, step_num)
 
             # Append the results to the trajectory (for visualization of the diffusion process)
             X_noisy_L_scaled = (
@@ -431,6 +661,9 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             X_noisy_L_traj.append(X_noisy_L_scaled)
             X_denoised_L_traj.append(X_denoised_L)
             t_hats.append(t_hat)
+
+        if motif_backbone_bias_controller is not None:
+            X_L = motif_backbone_bias_controller.postprocess_X_L(X_L)
 
         if torch.any(is_motif_atom_with_fixed_coord) and self.allow_realignment:
             # Insert the gt motif at the end
@@ -531,9 +764,11 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
         diffusion_batch_size: int,
         coord_atom_lvl_to_be_noised: Float[torch.Tensor, "D L 3"],
         initializer_outputs,
+        initializer_fn=None,
         ref_initializer_outputs: dict[str, Any] | None,
         f_ref: dict[str, Any] | None,
         floating_motif_refs=None,
+        sample_features: dict[str, Any] | None = None,
         **_,
     ) -> dict[str, Any]:
         # Motif setup to recenter the motif at every step
@@ -565,6 +800,22 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised.clone(),
             is_motif_atom_with_fixed_coord=fixed_coord_noise_mask,
         )  # (D, L, 3)
+
+        motif_unindexing_controller = build_motif_unindexing_controller(
+            self.motif_unindexing,
+            f,
+            sample_features=sample_features,
+        )
+        ranked_logger.info(
+            "[motif_unindexing] sampler_config enabled=%s controller=%s",
+            bool((self.motif_unindexing or {}).get("enabled", False)),
+            "built" if motif_unindexing_controller is not None else "disabled",
+        )
+        promoted_initializer_outputs = None
+
+        motif_backbone_bias_controller = build_motif_backbone_bias_controller(
+            self.motif_backbone_bias, f, sample_features=sample_features
+        )
 
         # Build the potential adapter once (masks are static across steps)
         potential_adapter = None
@@ -619,6 +870,79 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             # Compute the value of t_hat
             t_hat = c_t_minus_1 * (gamma + 1)
 
+            f_step = f_diffusion
+            initializer_outputs_step = initializer_outputs
+            if motif_unindexing_controller is not None:
+                f_step = motif_unindexing_controller.promoted_feature_dict(
+                    f_diffusion,
+                    X_L.detach(),
+                    step_num,
+                )
+                cache_rebuild_reason = motif_unindexing_controller.static_cache_rebuild_reason(step_num)
+                if (
+                    motif_unindexing_controller.config.rebuild_static_cache_at_projection_stop
+                    and 158 <= step_num <= 161
+                ):
+                    ranked_logger.info(
+                        "[motif_unindexing] step=%s projection_stop_cache_trace reason=%s promoted=%s initializer_fn=%s cache_built=%s activated_step=%s post_activation_stop_after=%s",
+                        step_num,
+                        cache_rebuild_reason,
+                        f_step is not f_diffusion,
+                        initializer_fn is not None,
+                        promoted_initializer_outputs is not None,
+                        motif_unindexing_controller.activated_step,
+                        motif_unindexing_controller.config.post_activation_stop_after,
+                    )
+                if cache_rebuild_reason is not None and promoted_initializer_outputs is None:
+                    ranked_logger.info(
+                        "[motif_unindexing] step=%s static_cache_rebuild_requested reason=%s promoted=%s initializer_fn=%s activated_step=%s post_activation_stop_after=%s",
+                        step_num,
+                        cache_rebuild_reason,
+                        f_step is not f_diffusion,
+                        initializer_fn is not None,
+                        motif_unindexing_controller.activated_step,
+                        motif_unindexing_controller.config.post_activation_stop_after,
+                    )
+                if f_step is not f_diffusion and initializer_fn is not None:
+                    if promoted_initializer_outputs is None:
+                        if cache_rebuild_reason is not None:
+                            ranked_logger.info(
+                                "[motif_unindexing] step=%s rebuilding_static_cache_from_promoted_step reason=%s activated_step=%s post_activation_stop_after=%s",
+                                step_num,
+                                cache_rebuild_reason,
+                                motif_unindexing_controller.activated_step,
+                                motif_unindexing_controller.config.post_activation_stop_after,
+                            )
+                            if cache_rebuild_reason == "assignment_lock_motif_pos_only":
+                                f_init = motif_unindexing_controller.feature_dict_for_motif_pos_only_initializer(
+                                    f_diffusion
+                                )
+                                promoted_initializer_outputs = initializer_fn(
+                                    f_init if f_init is not None else f_step
+                                )
+                            elif cache_rebuild_reason == "assignment_lock_mask_only":
+                                f_init = motif_unindexing_controller.feature_dict_for_mask_only_initializer(
+                                    f_diffusion
+                                )
+                                promoted_initializer_outputs = initializer_fn(
+                                    f_init if f_init is not None else f_step
+                                )
+                            else:
+                                promoted_initializer_outputs = initializer_fn(f_step)
+                        elif (
+                            motif_unindexing_controller.config.promote_to_motif_on_activation
+                            and motif_unindexing_controller.activated_step is not None
+                        ):
+                            f_init = motif_unindexing_controller.feature_dict_for_initializer(
+                                f_diffusion
+                            )
+                            if f_init is not None:
+                                promoted_initializer_outputs = initializer_fn(f_init)
+                            else:
+                                promoted_initializer_outputs = initializer_fn(f_step)
+                    if promoted_initializer_outputs is not None:
+                        initializer_outputs_step = promoted_initializer_outputs
+
             # Noise the coordinates with scaled Gaussian noise
             epsilon_L = (
                 self.noise_scale
@@ -635,21 +959,21 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
 
             # Denoise the coordinates
             # Handle chunked mode vs standard mode (same as default sampler)
-            if "chunked_pairwise_embedder" in initializer_outputs:
+            if "chunked_pairwise_embedder" in initializer_outputs_step:
                 # Chunked mode: explicitly provide P_LL=None
                 tic = time.time()
-                chunked_embedder = initializer_outputs[
+                chunked_embedder = initializer_outputs_step[
                     "chunked_pairwise_embedder"
                 ]  # Don't pop, just get
                 other_outputs = {
                     k: v
-                    for k, v in initializer_outputs.items()
+                    for k, v in initializer_outputs_step.items()
                     if k != "chunked_pairwise_embedder"
                 }
                 outs = diffusion_module(
                     X_noisy_L=X_noisy_L,
                     t=t_hat.tile(D),
-                    f=f_diffusion,
+                    f=f_step,
                     P_LL=None,  # Not used in chunked mode
                     chunked_pairwise_embedder=chunked_embedder,
                     initializer_outputs=other_outputs,
@@ -665,9 +989,9 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 outs = diffusion_module(
                     X_noisy_L=X_noisy_L,
                     t=t_hat.tile(D),
-                    f=f_diffusion,
+                    f=f_step,
                     n_recycle=self.n_recycle,
-                    **initializer_outputs,
+                    **initializer_outputs_step,
                 )
             outs = self.apply_post_denoise_symmetry(
                 outs, f, step_num, c_t, gamma_min_sym
@@ -706,6 +1030,11 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                     T=float(noise_schedule[0]),
                     step_idx=step_num,
                 )
+            if motif_unindexing_controller is not None:
+                X_L = motif_unindexing_controller.apply_pre_activation_bias(
+                    X_L,
+                    step_num,
+                )
             self.log_step_diagnostics(step_num, "post_ode", X_L, f)
             X_L = self.apply_post_update_symmetry(
                 X_L, f, step_num, c_t, gamma_min_sym
@@ -719,6 +1048,26 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 stop_after=self.floating_motif_stop_after,
             ):
                 X_L = project_floating_motifs_all_atom(X_L, floating_motif_refs)
+            if motif_unindexing_controller is not None:
+                dynamic_refs = motif_unindexing_controller.active_floating_motif_refs(
+                    step_num
+                )
+                if dynamic_refs:
+                    X_L = project_floating_motifs_all_atom(
+                        X_L,
+                        dynamic_refs,
+                        alpha=motif_unindexing_controller.projection_alpha(step_num),
+                    )
+                    X_L = self.apply_post_update_symmetry(
+                        X_L, f, step_num, c_t, gamma_min_sym
+                    )
+                X_L = motif_unindexing_controller.apply_boundary_distance_bias(
+                    X_L,
+                    step_num,
+                )
+                motif_unindexing_controller.log_diagnostics(X_L, step_num)
+            if motif_backbone_bias_controller is not None:
+                X_L = motif_backbone_bias_controller.apply_bias(X_L, step_num)
             self.log_step_diagnostics(step_num, "post_kabsch", X_L, f)
             X_L = self.post_step_hook(X_L, f)
             self.log_step_diagnostics(step_num, "post_hook", X_L, f)
@@ -730,6 +1079,9 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             X_noisy_L_traj.append(X_noisy_L_scaled)
             X_denoised_L_traj.append(X_denoised_L)
             t_hats.append(t_hat)
+
+        if motif_backbone_bias_controller is not None:
+            X_L = motif_backbone_bias_controller.postprocess_X_L(X_L)
 
         if torch.any(is_motif_atom_with_fixed_coord) and self.allow_realignment:
             # Insert the gt motif at the end

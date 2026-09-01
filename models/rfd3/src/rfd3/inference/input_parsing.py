@@ -73,6 +73,12 @@ from rfd3.utils.inference import (
     set_indices,
 )
 
+from autocontigmap import (
+    estimate_gap_fill,
+    gap_size_percentile_threshold,
+)
+from autocontigmap import load_pickle as load_gap_checkpoint
+
 from foundry.common import exists
 from foundry.utils.components import (
     fetch_mask_from_idx,
@@ -88,6 +94,13 @@ logger = RankedLogger(__name__, rank_zero_only=True)
 
 _SCAFFOLD_CONTIG_TOKEN_RE = re.compile(r"^\d+(?:-\d+)?$")
 _AUTO_CONTIG_TOKEN_RE = re.compile(r"^auto$", re.IGNORECASE)
+_AUTO_GAP_CONTIG_TOKEN_RE = re.compile(r"^auto-gap$", re.IGNORECASE)
+_CONCRETE_MOTIF_TOKEN_RE = re.compile(r"^[A-Za-z]\d+(-\d+)?$")
+# Checkpoint variant + large-gap warning threshold for the 'auto-gap' contig
+# token -- see estimate_gap_fill()/gap_size_percentile_threshold() in the
+# autocontigmap package (github.com/lorenzkleiter/AutoContigmap).
+AUTO_GAP_CHECKPOINT = "results_checkpoint_gyr"
+AUTO_GAP_WARN_PERCENTILE = 0.95
 UNINDEXED_FLOATING_MOTIF_ANNOTATION = "is_motif_atom_unindexed_floating_motif"
 # Keep the original true-unindex implementation on disk for later experiments, but
 # route active unindexed_motifs through inline sampled placement for now.
@@ -115,6 +128,7 @@ def _input_selection_from_contig_with_placeholders(
             token == "SymMotif"
             or token in motif_names
             or _AUTO_CONTIG_TOKEN_RE.match(token)
+            or _AUTO_GAP_CONTIG_TOKEN_RE.match(token)
             or _SCAFFOLD_CONTIG_TOKEN_RE.match(token)
         ):
             continue
@@ -260,6 +274,18 @@ def _auto_length_distance_from_potentials(
     return max(candidates) if candidates else default_distance
 
 
+def _resolve_auto_gap_distance(auto_length_potentials, auto_length_default_distance) -> float:
+    """Same target-distance approximation used by length='auto' (see
+    resolve_auto_length() / _auto_length_distance_from_potentials() below) -- shared
+    here since floating motifs are only guided toward this distance during diffusion,
+    not placed at it in the input structure, so it's the best available stand-in for
+    an 'auto-gap' token's gap distance."""
+    return _auto_length_distance_from_potentials(
+        _auto_length_guiding_potentials(auto_length_potentials),
+        default_distance=auto_length_default_distance,
+    )
+
+
 def _auto_length_radius_from_potentials(
     potential_specs: list[dict],
     *,
@@ -318,7 +344,7 @@ def _numeric_values(value) -> list[float]:
 
 def _parse_length_range(length: Optional[str]) -> tuple[int, int]:
     if not exists(length):
-        raise ValueError("Contig token 'auto' requires the top-level 'length' field.")
+        raise ValueError("Contig token 'auto'/'auto-gap' requires the top-level 'length' field.")
     length = str(length)
     if "-" in length:
         length_min, length_max = map(int, length.split("-"))
@@ -329,51 +355,158 @@ def _parse_length_range(length: Optional[str]) -> tuple[int, int]:
     return value, value
 
 
-def _resolve_contig_auto_tokens(contig: Optional[str], length: Optional[str]) -> tuple[Optional[str], Optional[dict]]:
+def _adjacent_concrete_token(parts: list[str], idx: int, offset: int) -> str:
+    """The concrete motif token directly beside parts[idx] (offset -1 or +1), or raise."""
+    side = "left" if offset < 0 else "right"
+    neighbor_idx = idx + offset
+    if neighbor_idx < 0 or neighbor_idx >= len(parts):
+        raise ValueError(
+            f"Contig token 'auto-gap' at position {idx} has no token on its {side} side "
+            f"(it's at the {'start' if offset < 0 else 'end'} of the contig) -- auto-gap "
+            f"needs a concrete motif token directly on both sides. Use 'auto' for a free "
+            f"terminal region instead."
+        )
+    token = parts[neighbor_idx]
+    if not _CONCRETE_MOTIF_TOKEN_RE.match(token):
+        raise ValueError(
+            f"Contig token 'auto-gap' at position {idx} needs a concrete motif token "
+            f"(e.g. 'A15' or 'A10-20') directly on its {side} side, found '{token}' instead."
+        )
+    return token
+
+
+def _resolve_auto_gap_tokens(
+    parts: list[str],
+    auto_gap_positions: list[int],
+    length_min: int,
+    length_max: int,
+    gap_distance: float,
+) -> list[dict]:
+    """Resolve each 'auto-gap' position in `parts` in place to a concrete 'lo-hi' range,
+    estimated from gap_distance via autocontigmap. Uses the (already-resolved)
+    length_min-length_max as the checkpoint lookup window -- e.g. the geometric
+    approximation from `length: auto`, if that's how length was specified.
+
+    gap_distance is NOT measured from the input structure's coordinates: these are
+    floating motifs, free to move during diffusion and only guided toward a target
+    distance by potentials, so whatever distance the flanking residues happen to sit
+    at in the input PDB is arbitrary and not the design's actual gap. gap_distance is
+    instead the same guided/approximate target distance used for `length: auto`
+    itself (see _auto_length_distance_from_potentials()) -- the best approximation
+    available for "how far apart will these motifs actually end up."
+    """
+    gap_size_data = load_gap_checkpoint(AUTO_GAP_CHECKPOINT)
+    threshold = gap_size_percentile_threshold(
+        length_min, length_max, percentile=AUTO_GAP_WARN_PERCENTILE, gap_size_data=gap_size_data
+    )
+
+    auto_gap_info = []
+    for idx in auto_gap_positions:
+        prev_token = _adjacent_concrete_token(parts, idx, -1)
+        next_token = _adjacent_concrete_token(parts, idx, +1)
+        aa_low, aa_high = estimate_gap_fill(
+            gap_distance, length_min, length_max, gap_size_data=gap_size_data
+        )
+        if threshold is not None and gap_distance > threshold:
+            logger.warning(
+                f"Contig token 'auto-gap' at position {idx} (between '{prev_token}' and "
+                f"'{next_token}'): approximate gap is {gap_distance:.1f} Å, beyond the "
+                f"{int(AUTO_GAP_WARN_PERCENTILE * 100)}th percentile ({threshold} Å) of gap "
+                f"sizes seen in the checkpoint data for {length_min}-{length_max}-residue "
+                f"proteins -- a bigger design length range is probably necessary."
+            )
+        value = f"{aa_low}-{aa_high}"
+        parts[idx] = value
+        auto_gap_info.append({
+            "position": idx,
+            "prev_token": prev_token,
+            "next_token": next_token,
+            "gap_angstrom": gap_distance,
+            "min": aa_low,
+            "max": aa_high,
+        })
+
+    return auto_gap_info
+
+
+def _resolve_contig_auto_tokens(
+    contig: Optional[str], length: Optional[str], gap_distance: Optional[float] = None
+) -> tuple[Optional[str], Optional[dict]]:
     if not exists(contig):
         return contig, None
 
     parts = [part.strip() for part in str(contig).split(",")]
+    auto_gap_positions = [
+        idx for idx, part in enumerate(parts) if _AUTO_GAP_CONTIG_TOKEN_RE.match(part)
+    ]
     auto_positions = [
         idx for idx, part in enumerate(parts) if _AUTO_CONTIG_TOKEN_RE.match(part)
     ]
-    if not auto_positions:
+    if not auto_positions and not auto_gap_positions:
         return contig, None
 
     length_min, length_max = _parse_length_range(length)
     is_length_range = length_min != length_max
-    fixed_budget = 0
     resolved_parts = list(parts)
-    for idx, part in enumerate(parts):
+
+    auto_gap_info = []
+    if auto_gap_positions:
+        if gap_distance is None:
+            raise ValueError(
+                "Contig token 'auto-gap' requires a gap_distance (the same "
+                "guiding-potentials/auto_length_default_distance approximation used "
+                "for length='auto'), which wasn't available at this call site."
+            )
+        auto_gap_info = _resolve_auto_gap_tokens(
+            resolved_parts, auto_gap_positions, length_min, length_max, gap_distance
+        )
+
+    fixed_budget = 0
+    for idx, part in enumerate(resolved_parts):
         if idx in auto_positions:
             continue
         fixed_budget += _contig_part_max_length(part)
 
-    remaining_min = length_min - fixed_budget
-    remaining_max = length_max - fixed_budget
-    if remaining_min < 0 or remaining_max < 0:
-        raise ValueError(
-            f"Contig token 'auto' has negative remaining length: sampled length "
-            f"{length_min}-{length_max}, fixed/max contig budget {fixed_budget}."
-        )
-
-    min_values = _split_integer_budget(remaining_min, len(auto_positions))
-    max_values = _split_integer_budget(remaining_max, len(auto_positions))
     auto_lengths = []
-    for idx, min_value, max_value in zip(auto_positions, min_values, max_values):
-        if min_value > max_value:
+    remaining_min = remaining_max = None
+    if auto_positions:
+        remaining_min = length_min - fixed_budget
+        remaining_max = length_max - fixed_budget
+        if remaining_min < 0 or remaining_max < 0:
             raise ValueError(
-                f"Contig token 'auto' produced invalid range {min_value}-{max_value}."
+                f"Contig token 'auto' has negative remaining length: sampled length "
+                f"{length_min}-{length_max}, fixed/max contig budget {fixed_budget}."
             )
-        if is_length_range:
-            value = f"{min_value}-{max_value}"
-        else:
-            value = str(min_value)
-        auto_lengths.append(value)
-        resolved_parts[idx] = value
+
+        min_values = _split_integer_budget(remaining_min, len(auto_positions))
+        max_values = _split_integer_budget(remaining_max, len(auto_positions))
+        for idx, min_value, max_value in zip(auto_positions, min_values, max_values):
+            if min_value > max_value:
+                raise ValueError(
+                    f"Contig token 'auto' produced invalid range {min_value}-{max_value}."
+                )
+            if is_length_range:
+                value = f"{min_value}-{max_value}"
+            else:
+                value = str(min_value)
+            auto_lengths.append(value)
+            resolved_parts[idx] = value
 
     resolved = ",".join(resolved_parts)
-    resolved_length = f"{length_min}-{length_max}" if is_length_range else str(length_min)
+
+    if auto_gap_positions:
+        # Recompute the overall length bottom-up from every now-concrete part (the actual
+        # motif residues + the estimated gap ranges), rather than keeping the original
+        # length_min-length_max -- which may just be the 'length: auto' geometric
+        # approximation used above as the checkpoint lookup window, not an actual target.
+        new_length_min = sum(_contig_part_min_length(part) for part in resolved_parts)
+        new_length_max = sum(_contig_part_max_length(part) for part in resolved_parts)
+        resolved_length = (
+            f"{new_length_min}-{new_length_max}" if new_length_min != new_length_max else str(new_length_min)
+        )
+    else:
+        resolved_length = f"{length_min}-{length_max}" if is_length_range else str(length_min)
+
     return resolved, {
         "input_contig": contig,
         "resolved_contig": resolved,
@@ -382,9 +515,12 @@ def _resolve_contig_auto_tokens(contig: Optional[str], length: Optional[str]) ->
         "length_max": length_max,
         "fixed_budget": fixed_budget,
         "remaining_length": (
-            f"{remaining_min}-{remaining_max}" if is_length_range else remaining_min
+            (f"{remaining_min}-{remaining_max}" if is_length_range else remaining_min)
+            if auto_positions
+            else None
         ),
         "auto_lengths": auto_lengths,
+        "auto_gap": auto_gap_info,
     }
 
 
@@ -406,6 +542,23 @@ def _contig_part_max_length(part: str) -> int:
         return int(numeric)
     if "-" in numeric and all(piece.isdigit() for piece in numeric.split("-", 1)):
         return int(numeric.split("-", 1)[1])
+
+    return len(get_design_pattern_with_constraints(part))
+
+
+def _contig_part_min_length(part: str) -> int:
+    """Mirrors _contig_part_max_length(), but the lower bound of a numeric range."""
+    if not part or part == "/0":
+        return 0
+
+    numeric = part
+    suffix = numeric[-1] if numeric[-1:] in {"P", "R", "D"} else ""
+    if suffix:
+        numeric = numeric[:-1]
+    if numeric.isdigit():
+        return int(numeric)
+    if "-" in numeric and all(piece.isdigit() for piece in numeric.split("-", 1)):
+        return int(numeric.split("-", 1)[0])
 
     return len(get_design_pattern_with_constraints(part))
 
@@ -1362,6 +1515,7 @@ class DesignInputSpecification(BaseModel):
             sampling_contig, contig_auto_info = _resolve_contig_auto_tokens(
                 _design_contig,
                 effective_length,
+                _resolve_auto_gap_distance(self.auto_length_potentials, self.auto_length_default_distance),
             )
             sampling_length = (
                 str(contig_auto_info["length"])
@@ -1464,7 +1618,7 @@ class DesignInputSpecification(BaseModel):
 
     def _mark_unindexed_named_motifs(self, atom_array, atom_array_input_annotated):
         """Mark built atoms originating from unindexed_motifs for Kabsch eligibility."""
-        if not exists(self.unindexed_motifs):
+        if not exists(self.unindexed_motifs) or self._external_motif_unindexing_enabled():
             return atom_array
 
         atom_array.set_annotation(
@@ -1542,7 +1696,7 @@ class DesignInputSpecification(BaseModel):
         inline layout before diffusion, rather than diffused as appended true-unindex
         guideposts and cleaned up afterward.
         """
-        if not exists(self.unindexed_motifs):
+        if not exists(self.unindexed_motifs) or self._external_motif_unindexing_enabled():
             return {}, []
 
         excluded_motifs = excluded_motifs or set()
@@ -1560,6 +1714,16 @@ class DesignInputSpecification(BaseModel):
                 get_design_pattern_with_constraints(motif_contig_str)
             )
         return indexed_tokens, inline_components
+
+    def _external_motif_unindexing_enabled(self) -> bool:
+        """Allow JSON motif names to act as external references only.
+
+        The sampler-side motif_unindexing module reads the same JSON
+        input/motifs/unindexed_motifs fields, but no motif atoms should be
+        inserted by this parser path when this opt-in marker is present.
+        """
+        extra = self.extra or {}
+        return bool(extra.get("external_motif_unindexing", False))
 
     def _insert_inline_named_motifs(
         self,
@@ -1685,7 +1849,7 @@ class DesignInputSpecification(BaseModel):
         but retain a dedicated annotation so floating motif projection still treats them as
         rigid floating motifs.
         """
-        if not exists(self.unindexed_motifs):
+        if not exists(self.unindexed_motifs) or self._external_motif_unindexing_enabled():
             return {}, [], []
 
         excluded_motifs = excluded_motifs or set()
@@ -1993,6 +2157,7 @@ class DesignInputSpecification(BaseModel):
             sampling_contig, _contig_auto_info = _resolve_contig_auto_tokens(
                 resolved_contig,
                 self.length,
+                _resolve_auto_gap_distance(self.auto_length_potentials, self.auto_length_default_distance),
             )
             sampling_length = (
                 str(_contig_auto_info["length"])
@@ -2023,6 +2188,7 @@ class DesignInputSpecification(BaseModel):
             sampling_contig, _contig_auto_info = _resolve_contig_auto_tokens(
                 resolved_contig,
                 effective_length,
+                _resolve_auto_gap_distance(self.auto_length_potentials, self.auto_length_default_distance),
             )
             sampling_length = (
                 str(_contig_auto_info["length"])

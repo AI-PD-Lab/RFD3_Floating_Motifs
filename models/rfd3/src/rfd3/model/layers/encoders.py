@@ -241,10 +241,21 @@ class TokenInitializer(nn.Module):
                 # Original full P_LL computation
                 ##################################################################################
                 # Embed motif coordinates
-                valid_mask = (
-                    f["is_motif_atom_with_fixed_coord"].unsqueeze(-1)
-                    & f["is_motif_atom_with_fixed_coord"].unsqueeze(-2)
-                ).unsqueeze(-1)
+                # When motif_id is present (motif_pos_only cache), use it directly as the
+                # gate — no dependency on is_motif_atom_with_fixed_coord, so C_L is built
+                # without the "fixed-coord" encoding that would be inconsistent at runtime.
+                if "motif_id" in f:
+                    mid = f["motif_id"]  # [L] int, -1 for non-motif
+                    same_motif = (
+                        (mid.unsqueeze(-1) == mid.unsqueeze(-2))
+                        & (mid.unsqueeze(-1) >= 0)
+                        & (mid.unsqueeze(-2) >= 0)
+                    )
+                    valid_mask = same_motif.unsqueeze(-1)
+                else:
+                    fixed_coord = f["is_motif_atom_with_fixed_coord"]
+                    both_fixed = fixed_coord.unsqueeze(-1) & fixed_coord.unsqueeze(-2)
+                    valid_mask = both_fixed.unsqueeze(-1)
                 P_LL = self.motif_pos_embedder(
                     f["motif_pos"], valid_mask
                 )  # (L, L, c_atompair)

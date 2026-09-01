@@ -7,6 +7,9 @@ gradients, which are then used to update the sampler trajectory.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import torch
 
 
@@ -1689,9 +1692,13 @@ class MotifRadialOrientationPotential(BasePotential):
         motif_offsets: list | None = None,
         motif_axis_weights: list | None = None,
         origin_atom_filter: str = "real",
+        parallel_transport_frame: bool = False,
         eps: float = 1e-6,
     ):
         super().__init__(weight)
+        # Opt-in (default False). Parallel-transport the reference radial frame
+        # along r_ref -> r_cur instead of re-seeding tangent axes from world axes.
+        self.parallel_transport_frame = bool(parallel_transport_frame)
         self.motif_offsets: list = list(motif_offsets) if motif_offsets is not None else []
         self.motif_axis_weights: list = (
             list(motif_axis_weights) if motif_axis_weights is not None else []
@@ -1834,7 +1841,11 @@ class MotifRadialOrientationPotential(BasePotential):
             # Columns of each frame are [r, t1, t2]: r is the radial axis,
             # t1 and t2 are two perpendicular tangents chosen deterministically.
             A_ref_i = _build_radial_frame(r_ref_i, self.eps)          # [3, 3]
-            A_cur_i = _build_radial_frame_batched(r_cur_i, self.eps)  # [D, 3, 3]
+            if self.parallel_transport_frame:
+                R_transport = _min_rotation_matrix_batched(r_ref_i, r_cur_i, self.eps)
+                A_cur_i = torch.matmul(R_transport, A_ref_i.unsqueeze(0)).detach()  # [D, 3, 3]
+            else:
+                A_cur_i = _build_radial_frame_batched(r_cur_i, self.eps)  # [D, 3, 3]
 
             # Express reference coordinates in the local radial frame of
             # A_ref_i, then apply any per-motif rotation offset.
@@ -1882,6 +1893,558 @@ class MotifRadialOrientationPotential(BasePotential):
             return torch.zeros_like(atom_grad)
         transformed = torch.zeros_like(atom_grad)
         for block_mask in motif_blocks:
+            if block_mask.sum().item() < 3:
+                continue
+            # Project to pure rigid rotation: zero translation, zero deformation.
+            transformed[:, block_mask, :] = _project_gradient_to_rigid_body(
+                atom_grad[:, block_mask, :],
+                xyz[:, block_mask, :],
+                allow_translation=False,
+                allow_rotation=True,
+            )
+        return transformed
+
+
+class MotifForbiddenRadialOrientation(BasePotential):
+    """Repel each motif's rotation away from its 180-degree-flipped input pose.
+
+    This is the repulsive counterpart to ``MotifRadialOrientationPotential``.
+    Given a reference PDB where a motif-receptor pair is docked, rotating that
+    pair 180 degrees about the motif-motif axis (the line from the shared
+    reference centre through the motif's own reference COM) produces a known
+    "forbidden" configuration — verified by inspecting where the receptor ends
+    up in that reference PDB. The receptor itself is never part of the RFD3
+    contig or the sampled structure, so only the motif's own coordinates are
+    needed here; this potential requires no receptor-handling code at all.
+
+    Because ``MotifRadialOrientationPotential`` already expresses each motif's
+    reference coordinates in a local frame ``[r, t1, t2]`` with the radial
+    (motif-motif axis) direction as axis 0, a 180-degree rotation about that
+    axis is exactly the sign flip ``(r, t1, t2) -> (r, -t1, -t2)`` — no new
+    rotation-matrix machinery is needed, just negating the two tangential
+    components of the projected reference coordinates.
+
+    Unlike the attractive potentials, this restraint is a bounded repulsive
+    bump rather than a raw unbounded quadratic:
+
+        bump = 1 - exp(-mean_loss / (2 * sigma**2))
+        value = weight * bump
+
+    ``bump`` is 0 exactly at the forbidden pose and saturates to 1 (full
+    ``weight``, ~zero gradient) far away from it. This shape is required: an
+    unbounded quadratic with a flipped sign would not add new information
+    here, since (on the single rotational degree of freedom being probed)
+    "maximize deviation from the 180-degree target" is mathematically
+    equivalent to "minimize deviation from the 0-degree target" — i.e. it
+    would just reproduce the attractive potential. The bounded bump instead
+    creates a genuinely localized exclusion zone. ``sigma`` (same Å^2-scale
+    units as the underlying local-frame squared-deviation loss) is the width
+    hyperparameter: larger ``sigma`` undersamples a wider neighbourhood of
+    poses similar to the forbidden one.
+
+    Note: there is deliberately no "forbidden spherical position" counterpart.
+    A 180-degree rotation about the motif-motif axis passes through the
+    motif's own reference COM, so it never moves that COM — the forbidden
+    target for angular position would always coincide exactly with the
+    ordinary attractive ``MotifSphericalPosition`` target, so it could only
+    ever fight that potential (or penalise the correct pose) without ever
+    discriminating the flip. The flip is entirely an orientation-channel
+    phenomenon, fully captured by this potential alone.
+
+    IMPORTANT — pair this with ``motif_spherical_position``: the local frame
+    ``[r, t1, t2]`` this potential reuses from ``MotifRadialOrientationPotential``
+    is built via a Gram-Schmidt construction seeded from whichever fixed global
+    axis is least aligned with the motif's *current* radial direction ``r_cur``.
+    That seed choice is not equivariant under rotation, so if ``r_cur`` drifts
+    far enough from the motif's reference direction ``r_ref`` to flip which
+    global axis gets picked, the local-frame coordinates pick up a large,
+    spurious jump unrelated to the motif's actual internal rotation (this is a
+    pre-existing property of the shared frame-construction helper, inherited
+    here unmodified, not something specific to this class). Empirically this
+    artifact is negligible while the current and reference radial directions
+    stay within roughly 5-10 degrees of each other, and jumps to an O(1)
+    spurious contribution beyond that. Keeping ``motif_spherical_position``
+    active with a meaningful nonzero weight alongside this potential keeps
+    ``r_cur`` close to ``r_ref`` and is effectively a prerequisite for a
+    trustworthy signal here, not an optional nicety.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        sigma: float = 3.0,
+        motif_indices: list | None = None,
+        motif_axis_weights: list | None = None,
+        origin_atom_filter: str = "real",
+        normalize_by_rho2: bool = False,
+        parallel_transport_frame: bool = False,
+        eps: float = 1e-6,
+    ):
+        super().__init__(weight)
+        if sigma <= 0.0:
+            raise ValueError("motif_forbidden_radial_orientation sigma must be positive")
+        self.sigma = float(sigma)
+        # Opt-in (default False = original behaviour). When True, each motif's
+        # squared-deviation loss is divided by <rho^2> — the mean squared
+        # tangential (perpendicular-to-radial) distance of its reference atoms.
+        # That is the motif-size scale factor S^2 which otherwise makes `sigma`
+        # a meaningless Angstrom^2 value; after normalisation mean_loss is
+        # dimensionless and ~[0,4] for the parallel<->antiparallel rotation, so
+        # `sigma` becomes an angular width (~1) and the potential exerts a real
+        # gradient once the motif nears its correct angular position instead of
+        # saturating to zero. See MotifForbiddenRadialOrientationCompact notes.
+        self.normalize_by_rho2 = bool(normalize_by_rho2)
+        # Opt-in (default False = original behaviour). When True, the current
+        # radial frame is the reference frame parallel-transported along
+        # r_ref -> r_cur, rather than rebuilt from world axes. This removes the
+        # angular-position contamination of the orientation loss (see
+        # _min_rotation_matrix_batched), so the loss/force reflect only the
+        # genuine orientation and the potential can act before the angular
+        # position has settled — without a spherical-position pin.
+        self.parallel_transport_frame = bool(parallel_transport_frame)
+        self.motif_indices: list | None = (
+            None if motif_indices is None else [int(i) for i in motif_indices]
+        )
+        self.motif_axis_weights: list = (
+            list(motif_axis_weights) if motif_axis_weights is not None else []
+        )
+        valid_origin_filters = ("real", "potential", "guide", "motif", "all")
+        if origin_atom_filter not in valid_origin_filters:
+            raise ValueError(
+                "motif_forbidden_radial_orientation origin_atom_filter must be one of "
+                f"{valid_origin_filters}"
+            )
+        self.origin_atom_filter = origin_atom_filter
+        self.eps = float(eps)
+        self.skip_reason: str | None = None
+        self.skip_detail: dict | None = None
+
+    def _selected_motif_indices(self, n_blocks: int) -> range | list:
+        if self.motif_indices is None:
+            return range(n_blocks)
+        return [i for i in self.motif_indices if 0 <= i < n_blocks]
+
+    def _axis_weights_tensor(
+        self,
+        motif_i: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """[3] per-axis loss weights for motif_i. Default [1, 1, 1] (full constraint).
+
+        Same semantics as MotifRadialOrientationPotential._axis_weights_tensor.
+        """
+        if motif_i < len(self.motif_axis_weights):
+            aw = self.motif_axis_weights[motif_i]
+            if hasattr(aw, "__len__") and len(aw) >= 3:
+                return torch.tensor(
+                    [float(aw[0]), float(aw[1]), float(aw[2])],
+                    device=device,
+                    dtype=dtype,
+                )
+        return torch.ones(3, device=device, dtype=dtype)
+
+    def compute(self, xyz, masks, metadata):
+        self.skip_reason = None
+        self.skip_detail = None
+
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        self.skip_detail = {
+            "n_motif_blocks": len(motif_blocks),
+            "motif_indices": self.motif_indices,
+            "origin_atom_filter": self.origin_atom_filter,
+        }
+
+        if len(motif_blocks) == 0:
+            self.skip_reason = "no_motif_blocks"
+            return xyz.new_zeros(())
+
+        selected_indices = self._selected_motif_indices(len(motif_blocks))
+        if not selected_indices:
+            self.skip_reason = "no_selected_motif_indices"
+            return xyz.new_zeros(())
+
+        # Protein COM for this step — detached so the potential cannot push
+        # atoms toward or away from the COM (no radial-distance gradient).
+        origin_mask = _pose_origin_atom_mask(
+            self.origin_atom_filter, masks, xyz.device
+        )
+        current_com = _masked_current_com(xyz, origin_mask)
+        if current_com is None:
+            self.skip_reason = "current_com_missing"
+            return xyz.new_zeros(())
+        current_com = current_com.detach()  # [D, 3]
+
+        # Reference global centre = mean of all motif-block reference centres,
+        # exactly as MotifRadialOrientationPotential defines it.
+        ref_centers: list[torch.Tensor] = []
+        for block_mask in motif_blocks:
+            rc = _motif_block_reference_com(xyz, masks, metadata, block_mask)
+            ref_centers.append(rc)
+        valid_ref_centers = [c for c in ref_centers if c is not None]
+        if not valid_ref_centers:
+            self.skip_reason = "no_motif_reference_centers"
+            return xyz.new_zeros(())
+        c_ref_global = torch.stack(valid_ref_centers, dim=0).mean(dim=0)  # [3]
+
+        flip = xyz.new_tensor([1.0, -1.0, -1.0])  # 180-deg rotation about local axis 0 (r)
+
+        total_loss = xyz.new_zeros(())
+        n_active = 0
+
+        for motif_i in selected_indices:
+            block_mask = motif_blocks[motif_i]
+            current_xyz_i, ref_xyz_i = _motif_block_current_and_reference_xyz(
+                xyz, masks, metadata, block_mask
+            )
+            if current_xyz_i is None or ref_xyz_i is None or ref_xyz_i.shape[0] < 3:
+                continue
+
+            ref_com_i = ref_xyz_i.mean(dim=0)  # [3]
+
+            d_ref = ref_com_i - c_ref_global  # [3]
+            d_ref_norm = d_ref.norm()
+            if d_ref_norm < self.eps:
+                continue
+            r_ref_i = d_ref / d_ref_norm  # [3] unit vector
+
+            m_cur_i = _motif_block_current_com(xyz, block_mask)  # [D, 3]
+            if m_cur_i is None:
+                continue
+
+            # Current radial direction — detached so the gradient does NOT
+            # push the motif to a specific angular position on the sphere.
+            d_cur = m_cur_i - current_com  # [D, 3]
+            d_cur_norm = d_cur.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+            r_cur_i = (d_cur / d_cur_norm).detach()  # [D, 3]
+
+            A_ref_i = _build_radial_frame(r_ref_i, self.eps)          # [3, 3]
+            if self.parallel_transport_frame:
+                # Carry the reference tangent axes along the geodesic r_ref->r_cur
+                # so A_cur differs from A_ref only by the genuine r-rotation
+                # (no world-axis re-seed) -> loss measures pure orientation.
+                R_transport = _min_rotation_matrix_batched(r_ref_i, r_cur_i, self.eps)
+                A_cur_i = torch.matmul(R_transport, A_ref_i.unsqueeze(0)).detach()  # [D, 3, 3]
+            else:
+                A_cur_i = _build_radial_frame_batched(r_cur_i, self.eps)  # [D, 3, 3]
+
+            # Express reference coordinates in the local radial frame, then
+            # flip 180 degrees about the radial axis to get the forbidden
+            # target: negate the two tangential (t1, t2) components.
+            ref_centered = ref_xyz_i - ref_com_i  # [N, 3]
+            ref_local = ref_centered @ A_ref_i  # [N, 3]
+            forbidden_local = ref_local * flip  # [N, 3]
+
+            current_centered = (
+                current_xyz_i - current_xyz_i.mean(dim=1, keepdim=True)
+            )  # [D, N, 3]
+            current_local = current_centered @ A_cur_i  # [D, N, 3]
+            diff_local = current_local - forbidden_local.unsqueeze(0)  # [D, N, 3]
+
+            axis_w = self._axis_weights_tensor(motif_i, xyz.device, xyz.dtype)
+            per_motif_loss = (diff_local.pow(2) * axis_w).sum(dim=-1).mean()
+            if self.normalize_by_rho2:
+                # <rho^2>: mean squared tangential (t1, t2) distance of the
+                # reference atoms from the radial axis — the S^2 scale factor.
+                rho2 = (ref_local[:, 1] ** 2 + ref_local[:, 2] ** 2).mean()
+                per_motif_loss = per_motif_loss / rho2.clamp_min(self.eps)
+            total_loss = total_loss + per_motif_loss
+            n_active += 1
+
+        if n_active == 0:
+            self.skip_reason = "no_active_motifs"
+            return xyz.new_zeros(())
+
+        mean_loss = total_loss / n_active
+        bump = 1.0 - torch.exp(-mean_loss / (2.0 * self.sigma**2))
+        return self.weight * bump
+
+    def guide_atom_mask(self, masks, metadata, device):
+        motif_blocks = _motif_distance_blocks(masks, metadata, device)
+        if not motif_blocks:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        guide_mask = torch.zeros_like(motif_blocks[0], dtype=torch.bool, device=device)
+        for motif_i in self._selected_motif_indices(len(motif_blocks)):
+            guide_mask = guide_mask | motif_blocks[motif_i]
+        return guide_mask
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        if not motif_blocks:
+            return torch.zeros_like(atom_grad)
+        transformed = torch.zeros_like(atom_grad)
+        for motif_i in self._selected_motif_indices(len(motif_blocks)):
+            block_mask = motif_blocks[motif_i]
+            if block_mask.sum().item() < 3:
+                continue
+            # Project to pure rigid rotation: zero translation, zero deformation.
+            transformed[:, block_mask, :] = _project_gradient_to_rigid_body(
+                atom_grad[:, block_mask, :],
+                xyz[:, block_mask, :],
+                allow_translation=False,
+                allow_rotation=True,
+            )
+        return transformed
+
+
+class MotifForbiddenRadialOrientationCompact(BasePotential):
+    """Repel each motif's rotation away from its 180-degree-flipped input pose,
+    using a compactly-supported (exactly-flat-beyond-cutoff) bump instead of
+    ``MotifForbiddenRadialOrientation``'s Gaussian-tailed one.
+
+    Same forbidden-pose concept as ``MotifForbiddenRadialOrientation`` (see
+    that class's docstring for the shared derivation: local frame ``[r, t1,
+    t2]``, forbidden target = reference coordinates with tangential axes
+    sign-flipped, no receptor-handling code needed, must be paired with
+    ``motif_spherical_position`` for the same frame-instability reason
+    documented there — inherited unmodified from ``_build_radial_frame``/
+    ``_build_radial_frame_batched``, negligible while current/reference radial
+    directions stay within ~5-10 degrees, spurious beyond that).
+
+    The difference is entirely in the final shaping step. The Gaussian-tailed
+    sibling's ``bump = 1 - exp(-mean_loss / (2*sigma**2))`` only *asymptotically*
+    approaches 1 (no gradient) far from the forbidden pose. Once ``sigma`` is
+    large enough to matter against the very large ``mean_loss`` values seen
+    early in a diffusion trajectory (structure not yet converged), that
+    asymptotic shape becomes locally linear in ``mean_loss`` across the entire
+    physically-relevant range — and since ``mean_loss(theta) = 2*S^2*(1+cos
+    theta)`` (the closed form on the tracked spin angle) has a single global
+    maximum at ``theta=0`` (the reference/"correct" pose, not a neighbourhood
+    of anything), maximizing it via gradient ascent collapses this potential
+    into a disguised version of the attractive ``MotifRadialOrientationPotential``
+    — pulling toward one specific orientation, not repelling from a
+    neighbourhood while staying neutral elsewhere. No choice of ``sigma``
+    avoids this: the same parameter controls both how early the potential can
+    activate and how flat it stays, and pushing one erodes the other.
+
+    This class instead uses a quintic "smootherstep" polynomial:
+
+        t    = clamp(mean_loss / cutoff, 0, 1)
+        bump = 6*t**5 - 15*t**4 + 10*t**3
+        value = weight * bump
+
+    ``bump`` is *exactly* 0 at the forbidden pose and *exactly* 1 for every
+    ``mean_loss >= cutoff`` — not asymptotically, exactly, with exactly zero
+    gradient throughout that region (the polynomial's derivative,
+    ``30*t**2*(t-1)**2``, is algebraically zero at both ``t=0`` and ``t=1``).
+    This guarantees no preference is ever expressed between different "far
+    from forbidden" orientations, however far apart they are, which is the
+    entire point of this class: repel from a neighbourhood of the forbidden
+    pose, remain genuinely indifferent everywhere else, never collapse into a
+    single-orientation attractor. No ``torch.where``/``eps``-guarding is
+    needed anywhere in this formula (unlike a C-infinity mollifier
+    alternative built from ``exp(-1/t)``, which would need such guarding to
+    avoid NaN gradients at its own domain boundary) — there is no division or
+    exponential-of-reciprocal in this construction at all, so there is no
+    asymptote to guard against.
+
+    ``cutoff`` is in the same Å^2 units as ``mean_loss`` and has an exact,
+    checkable meaning: no motif with ``mean_loss`` at or above this value ever
+    receives any gradient from this potential. Since ``mean_loss(theta) =
+    2*S^2*(1+cos theta)`` for a motif with tangential spread ``S^2`` (its own
+    reference atoms' mean squared distance from the motif-motif axis), you can
+    solve this relationship directly for whatever angular exclusion width you
+    want around the forbidden pose, given your motifs' own ``S^2``.
+
+    With multiple active motifs (``motif_indices=None``, the default), each
+    motif's loss is shaped independently and the *minimum* of the resulting
+    per-motif bumps is reported, not their average. Averaging the raw losses
+    before shaping (as the Gaussian-tailed sibling does) would create a dead
+    zone under a hard cutoff: one motif could sit exactly at its own forbidden
+    pose while another is far from its own, and the *average* loss could
+    still clear the cutoff, reporting "fully safe" despite one motif genuinely
+    being in the excluded zone. Taking the min across per-motif bumps instead
+    means the potential reports "unsafe" if *any* single motif is near its own
+    forbidden neighbourhood. This does not affect SE(3) invariance: each
+    per-motif bump is already invariant on its own (built only from relative
+    geometry via the shared frame-construction helpers), and any combination
+    of already-invariant scalars — min, mean, whatever — is itself invariant.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        cutoff: float = 100.0,
+        motif_indices: list | None = None,
+        motif_axis_weights: list | None = None,
+        origin_atom_filter: str = "real",
+        parallel_transport_frame: bool = False,
+        eps: float = 1e-6,
+    ):
+        super().__init__(weight)
+        if cutoff <= 0.0:
+            raise ValueError(
+                "motif_forbidden_radial_orientation_compact cutoff must be positive"
+            )
+        self.cutoff = float(cutoff)
+        self.parallel_transport_frame = bool(parallel_transport_frame)
+        self.motif_indices: list | None = (
+            None if motif_indices is None else [int(i) for i in motif_indices]
+        )
+        self.motif_axis_weights: list = (
+            list(motif_axis_weights) if motif_axis_weights is not None else []
+        )
+        valid_origin_filters = ("real", "potential", "guide", "motif", "all")
+        if origin_atom_filter not in valid_origin_filters:
+            raise ValueError(
+                "motif_forbidden_radial_orientation_compact origin_atom_filter must be one of "
+                f"{valid_origin_filters}"
+            )
+        self.origin_atom_filter = origin_atom_filter
+        self.eps = float(eps)
+        self.skip_reason: str | None = None
+        self.skip_detail: dict | None = None
+
+    def _selected_motif_indices(self, n_blocks: int) -> range | list:
+        if self.motif_indices is None:
+            return range(n_blocks)
+        return [i for i in self.motif_indices if 0 <= i < n_blocks]
+
+    def _axis_weights_tensor(
+        self,
+        motif_i: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """[3] per-axis loss weights for motif_i. Default [1, 1, 1] (full constraint).
+
+        Same semantics as MotifRadialOrientationPotential._axis_weights_tensor.
+        """
+        if motif_i < len(self.motif_axis_weights):
+            aw = self.motif_axis_weights[motif_i]
+            if hasattr(aw, "__len__") and len(aw) >= 3:
+                return torch.tensor(
+                    [float(aw[0]), float(aw[1]), float(aw[2])],
+                    device=device,
+                    dtype=dtype,
+                )
+        return torch.ones(3, device=device, dtype=dtype)
+
+    def compute(self, xyz, masks, metadata):
+        self.skip_reason = None
+        self.skip_detail = None
+
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        self.skip_detail = {
+            "n_motif_blocks": len(motif_blocks),
+            "motif_indices": self.motif_indices,
+            "origin_atom_filter": self.origin_atom_filter,
+        }
+
+        if len(motif_blocks) == 0:
+            self.skip_reason = "no_motif_blocks"
+            return xyz.new_zeros(())
+
+        selected_indices = self._selected_motif_indices(len(motif_blocks))
+        if not selected_indices:
+            self.skip_reason = "no_selected_motif_indices"
+            return xyz.new_zeros(())
+
+        # Protein COM for this step — detached so the potential cannot push
+        # atoms toward or away from the COM (no radial-distance gradient).
+        origin_mask = _pose_origin_atom_mask(
+            self.origin_atom_filter, masks, xyz.device
+        )
+        current_com = _masked_current_com(xyz, origin_mask)
+        if current_com is None:
+            self.skip_reason = "current_com_missing"
+            return xyz.new_zeros(())
+        current_com = current_com.detach()  # [D, 3]
+
+        # Reference global centre = mean of all motif-block reference centres,
+        # exactly as MotifRadialOrientationPotential defines it.
+        ref_centers: list[torch.Tensor] = []
+        for block_mask in motif_blocks:
+            rc = _motif_block_reference_com(xyz, masks, metadata, block_mask)
+            ref_centers.append(rc)
+        valid_ref_centers = [c for c in ref_centers if c is not None]
+        if not valid_ref_centers:
+            self.skip_reason = "no_motif_reference_centers"
+            return xyz.new_zeros(())
+        c_ref_global = torch.stack(valid_ref_centers, dim=0).mean(dim=0)  # [3]
+
+        flip = xyz.new_tensor([1.0, -1.0, -1.0])  # 180-deg rotation about local axis 0 (r)
+
+        per_motif_bumps: list[torch.Tensor] = []
+
+        for motif_i in selected_indices:
+            block_mask = motif_blocks[motif_i]
+            current_xyz_i, ref_xyz_i = _motif_block_current_and_reference_xyz(
+                xyz, masks, metadata, block_mask
+            )
+            if current_xyz_i is None or ref_xyz_i is None or ref_xyz_i.shape[0] < 3:
+                continue
+
+            ref_com_i = ref_xyz_i.mean(dim=0)  # [3]
+
+            d_ref = ref_com_i - c_ref_global  # [3]
+            d_ref_norm = d_ref.norm()
+            if d_ref_norm < self.eps:
+                continue
+            r_ref_i = d_ref / d_ref_norm  # [3] unit vector
+
+            m_cur_i = _motif_block_current_com(xyz, block_mask)  # [D, 3]
+            if m_cur_i is None:
+                continue
+
+            # Current radial direction — detached so the gradient does NOT
+            # push the motif to a specific angular position on the sphere.
+            d_cur = m_cur_i - current_com  # [D, 3]
+            d_cur_norm = d_cur.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+            r_cur_i = (d_cur / d_cur_norm).detach()  # [D, 3]
+
+            A_ref_i = _build_radial_frame(r_ref_i, self.eps)          # [3, 3]
+            if self.parallel_transport_frame:
+                R_transport = _min_rotation_matrix_batched(r_ref_i, r_cur_i, self.eps)
+                A_cur_i = torch.matmul(R_transport, A_ref_i.unsqueeze(0)).detach()  # [D, 3, 3]
+            else:
+                A_cur_i = _build_radial_frame_batched(r_cur_i, self.eps)  # [D, 3, 3]
+
+            # Express reference coordinates in the local radial frame, then
+            # flip 180 degrees about the radial axis to get the forbidden
+            # target: negate the two tangential (t1, t2) components.
+            ref_centered = ref_xyz_i - ref_com_i  # [N, 3]
+            ref_local = ref_centered @ A_ref_i  # [N, 3]
+            forbidden_local = ref_local * flip  # [N, 3]
+
+            current_centered = (
+                current_xyz_i - current_xyz_i.mean(dim=1, keepdim=True)
+            )  # [D, N, 3]
+            current_local = current_centered @ A_cur_i  # [D, N, 3]
+            diff_local = current_local - forbidden_local.unsqueeze(0)  # [D, N, 3]
+
+            axis_w = self._axis_weights_tensor(motif_i, xyz.device, xyz.dtype)
+            loss_i = (diff_local.pow(2) * axis_w).sum(dim=-1).mean()
+
+            t_i = (loss_i / self.cutoff).clamp(min=0.0, max=1.0)
+            bump_i = t_i * t_i * t_i * (10.0 + t_i * (-15.0 + 6.0 * t_i))  # quintic smootherstep
+            per_motif_bumps.append(bump_i)
+
+        if not per_motif_bumps:
+            self.skip_reason = "no_active_motifs"
+            return xyz.new_zeros(())
+
+        bump = torch.stack(per_motif_bumps).min()
+        return self.weight * bump
+
+    def guide_atom_mask(self, masks, metadata, device):
+        motif_blocks = _motif_distance_blocks(masks, metadata, device)
+        if not motif_blocks:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        guide_mask = torch.zeros_like(motif_blocks[0], dtype=torch.bool, device=device)
+        for motif_i in self._selected_motif_indices(len(motif_blocks)):
+            guide_mask = guide_mask | motif_blocks[motif_i]
+        return guide_mask
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        if not motif_blocks:
+            return torch.zeros_like(atom_grad)
+        transformed = torch.zeros_like(atom_grad)
+        for motif_i in self._selected_motif_indices(len(motif_blocks)):
+            block_mask = motif_blocks[motif_i]
             if block_mask.sum().item() < 3:
                 continue
             # Project to pure rigid rotation: zero translation, zero deformation.
@@ -3373,6 +3936,32 @@ def _motif_block_current_and_reference_xyz(
     return current_xyz[:, valid, :], ref_xyz[valid]
 
 
+def _motif_block_res_ids(
+    metadata: dict,
+    block_mask: torch.Tensor,
+) -> "set[int] | None":
+    """Original residue ids of one contig motif block, from
+    ``metadata['motif_atom_res_id']`` (populated by the potentials adapter from
+    each floating-motif reference's src_component).
+
+    Returns None when the mapping isn't available (older inputs / non
+    floating-motif runs), so callers fall back to their previous behaviour of
+    loading the whole align chain. Used by the offline align path (align=True)
+    to restrict an external align chain to exactly this motif's residues before
+    the 1:1 Kabsch fit -- fixing the case where the align chain (e.g. a
+    full-length receptor template) spans residues the contig trimmed away.
+    """
+    res_id_map = metadata.get("motif_atom_res_id")
+    if res_id_map is None:
+        return None
+    res_id_map = res_id_map.to(device=block_mask.device)
+    block_res = res_id_map[block_mask]
+    block_res = block_res[block_res >= 0]
+    if block_res.numel() == 0:
+        return None
+    return {int(r) for r in torch.unique(block_res).tolist()}
+
+
 def _motif_block_current_com(
     xyz: torch.Tensor,
     block_mask: torch.Tensor,
@@ -3635,6 +4224,54 @@ def _build_radial_frame_batched(r: torch.Tensor, eps: float = 1e-6) -> torch.Ten
     return torch.stack([r, t1, t2], dim=-1)  # [D, 3, 3], columns are basis vectors
 
 
+def _min_rotation_matrix_batched(
+    a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """Minimal (geodesic) rotation matrices R with R @ a = b, per batch element.
+
+    a: [3] (broadcast) or [D, 3];  b: [D, 3];  returns [D, 3, 3].
+    Used to parallel-transport a reference radial frame from r_ref to r_cur so
+    the tangent axes are carried along the geodesic instead of being re-seeded
+    from world axes (which leaks angular position into the orientation loss).
+    Handles a~b (R=I) and a~-b (180 deg about an arbitrary perpendicular).
+    Inputs are detached; the returned frame stays out of the autograd graph.
+    """
+    b = (b / b.norm(dim=-1, keepdim=True).clamp_min(eps)).detach()
+    if a.dim() == 1:
+        a = a.unsqueeze(0).expand_as(b)
+    a = (a / a.norm(dim=-1, keepdim=True).clamp_min(eps)).detach()
+    D = b.shape[0]
+    dtype, device = b.dtype, b.device
+    v = torch.cross(a, b, dim=-1)          # axis * sin(theta)   [D, 3]
+    c = (a * b).sum(dim=-1)                # cos(theta)          [D]
+    s2 = (v * v).sum(dim=-1)               # sin^2(theta)        [D]
+    eye = torch.eye(3, dtype=dtype, device=device).expand(D, 3, 3)
+    zero = torch.zeros(D, dtype=dtype, device=device)
+    vx = torch.stack([
+        torch.stack([zero, -v[:, 2], v[:, 1]], dim=-1),
+        torch.stack([v[:, 2], zero, -v[:, 0]], dim=-1),
+        torch.stack([-v[:, 1], v[:, 0], zero], dim=-1),
+    ], dim=-2)                             # [D, 3, 3]
+    coef = ((1.0 - c) / s2.clamp_min(eps)).view(D, 1, 1)
+    R = eye + vx + torch.matmul(vx, vx) * coef   # Rodrigues (valid for sin != 0)
+    # Degenerate: sin(theta) ~ 0.  a~b -> identity; a~-b -> 180 deg flip.
+    near_deg = s2 < eps
+    if near_deg.any():
+        Rdeg = eye.clone()
+        anti = near_deg & (c < 0)
+        if anti.any():
+            aa = a[anti]
+            widx = aa.abs().argmin(dim=-1)
+            wv = torch.zeros_like(aa)
+            wv.scatter_(-1, widx.unsqueeze(-1), 1.0)
+            perp = wv - (wv * aa).sum(dim=-1, keepdim=True) * aa
+            perp = perp / perp.norm(dim=-1, keepdim=True).clamp_min(eps)
+            Rdeg[anti] = (2.0 * torch.matmul(perp.unsqueeze(-1), perp.unsqueeze(-2))
+                          - torch.eye(3, dtype=dtype, device=device))
+        R = torch.where(near_deg.view(D, 1, 1), Rdeg, R)
+    return R.detach()
+
+
 def _project_gradient_to_rigid_body(
     atom_grad: torch.Tensor,
     xyz_block: torch.Tensor,
@@ -3692,6 +4329,1159 @@ def _soft_contacts(dists: torch.Tensor, r_0: float, d_0: float) -> torch.Tensor:
     return 1.0 / (1.0 + x.pow(6))
 
 
+class MotifPairOrientation(BasePotential):
+    """Control each motif's orientation via two frame-free rotation scalars.
+
+    Replacement for MotifRadialOrientationPotential / MotifForbiddenRadialOrientation
+    that measures the motif's *rotation* directly instead of differencing atom
+    coordinates in an ad-hoc local frame.
+
+    Per motif block:
+      Q       = Kabsch rotation taking the centred reference onto the centred
+                current motif.  Because it is a rigid fit, Q is exactly invariant
+                to the motif's internal deformation -- the diffuse early-trajectory
+                motif yields a *bounded* rotation rather than an O(t_hat^2)
+                Angstrom^2 loss.  (Verified: Kabsch(ref, blob) equals
+                Kabsch(ref, rigidify(blob)) to float32 precision, so this loss is
+                unchanged by whether the floating-motif projection has run yet.)
+      r_ref   = unit vector from the mean of all motif reference centres to this
+                motif's reference centre.  A CONSTANT from the input PDB -- no
+                noisy per-step axis measurement, so no world-axis frame re-seeding
+                and no angular-position contamination.  This assumes the motif
+                stays near its input angular position, which is exactly what
+                motif_spherical_position enforces (measured: final inter-motif
+                axis lands 4 +/- 5 deg from the input axis at weight 5000, versus
+                107 +/- 36 deg at weight 0).
+
+    Two scalars, both basis-independent traces of Q and both invariant to the
+    row-vs-column rotation convention:
+
+        cos_spin = 0.5 * (tr(Q) - r_ref . Q r_ref)   # rotation ABOUT r_ref
+        cos_tilt = r_ref . Q r_ref                   # rotation AWAY FROM r_ref
+
+    Reference pose  -> cos_spin = +1, cos_tilt = +1.
+    180-deg flip about r_ref (the "forbidden" pose) -> cos_spin = -1, cos_tilt = +1.
+
+    Reward (this potential is MAXIMISED):
+
+        spin_weight * sqrt(1 + cos_spin)  +  tilt_weight * cos_tilt
+
+    The sqrt is deliberate: sqrt(1 + cos_spin) = sqrt(2)*|cos(spin/2)|, whose
+    torque goes as sin(spin/2) -- MAXIMAL at the forbidden 180-deg pose and
+    decaying to zero at the reference pose.  That is the opposite of
+    MotifForbiddenRadialOrientation's Gaussian bump, which saturates to *zero*
+    force exactly where repulsion is needed.  A plain (1 + cos_spin) reward would
+    instead peak at 90 deg and vanish at 180 deg.
+
+    Both terms are dimensionless and bounded (spin in [0, sqrt(2)], tilt in
+    [-1, 1]), so the weights are directly comparable and there is no
+    Angstrom^2-scale `sigma` to mis-set.
+
+    Gradient is projected to pure rigid rotation per motif (no translation), so
+    this potential never fights motif_distance / motif_spherical_position.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        spin_weight: float = 1.0,
+        tilt_weight: float = 0.0,
+        motif_indices: list | None = None,
+        origin_atom_filter: str = "real",
+        sqrt_eps: float = 1e-3,
+        eps: float = 1e-6,
+        debug_log: bool = False,
+    ):
+        super().__init__(weight)
+        self.spin_weight = float(spin_weight)
+        self.tilt_weight = float(tilt_weight)
+        self.motif_indices: list | None = (
+            None if motif_indices is None else [int(i) for i in motif_indices]
+        )
+        valid_origin_filters = ("real", "potential", "guide", "motif", "all")
+        if origin_atom_filter not in valid_origin_filters:
+            raise ValueError(
+                "motif_pair_orientation origin_atom_filter must be one of "
+                f"{valid_origin_filters}"
+            )
+        self.origin_atom_filter = origin_atom_filter
+        # Floor inside the sqrt.  d/dcos sqrt(1+cos) diverges at the forbidden
+        # pose; the vanishing d cos/d(coords) there keeps the product finite, but
+        # the floor keeps the intermediate bounded in float32.
+        self.sqrt_eps = float(sqrt_eps)
+        self.eps = float(eps)
+        self.debug_log = bool(debug_log)
+        self.skip_reason: str | None = None
+        self.skip_detail: dict | None = None
+
+    def _selected_motif_indices(self, n_blocks: int) -> range | list:
+        if self.motif_indices is None:
+            return range(n_blocks)
+        return [i for i in self.motif_indices if 0 <= i < n_blocks]
+
+    def compute(self, xyz, masks, metadata):
+        self.skip_reason = None
+        self.skip_detail = None
+
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        self.skip_detail = {
+            "n_motif_blocks": len(motif_blocks),
+            "motif_indices": self.motif_indices,
+        }
+        if len(motif_blocks) == 0:
+            self.skip_reason = "no_motif_blocks"
+            return xyz.new_zeros(())
+
+        selected_indices = self._selected_motif_indices(len(motif_blocks))
+        if not selected_indices:
+            self.skip_reason = "no_selected_motif_indices"
+            return xyz.new_zeros(())
+
+        # Reference global centre = mean of all motif-block reference centres,
+        # matching MotifRadialOrientationPotential's convention.
+        ref_centers: list[torch.Tensor | None] = [
+            _motif_block_reference_com(xyz, masks, metadata, bm) for bm in motif_blocks
+        ]
+        valid_ref_centers = [c for c in ref_centers if c is not None]
+        if not valid_ref_centers:
+            self.skip_reason = "no_motif_reference_centers"
+            return xyz.new_zeros(())
+        c_ref_global = torch.stack(valid_ref_centers, dim=0).mean(dim=0)  # [3]
+
+        total = xyz.new_zeros(())
+        n_active = 0
+        debug_rows: list[dict] = []
+
+        for motif_i in selected_indices:
+            block_mask = motif_blocks[motif_i]
+            current_xyz_i, ref_xyz_i = _motif_block_current_and_reference_xyz(
+                xyz, masks, metadata, block_mask
+            )
+            if current_xyz_i is None or ref_xyz_i is None or ref_xyz_i.shape[0] < 3:
+                continue
+
+            ref_com_i = ref_centers[motif_i]
+            if ref_com_i is None:
+                continue
+            d_ref = ref_com_i - c_ref_global
+            d_ref_norm = d_ref.norm()
+            if d_ref_norm < self.eps:
+                continue  # motif sits at the global centre -- no radial axis
+            r_ref_i = (d_ref / d_ref_norm).detach()  # [3] constant unit vector
+
+            Q = _kabsch_ref_to_current_rotation(ref_xyz_i, current_xyz_i, self.eps)
+            if Q is None:
+                continue  # degenerate fit
+
+            tr = Q.diagonal(dim1=-2, dim2=-1).sum(dim=-1)          # [D]
+            rQr = torch.einsum("i,dij,j->d", r_ref_i, Q, r_ref_i)  # [D]
+            cos_spin = (0.5 * (tr - rQr)).clamp(-1.0, 1.0)         # [D]
+            cos_tilt = rQr.clamp(-1.0, 1.0)                        # [D]
+
+            spin_term = (1.0 + cos_spin).clamp_min(self.sqrt_eps).sqrt()
+            reward = self.spin_weight * spin_term + self.tilt_weight * cos_tilt
+            total = total + reward.mean()
+            n_active += 1
+
+            if self.debug_log:
+                # Internal deformation is what the floating-motif projection
+                # removes.  Q is provably invariant to it, so log it to judge
+                # whether reordering the potential after the projection could
+                # still matter via the gradient (the loss value cannot change).
+                with torch.no_grad():
+                    rc = (ref_xyz_i - ref_xyz_i.mean(dim=0, keepdim=True)).float()
+                    cc = (
+                        current_xyz_i - current_xyz_i.mean(dim=1, keepdim=True)
+                    ).float()
+                    fitted = torch.matmul(rc.unsqueeze(0), Q.float())
+                    fit_rmsd = (cc - fitted).pow(2).sum(-1).mean(-1).sqrt()
+                    rg_ratio = cc.pow(2).sum(-1).mean(-1).sqrt() / rc.pow(2).sum(
+                        -1
+                    ).mean().sqrt().clamp_min(self.eps)
+                    debug_rows.append(
+                        {
+                            "motif": int(motif_i),
+                            "spin_deg": [
+                                round(float(v), 2)
+                                for v in torch.rad2deg(torch.acos(cos_spin))
+                            ],
+                            "tilt_deg": [
+                                round(float(v), 2)
+                                for v in torch.rad2deg(torch.acos(cos_tilt))
+                            ],
+                            "fit_rmsd": [round(float(v), 3) for v in fit_rmsd],
+                            "rg_ratio": [round(float(v), 3) for v in rg_ratio],
+                        }
+                    )
+
+        if n_active == 0:
+            self.skip_reason = "no_active_motifs"
+            return xyz.new_zeros(())
+
+        if self.debug_log and debug_rows:
+            # This module's loggers do not reach the SLURM log; print like
+            # potentials/integration.py does.
+            print(f"[pair_ori] {debug_rows}", file=sys.stderr, flush=True)
+
+        return self.weight * total / n_active
+
+    def guide_atom_mask(self, masks, metadata, device):
+        motif_blocks = _motif_distance_blocks(masks, metadata, device)
+        if not motif_blocks:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        guide_mask = torch.zeros_like(motif_blocks[0], dtype=torch.bool, device=device)
+        for motif_i in self._selected_motif_indices(len(motif_blocks)):
+            guide_mask = guide_mask | motif_blocks[motif_i]
+        return guide_mask
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        if not motif_blocks:
+            return torch.zeros_like(atom_grad)
+        transformed = torch.zeros_like(atom_grad)
+        for motif_i in self._selected_motif_indices(len(motif_blocks)):
+            block_mask = motif_blocks[motif_i]
+            if block_mask.sum().item() < 3:
+                continue
+            # Pure rigid rotation: no translation, no deformation.
+            transformed[:, block_mask, :] = _project_gradient_to_rigid_body(
+                atom_grad[:, block_mask, :],
+                xyz[:, block_mask, :],
+                allow_translation=False,
+                allow_rotation=True,
+            )
+        return transformed
+
+
+class MotifPairAxisDot(BasePotential):
+    """Drive the receptor-receptor axis dot product to its input-PDB value.
+
+    This targets the QC metric directly.  The screen's pass/fail criterion is
+
+        dot = v_receptor_i . v_receptor_j
+
+    where each receptor axis is CA(distal) - CA(proximal) of the *full receptor*
+    (HER2 571->496, FGFR 263->277 for FGFR-HER2), taken after the receptor is
+    superimposed onto its designed motif.  The receptors are not part of the
+    diffused structure, but the motif is rigid, so each receptor axis is a
+    CONSTANT VECTOR IN THE MOTIF'S BODY FRAME.  Given the Kabsch rotation R_i
+    from reference motif to current motif,
+
+        v_i = a_i @ R_i        (row convention: cur_centred ~ ref_centred @ R)
+
+    recovers the receptor axis without ever needing receptor atoms.
+
+    Why this and not per-motif spin/tilt:
+      * It is SE(3)-invariant UNCONDITIONALLY.  Under a global rotation G both
+        R_i pick up G, and (G v_i).(G v_j) = v_i.v_j.  Unlike a potential
+        referenced to a fixed r_ref, it does not rely on the motif positions
+        being pinned.
+      * It constrains exactly the 1 DOF the metric measures.  Forcing both
+        motifs back to their input orientation would be a 6-DOF constraint for a
+        1-DOF criterion, needlessly fighting linker designability.
+      * It correctly captures the "forbidden" antiparallel state.  A negative dot
+        does NOT require either motif to be flipped 180 degrees -- two ~90 degree
+        rotations can produce it.  Measured on 400 designs, per-motif rotation
+        angle correlates with dot at |r| <= 0.21, so repelling each motif from
+        its own flipped pose does not prevent a negative dot.
+
+    Reward (MAXIMISED):  -weight * (dot - target_dot)^2
+
+    Harmonic in dot: the force is linear in the error, MAXIMAL at the
+    antiparallel extreme and zero at the target.  Bounded and dimensionless
+    ((dot-target)^2 <= ~4), so `weight` is a plain gain with no Angstrom^2 scale.
+
+    ``motif_axes`` gives the two body-frame axis unit vectors directly, in
+    motif-block (contig) order -- computed offline by hand from a reference
+    structure. As an alternative, ``motif_chains`` computes the same body-frame
+    vectors internally: each entry is ``{motif_index, chain_pdb, chain_id,
+    receptor_residues: [proximal_resid, distal_resid], align, align_chain_id,
+    align_atom_selection}`` -- the same shape as MinimalOverlapPotential's own
+    ``motif_chains`` (chain_pdb is never part of the diffused structure or
+    necessarily even the design's own input PDB, see that class's docstring).
+    ``receptor_residues``' two residues' CA atoms (``atom_name`` overrides "CA")
+    give a raw-frame vector ``distal - proximal``; with ``align=True`` that
+    vector is rotated (translation does not apply to a direction) by the same
+    offline Kabsch fit ``align_chain_id`` -> the design's own motif reference
+    already uses elsewhere in this file, landing it in the motif's body frame
+    with no further correction needed. Exactly one of ``motif_axes`` /
+    ``motif_chains`` must be given. ``target_dot`` defaults to a_i . a_j, which
+    is the input geometry's own dot product -- so R = I reproduces the control
+    exactly and no separate target has to be supplied.
+
+    ``motif_i`` / ``motif_j`` select which two motif blocks (in contig order)
+    are being compared. With ``motif_chains``, this is redundant with each
+    entry's own ``motif_index`` and does not need to be given -- it is derived
+    automatically from ``motif_chains``' two ``motif_index`` values (in list
+    order). Only needed explicitly when using ``motif_axes`` (default 0, 1),
+    or to override the derived values (which must then still match one of
+    ``motif_chains``' own ``motif_index`` entries).
+
+    Gradient is projected to pure rigid rotation per motif (no translation), so
+    this never fights motif_distance / motif_spherical_position.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_axes: list | None = None,
+        motif_chains: list | None = None,
+        motif_i: int | None = None,
+        motif_j: int | None = None,
+        target_dot: float | None = None,
+        eps: float = 1e-6,
+        debug_log: bool = False,
+    ):
+        super().__init__(weight)
+        if (motif_axes is None) == (motif_chains is None):
+            raise ValueError(
+                "motif_pair_axis_dot requires exactly one of motif_axes=[[x,y,z],"
+                "[x,y,z]] (the receptor axis unit vectors in each motif's body "
+                "frame, given directly) or motif_chains=[{motif_index, chain_pdb, "
+                "chain_id, receptor_residues: [proximal_resid, distal_resid], "
+                "...}, {...}] (computed internally from two residues per motif)"
+            )
+        if motif_axes is not None:
+            if len(motif_axes) < 2:
+                raise ValueError("motif_pair_axis_dot: motif_axes needs 2 entries")
+            self.motif_axes = [[float(c) for c in a[:3]] for a in motif_axes[:2]]
+            self._motif_chain_by_index = None
+            # motif_i/motif_j have no self-describing source here (motif_axes
+            # is just 2 raw vectors, positionally paired) -- default to the
+            # historical 0/1 convention, same as before this param became
+            # optional.
+            motif_i = 0 if motif_i is None else motif_i
+            motif_j = 1 if motif_j is None else motif_j
+        else:
+            if len(motif_chains) != 2:
+                raise ValueError(
+                    "motif_pair_axis_dot: motif_chains must have exactly 2 entries "
+                    f"(one per motif), got {len(motif_chains)}"
+                )
+            resolved: dict[int, dict] = {}
+            for i, spec in enumerate(motif_chains):
+                missing = [
+                    k for k in ("motif_index", "chain_pdb", "chain_id", "receptor_residues")
+                    if k not in spec
+                ]
+                if missing:
+                    raise ValueError(f"motif_pair_axis_dot: motif_chains[{i}] is missing {missing}")
+                residues = spec["receptor_residues"]
+                if len(residues) != 2:
+                    raise ValueError(
+                        f"motif_pair_axis_dot: motif_chains[{i}] receptor_residues "
+                        "must be [proximal_resid, distal_resid] (exactly 2)"
+                    )
+                entry = {
+                    "chain_pdb": str(spec["chain_pdb"]),
+                    "chain_id": str(spec["chain_id"]),
+                    "proximal_residue": int(residues[0]),
+                    "distal_residue": int(residues[1]),
+                    "atom_name": str(spec.get("atom_name", "CA")),
+                    "align": bool(spec.get("align", False)),
+                    "align_chain_id": spec.get("align_chain_id"),
+                    "align_atom_selection": str(spec.get("align_atom_selection", "CA")),
+                }
+                if entry["align"] and not entry["align_chain_id"]:
+                    raise ValueError(
+                        f"motif_pair_axis_dot: motif_chains[{i}] sets align=True "
+                        "but is missing 'align_chain_id'"
+                    )
+                resolved[int(spec["motif_index"])] = entry
+            self.motif_axes = None
+            self._motif_chain_by_index = resolved
+            # motif_chains already self-describes which two motif blocks are
+            # being compared via each entry's own motif_index -- redundant to
+            # also require motif_i/motif_j. Derive them (in the given list's
+            # order) when not explicitly overridden; if they ARE given, they
+            # must actually match one of the motif_chains entries or the
+            # later dict lookup in _resolve_axis would silently make no sense.
+            derived_i, derived_j = (int(spec["motif_index"]) for spec in motif_chains)
+            motif_i = derived_i if motif_i is None else motif_i
+            motif_j = derived_j if motif_j is None else motif_j
+            if motif_i not in resolved or motif_j not in resolved:
+                raise ValueError(
+                    f"motif_pair_axis_dot: motif_i={motif_i}, motif_j={motif_j} must "
+                    f"each match one of motif_chains' own motif_index values "
+                    f"({sorted(resolved)})"
+                )
+        self._axis_cache: dict[int, torch.Tensor] = {}
+        self.motif_i = int(motif_i)
+        self.motif_j = int(motif_j)
+        self.target_dot = None if target_dot is None else float(target_dot)
+        self.eps = float(eps)
+        self.debug_log = bool(debug_log)
+        self.skip_reason: str | None = None
+        self.skip_detail: dict | None = None
+
+    def _resolve_axis(self, slot, motif_i, ref_xyz_i, device, dtype, align_residues=None):
+        if self.motif_axes is not None:
+            a = torch.tensor(self.motif_axes[slot], device=device, dtype=dtype)
+            return a / a.norm().clamp_min(self.eps)
+
+        if motif_i in self._axis_cache:
+            return self._axis_cache[motif_i]
+        spec = self._motif_chain_by_index[motif_i]
+        proximal = _load_chain_residue_atom(
+            spec["chain_pdb"], spec["chain_id"], spec["proximal_residue"], spec["atom_name"]
+        ).to(device=device, dtype=dtype)
+        distal = _load_chain_residue_atom(
+            spec["chain_pdb"], spec["chain_id"], spec["distal_residue"], spec["atom_name"]
+        ).to(device=device, dtype=dtype)
+        raw_vector = distal - proximal
+
+        if spec["align"]:
+            align_xyz = _load_chain_atoms(
+                spec["chain_pdb"], spec["align_chain_id"], spec["align_atom_selection"], None,
+                residue_whitelist=align_residues,
+            ).to(device=device, dtype=dtype)
+            if align_xyz.shape[0] != ref_xyz_i.shape[0]:
+                raise ValueError(
+                    f"motif_pair_axis_dot: motif_chains[motif_index={motif_i}] "
+                    f"align_chain_id={spec['align_chain_id']!r} has "
+                    f"{align_xyz.shape[0]} atoms but the design's motif reference "
+                    f"has {ref_xyz_i.shape[0]} -- align_atom_selection must "
+                    "produce a 1:1 atom correspondence (same count and order) "
+                    "with the contig motif block"
+                )
+            R_align = _kabsch_ref_to_current_rotation(align_xyz, ref_xyz_i.unsqueeze(0), self.eps)
+            if R_align is None:
+                raise ValueError(
+                    f"motif_pair_axis_dot: motif_chains[motif_index={motif_i}] "
+                    "offline alignment is degenerate (too few or co-linear "
+                    "align atoms)"
+                )
+            # A vector (unlike a point) transforms by rotation alone -- the
+            # translation/COM terms MinimalOverlapPotential's own point-based
+            # align needs cancel out exactly when differencing two points.
+            raw_vector = raw_vector @ R_align[0]
+
+        axis = raw_vector / raw_vector.norm().clamp_min(self.eps)
+        self._axis_cache[motif_i] = axis
+        return axis
+
+    def compute(self, xyz, masks, metadata):
+        self.skip_reason = None
+        self.skip_detail = None
+
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        self.skip_detail = {
+            "n_motif_blocks": len(motif_blocks),
+            "motif_i": self.motif_i,
+            "motif_j": self.motif_j,
+        }
+        if max(self.motif_i, self.motif_j) >= len(motif_blocks):
+            self.skip_reason = "motif_index_out_of_range"
+            return xyz.new_zeros(())
+
+        axes = []
+        vecs = []
+        for slot, motif_i in enumerate((self.motif_i, self.motif_j)):
+            block_mask = motif_blocks[motif_i]
+            current_xyz_i, ref_xyz_i = _motif_block_current_and_reference_xyz(
+                xyz, masks, metadata, block_mask
+            )
+            if current_xyz_i is None or ref_xyz_i is None or ref_xyz_i.shape[0] < 3:
+                self.skip_reason = f"motif_{motif_i}_coords_missing"
+                return xyz.new_zeros(())
+            R = _kabsch_ref_to_current_rotation(ref_xyz_i, current_xyz_i, self.eps)
+            if R is None:
+                self.skip_reason = f"motif_{motif_i}_frame_degenerate"
+                return xyz.new_zeros(())
+            axis = self._resolve_axis(
+                slot, motif_i, ref_xyz_i, xyz.device, xyz.dtype,
+                align_residues=_motif_block_res_ids(metadata, block_mask),
+            )
+            axes.append(axis)
+            # Row convention: a vector in the reference frame maps to a @ R.
+            v = torch.einsum("j,djk->dk", axis, R)  # [D, 3]
+            vecs.append(v / v.norm(dim=-1, keepdim=True).clamp_min(self.eps))
+
+        target = (
+            float((axes[0] * axes[1]).sum())
+            if self.target_dot is None
+            else self.target_dot
+        )
+
+        dot = (vecs[0] * vecs[1]).sum(dim=-1).clamp(-1.0, 1.0)  # [D]
+        loss = (dot - target).pow(2)
+
+        if self.debug_log:
+            print(
+                "[axis_dot] "
+                + repr(
+                    {
+                        "target": round(target, 4),
+                        "dot": [round(float(v), 4) for v in dot],
+                        "angle_deg": [
+                            round(float(v), 2) for v in torch.rad2deg(torch.acos(dot))
+                        ],
+                    }
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+
+        return -self.weight * loss.mean()
+
+    def guide_atom_mask(self, masks, metadata, device):
+        motif_blocks = _motif_distance_blocks(masks, metadata, device)
+        if not motif_blocks:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        guide_mask = torch.zeros_like(motif_blocks[0], dtype=torch.bool, device=device)
+        for motif_i in (self.motif_i, self.motif_j):
+            if motif_i < len(motif_blocks):
+                guide_mask = guide_mask | motif_blocks[motif_i]
+        return guide_mask
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        if not motif_blocks:
+            return torch.zeros_like(atom_grad)
+        transformed = torch.zeros_like(atom_grad)
+        for motif_i in (self.motif_i, self.motif_j):
+            if motif_i >= len(motif_blocks):
+                continue
+            block_mask = motif_blocks[motif_i]
+            if block_mask.sum().item() < 3:
+                continue
+            transformed[:, block_mask, :] = _project_gradient_to_rigid_body(
+                atom_grad[:, block_mask, :],
+                xyz[:, block_mask, :],
+                allow_translation=False,
+                allow_rotation=True,
+            )
+        return transformed
+
+
+def _load_chain_atoms(
+    pdb_path: str,
+    chain_id: str,
+    atom_selection: str = "CA",
+    max_atoms: int | None = None,
+    residue_whitelist: "set[int] | None" = None,
+) -> torch.Tensor:
+    """Load one chain's atom coordinates from a PDB/mmCIF file.
+
+    Used by MinimalOverlapPotential to bring in chains that are never part of
+    the diffused structure -- the same situation MotifPairAxisDot documents for
+    its receptor axis ("The receptor itself is never part of the RFD3 contig or
+    the sampled structure"), just generalised from a single axis vector to a
+    full point cloud so steric overlap can be measured.
+
+    ``atom_selection``: 'CA' (default -- cheap and sufficient as a steric
+    proxy), 'backbone' (N, CA, C, O), or 'heavy' (all non-hydrogen atoms).
+    ``max_atoms``: optional uniform-stride subsample cap so a very large chain
+    can't blow up the pairwise-overlap cost; deterministic, not random.
+    ``residue_whitelist``: optional set of residue ids; when given, only atoms
+    whose ``res_id`` is in the set are kept. Used by the offline align path to
+    narrow an align chain that spans MORE residues than the contig motif kept
+    (e.g. a full-length receptor template) down to the contig motif's residues,
+    so the two point clouds regain their 1:1 correspondence for Kabsch.
+
+    Biotite is imported lazily here (not at module scope) so importing
+    potentials.py stays cheap for callers that never touch this potential.
+    """
+    import biotite.structure as struc
+    import biotite.structure.io as strucio
+    import numpy as np
+
+    path = Path(pdb_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"minimal_overlap chain_pdb not found: {pdb_path}")
+
+    atom_array = strucio.load_structure(str(path), model=1)
+
+    chain_mask = atom_array.chain_id == str(chain_id)
+    if atom_selection == "CA":
+        sel_mask = atom_array.atom_name == "CA"
+    elif atom_selection == "backbone":
+        sel_mask = np.isin(atom_array.atom_name, ["N", "CA", "C", "O"])
+    elif atom_selection == "heavy":
+        element = atom_array.element
+        if element is None or getattr(element, "size", 0) == 0:
+            atom_array = atom_array.copy()
+            atom_array.element = struc.infer_elements(atom_array)
+            element = atom_array.element
+        # OXT (the C-terminal carboxylate oxygen) is present on essentially
+        # every raw PDB's terminal residue but never modeled by RFD3's own
+        # fixed per-residue atom template -- excluding it here (rather than
+        # requiring hand-cleaned input files) keeps 'heavy' 1:1-comparable
+        # with RFD3's internal reference for *any* chain/receptor, not just
+        # ones someone happened to pre-strip.
+        sel_mask = (np.asarray(element) != "H") & (
+            np.asarray(atom_array.atom_name) != "OXT"
+        )
+    else:
+        raise ValueError(
+            "minimal_overlap atom_selection must be one of 'CA', 'backbone', "
+            f"'heavy', got {atom_selection!r}"
+        )
+
+    final_mask = chain_mask & sel_mask
+    if residue_whitelist is not None:
+        res_id = np.asarray(atom_array.res_id)
+        keep = np.isin(res_id, np.asarray(sorted(residue_whitelist), dtype=res_id.dtype))
+        final_mask = final_mask & keep
+    coords = atom_array.coord[final_mask]
+    if coords.shape[0] == 0:
+        raise ValueError(
+            f"minimal_overlap: no atoms found for chain_id={chain_id!r} "
+            f"atom_selection={atom_selection!r} in {pdb_path}"
+            + (
+                f" (residue_whitelist={sorted(residue_whitelist)})"
+                if residue_whitelist is not None
+                else ""
+            )
+        )
+    if max_atoms is not None and coords.shape[0] > int(max_atoms):
+        stride = max(1, coords.shape[0] // int(max_atoms))
+        coords = coords[::stride][: int(max_atoms)]
+    return torch.as_tensor(np.asarray(coords), dtype=torch.float32)
+
+
+def _load_chain_residue_atom(
+    pdb_path: str,
+    chain_id: str,
+    res_id: int,
+    atom_name: str = "CA",
+) -> torch.Tensor:
+    """Load the coordinate of exactly one named atom of one residue from a
+    PDB/mmCIF file -- used by TargetAnchorDistance to pick out a single
+    "anchor" atom (e.g. a membrane-proximal residue) on a chain that is never
+    part of the diffused structure, the same chain_pdb file MinimalOverlapPotential
+    already loads for that motif's attached receptor.
+    """
+    import biotite.structure.io as strucio
+    import numpy as np
+
+    path = Path(pdb_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"target_anchor_distance chain_pdb not found: {pdb_path}")
+
+    atom_array = strucio.load_structure(str(path), model=1)
+    sel_mask = (
+        (atom_array.chain_id == str(chain_id))
+        & (atom_array.res_id == int(res_id))
+        & (atom_array.atom_name == str(atom_name))
+    )
+    coords = atom_array.coord[sel_mask]
+    if coords.shape[0] != 1:
+        raise ValueError(
+            f"target_anchor_distance: expected exactly 1 atom for "
+            f"chain_id={chain_id!r} res_id={res_id!r} atom_name={atom_name!r} "
+            f"in {pdb_path}, found {coords.shape[0]}"
+        )
+    return torch.as_tensor(np.asarray(coords[0]), dtype=torch.float32)
+
+
+def _pairwise_clash_overlap(
+    xyz_a: torch.Tensor,  # [D, Na, 3]
+    xyz_b: torch.Tensor,  # [D, Nb, 3]
+    clash_distance: float,
+) -> torch.Tensor:
+    """Soft steric overlap: sum of squared sphere-overlap depths.
+
+    Zero wherever the closest a-b atom pair is >= clash_distance apart; grows
+    smoothly (gradient defined everywhere, including exactly at the cutoff) as
+    atoms interpenetrate. Not normalised by atom count -- callers combine
+    several such terms and only normalise (via `.mean()` over the batch dim)
+    at the very end, same as the rest of this file's potentials.
+    """
+    if xyz_a.shape[1] == 0 or xyz_b.shape[1] == 0:
+        return xyz_a.new_zeros(())
+    dists = torch.cdist(xyz_a, xyz_b)  # [D, Na, Nb]
+    overlap = (clash_distance - dists).clamp_min(0.0).pow(2)
+    return overlap.sum(dim=(-2, -1)).mean()
+
+
+class MinimalOverlapPotential(BasePotential):
+    """Minimise steric overlap of external chains rigidly attached to motifs.
+
+    Generalises MotifPairAxisDot's "Fake-Kabsch" trick from a single body-frame
+    axis vector to a full external chain's atom cloud. For each entry in
+    ``motif_chains`` (one motif -> one attached chain, e.g. a bound receptor or
+    other context chain that is *never* part of the diffused structure):
+
+      1. Load the chain's atoms once from ``chain_pdb`` / ``chain_id``
+         (``_load_chain_atoms``).  By default (``align=False``) these are
+         assumed already co-registered in the same coordinate frame as the
+         design's own reference/input PDB -- the common case where the chain
+         lives in the same combined input structure as the motifs, just
+         outside the contig.  Opt in with ``align=True`` (+ ``align_chain_id``)
+         when the chain instead comes from a *different* structure (the
+         MotifPairAxisDot receptor case): on first use this automatically
+         Kabsch-fits ``align_chain_id`` atoms in that same file onto the
+         motif's own reference atoms (``_kabsch_ref_to_current_rotation``),
+         automating the offline superposition that had to be done by hand to
+         produce MotifPairAxisDot's ``motif_axes``.  Either way the result is a
+         constant point cloud in the design's reference frame, cached after
+         first use (the reference geometry is fixed for the whole run, same
+         assumption ``motif_axes`` already makes).
+      2. Every step, transport that constant cloud into current-step world
+         coordinates with the *same* per-motif rigid transform that tracks the
+         motif's own atoms -- rotate about the motif's own reference COM (not
+         the chain's own centroid, which would collapse the physical offset
+         between them), then translate to the motif's current COM:
+         ``current = (chain_ref - motif_ref_com) @ R_i + current_com_i`` --
+         this is "aligning the chain to the Kabsch alignment".
+      3. Accumulate soft steric overlap (``_pairwise_clash_overlap``) (a)
+         between every pair of configured chains and (b) between each chain and
+         the rest of the currently-generated structure (``protein_atom_filter``,
+         excluding that chain's own parent motif atoms).
+
+    Returns ``-weight * total_overlap`` (maximised => overlap minimised), the
+    same sign convention as every other potential in this file.
+
+    Gradient is projected to pure rigid rotation per motif (no translation),
+    so this only ever changes *orientation* -- never fights
+    motif_distance / motif_spherical_position -- matching MotifPairAxisDot /
+    MotifPairOrientation.
+
+    Registered as both ``minimal_overlap`` and ``minimal_clashes`` (same
+    class).
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_chains: list | None = None,
+        clash_distance: float = 4.0,
+        protein_atom_filter: str = "CA",
+        chain_chain_weight: float = 1.0,
+        chain_protein_weight: float = 1.0,
+        eps: float = 1e-6,
+        debug_log: bool = False,
+    ):
+        super().__init__(weight)
+        if not motif_chains:
+            raise ValueError(
+                "minimal_overlap requires motif_chains=[{motif_index, chain_pdb, "
+                "chain_id, ...}, ...] -- the external chain(s) rigidly attached "
+                "to each floating motif whose steric overlap should be minimised"
+            )
+        resolved: list[dict] = []
+        for i, spec in enumerate(motif_chains):
+            missing = [k for k in ("motif_index", "chain_pdb", "chain_id") if k not in spec]
+            if missing:
+                raise ValueError(
+                    f"minimal_overlap: motif_chains[{i}] is missing {missing}"
+                )
+            entry = {
+                "motif_index": int(spec["motif_index"]),
+                "chain_pdb": str(spec["chain_pdb"]),
+                "chain_id": str(spec["chain_id"]),
+                "atom_selection": str(spec.get("atom_selection", "CA")),
+                "max_atoms": spec.get("max_atoms"),
+                "align": bool(spec.get("align", False)),
+                "align_chain_id": spec.get("align_chain_id"),
+                "align_atom_selection": str(spec.get("align_atom_selection", "CA")),
+            }
+            if entry["align"] and not entry["align_chain_id"]:
+                raise ValueError(
+                    f"minimal_overlap: motif_chains[{i}] sets align=True but is "
+                    "missing 'align_chain_id'"
+                )
+            resolved.append(entry)
+        self.motif_chains = resolved
+
+        valid_filters = ("all", "real", "potential", "backbone", "CA")
+        if protein_atom_filter not in valid_filters:
+            raise ValueError(
+                f"minimal_overlap protein_atom_filter must be one of {valid_filters}"
+            )
+        self.protein_atom_filter = protein_atom_filter
+        self.clash_distance = float(clash_distance)
+        self.chain_chain_weight = float(chain_chain_weight)
+        self.chain_protein_weight = float(chain_protein_weight)
+        self.eps = float(eps)
+        self.debug_log = bool(debug_log)
+
+        # Populated lazily on first compute(): per-entry constant chain point
+        # cloud, expressed in the *design's* reference frame (same frame as
+        # ref_xyz_i -- NOT re-centred on the chain's own centroid, since the
+        # whole point is to preserve the chain's physical offset from its
+        # parent motif). Loading and the optional offline alignment only need
+        # to happen once -- the reference geometry is constant across the
+        # batch and across the whole trajectory.
+        self._chain_ref_xyz: dict[int, torch.Tensor] = {}
+        self.skip_reason: str | None = None
+        self.skip_detail: dict | None = None
+
+    def _resolve_chain_ref_xyz(self, idx, spec, ref_xyz_i, device, dtype, align_residues=None):
+        if idx in self._chain_ref_xyz:
+            return self._chain_ref_xyz[idx]
+
+        chain_xyz = _load_chain_atoms(
+            spec["chain_pdb"], spec["chain_id"], spec["atom_selection"], spec["max_atoms"]
+        ).to(device=device, dtype=dtype)
+
+        if spec["align"]:
+            align_xyz = _load_chain_atoms(
+                spec["chain_pdb"], spec["align_chain_id"], spec["align_atom_selection"], None,
+                residue_whitelist=align_residues,
+            ).to(device=device, dtype=dtype)
+            if align_xyz.shape[0] != ref_xyz_i.shape[0]:
+                raise ValueError(
+                    f"minimal_overlap: motif_chains[{idx}] align_chain_id="
+                    f"{spec['align_chain_id']!r} has {align_xyz.shape[0]} atoms "
+                    f"but the design's motif reference has {ref_xyz_i.shape[0]} "
+                    "-- align_atom_selection must produce a 1:1 atom "
+                    "correspondence (same count and order) with the contig "
+                    "motif block"
+                )
+            R_align = _kabsch_ref_to_current_rotation(
+                align_xyz, ref_xyz_i.unsqueeze(0), self.eps
+            )
+            if R_align is None:
+                raise ValueError(
+                    f"minimal_overlap: motif_chains[{idx}] offline alignment is "
+                    "degenerate (too few or co-linear align atoms)"
+                )
+            align_com = align_xyz.mean(dim=0)
+            chain_xyz = (chain_xyz - align_com) @ R_align[0] + ref_xyz_i.mean(dim=0)
+
+        self._chain_ref_xyz[idx] = chain_xyz
+        return chain_xyz
+
+    def compute(self, xyz, masks, metadata):
+        self.skip_reason = None
+        self.skip_detail = None
+
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        self.skip_detail = {"n_motif_blocks": len(motif_blocks)}
+        if not motif_blocks:
+            self.skip_reason = "no_motif_blocks"
+            return xyz.new_zeros(())
+
+        device, dtype = xyz.device, xyz.dtype
+        current_chains: list[torch.Tensor] = []  # transported to this step, [D, N, 3]
+        own_motif_masks: list[torch.Tensor] = []
+
+        for idx, spec in enumerate(self.motif_chains):
+            motif_i = spec["motif_index"]
+            if motif_i < 0 or motif_i >= len(motif_blocks):
+                self.skip_reason = f"motif_chains_{idx}_index_out_of_range"
+                continue
+            block_mask = motif_blocks[motif_i]
+            current_xyz_i, ref_xyz_i = _motif_block_current_and_reference_xyz(
+                xyz, masks, metadata, block_mask
+            )
+            if current_xyz_i is None or ref_xyz_i is None or ref_xyz_i.shape[0] < 3:
+                self.skip_reason = f"motif_chains_{idx}_coords_missing"
+                continue
+            R = _kabsch_ref_to_current_rotation(ref_xyz_i, current_xyz_i, self.eps)
+            if R is None:
+                self.skip_reason = f"motif_chains_{idx}_frame_degenerate"
+                continue
+
+            chain_ref_xyz = self._resolve_chain_ref_xyz(
+                idx, spec, ref_xyz_i, device, dtype,
+                align_residues=_motif_block_res_ids(metadata, block_mask),
+            )
+            motif_ref_com = ref_xyz_i.mean(dim=0)  # [3] -- the pivot, not the chain's own COM
+            current_com_i = current_xyz_i.mean(dim=1)  # [D, 3]
+            # "Align the additional chain to this Kabsch alignment": the same
+            # per-motif rigid transform that tracks the motif's own atoms
+            # (rotate about the motif's reference COM, translate to its
+            # current COM) is applied to the chain's constant body-frame
+            # point cloud, preserving its physical offset from the motif.
+            transported = (
+                (chain_ref_xyz - motif_ref_com).unsqueeze(0) @ R
+            ) + current_com_i.unsqueeze(1)  # [D, N_chain, 3]
+            current_chains.append(transported)
+            own_motif_masks.append(block_mask)
+
+        if len(current_chains) == 0:
+            self.skip_reason = self.skip_reason or "no_active_chains"
+            return xyz.new_zeros(())
+
+        total = xyz.new_zeros(())
+        n_terms = 0
+
+        # (a) chain vs chain
+        for i in range(len(current_chains)):
+            for j in range(i + 1, len(current_chains)):
+                total = total + self.chain_chain_weight * _pairwise_clash_overlap(
+                    current_chains[i], current_chains[j], self.clash_distance
+                )
+                n_terms += 1
+
+        # (b) chain vs the rest of the currently-generated structure (own
+        # parent motif excluded -- a chain rigidly riding on its motif isn't
+        # meaningfully "clashing" with the thing it's attached to)
+        protein_mask = _atom_filter_mask(self.protein_atom_filter, masks, device)
+        for i, chain_xyz in enumerate(current_chains):
+            other_mask = protein_mask & ~own_motif_masks[i]
+            other_xyz = xyz[:, other_mask, :]
+            total = total + self.chain_protein_weight * _pairwise_clash_overlap(
+                chain_xyz, other_xyz, self.clash_distance
+            )
+            n_terms += 1
+
+        if self.debug_log:
+            print(
+                "[minimal_overlap] "
+                + repr({"total_overlap": round(float(total), 4), "n_terms": n_terms}),
+                file=sys.stderr,
+                flush=True,
+            )
+
+        return -self.weight * total
+
+    def guide_atom_mask(self, masks, metadata, device):
+        motif_blocks = _motif_distance_blocks(masks, metadata, device)
+        if not motif_blocks:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        guide_mask = torch.zeros_like(motif_blocks[0], dtype=torch.bool, device=device)
+        for spec in self.motif_chains:
+            motif_i = spec["motif_index"]
+            if 0 <= motif_i < len(motif_blocks):
+                guide_mask = guide_mask | motif_blocks[motif_i]
+        return guide_mask
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        motif_blocks = _motif_distance_blocks(masks, metadata, xyz.device)
+        if not motif_blocks:
+            return torch.zeros_like(atom_grad)
+        transformed = torch.zeros_like(atom_grad)
+        seen: set[int] = set()
+        for spec in self.motif_chains:
+            motif_i = spec["motif_index"]
+            if not (0 <= motif_i < len(motif_blocks)) or motif_i in seen:
+                continue
+            seen.add(motif_i)
+            block_mask = motif_blocks[motif_i]
+            if block_mask.sum().item() < 3:
+                continue
+            transformed[:, block_mask, :] = _project_gradient_to_rigid_body(
+                atom_grad[:, block_mask, :],
+                xyz[:, block_mask, :],
+                allow_translation=False,
+                allow_rotation=True,
+            )
+        return transformed
+
+
+class TargetAnchorDistance(BasePotential):
+    """Harmonic restraint on the distance between one specific atom on each
+    of two RECEPTOR chains -- e.g. the membrane-proximal residue of each
+    ectodomain -- rather than the motif's own center of mass (motif_distance)
+    or any atom of the motif itself (as an earlier, now-removed version of
+    this potential did).
+
+    The receptor is never part of the diffused structure -- exactly the
+    situation MinimalOverlapPotential already handles for its clash cloud.
+    This potential reuses that same mechanism for a single point instead of a
+    full cloud: for each ``motif_chains`` entry (one motif -> one attached
+    receptor chain), the target residue's CA (``target_residue`` /
+    ``target_atom``) is loaded once from ``chain_pdb`` (optionally corrected
+    into the design's reference frame via ``align`` / ``align_chain_id`` --
+    same offline-registration mechanism and same reasoning as
+    MinimalOverlapPotential, see its docstring), then transported every step
+    with the *same* per-motif Kabsch rotation that tracks the motif's own
+    atoms: ``anchor_current = (anchor_ref - motif_ref_com) @ R + motif_current_com``.
+
+    Because the transported anchor position is a differentiable function of
+    the *whole* motif block's current coordinates (through the Kabsch fit and
+    the current-COM translation), autograd's raw gradient is already
+    naturally spread across the block -- unlike a potential that reads one
+    atom directly out of ``xyz``, there is no single-atom-dilution concern
+    here, so transform_atom_gradient can project the true per-block gradient
+    directly with ``_project_gradient_to_rigid_body``, the same pattern
+    MinimalOverlapPotential itself uses.
+
+    ``allow_translation`` / ``allow_rotation`` (both default True) select
+    which rigid-body degrees of freedom this potential is allowed to use to
+    reduce the anchor distance. Reaching a single target point can always be
+    done by pure translation, but when the receptor's target_residue sits far
+    from the motif's own reference COM (a long lever arm), a small rotation
+    can move that distant point a lot for very little RMS atom displacement
+    -- often more efficient than translating the whole rigid body. Turn OFF
+    whichever DOF another active potential on the same motif pair already
+    owns, to avoid two potentials fighting over the same DOF with different
+    objectives: set ``allow_translation=False`` if motif_distance /
+    symmetry_motif_distance is also active on this pair, and
+    ``allow_rotation=False`` if motif_pair_axis_dot (or another rotation-only
+    potential) is also active on this pair.
+
+    Returns -weight * (distance - target_distance)^2, same convention as
+    MotifDistance / MinimalOverlapPotential.
+
+    Registered as ``target_anchor_distance``.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_chains: list | None = None,
+        target_distance: float = 8.0,
+        allow_translation: bool = True,
+        allow_rotation: bool = True,
+        eps: float = 1e-6,
+    ):
+        super().__init__(weight)
+        if not motif_chains or len(motif_chains) != 2:
+            raise ValueError(
+                "target_anchor_distance requires exactly 2 motif_chains=["
+                "{motif_index, chain_pdb, chain_id, target_residue, ...}, "
+                "{...}] -- the two receptor anchor points whose distance "
+                "should be restrained"
+            )
+        resolved: list[dict] = []
+        for i, spec in enumerate(motif_chains):
+            missing = [
+                k for k in ("motif_index", "chain_pdb", "chain_id", "target_residue")
+                if k not in spec
+            ]
+            if missing:
+                raise ValueError(
+                    f"target_anchor_distance: motif_chains[{i}] is missing {missing}"
+                )
+            entry = {
+                "motif_index": int(spec["motif_index"]),
+                "chain_pdb": str(spec["chain_pdb"]),
+                "chain_id": str(spec["chain_id"]),
+                "target_residue": int(spec["target_residue"]),
+                "target_atom": str(spec.get("target_atom", "CA")),
+                "align": bool(spec.get("align", False)),
+                "align_chain_id": spec.get("align_chain_id"),
+                "align_atom_selection": str(spec.get("align_atom_selection", "CA")),
+            }
+            if entry["align"] and not entry["align_chain_id"]:
+                raise ValueError(
+                    f"target_anchor_distance: motif_chains[{i}] sets align=True "
+                    "but is missing 'align_chain_id'"
+                )
+            resolved.append(entry)
+        self.motif_chains = resolved
+        self.target_distance = float(target_distance)
+        self.allow_translation = bool(allow_translation)
+        self.allow_rotation = bool(allow_rotation)
+        self.eps = float(eps)
+
+        # Populated lazily on first compute(): per-entry constant anchor point
+        # in the design's reference frame (same caching assumption as
+        # MinimalOverlapPotential._chain_ref_xyz -- the reference geometry is
+        # fixed for the whole run).
+        self._anchor_ref: dict[int, torch.Tensor] = {}
+        self.skip_reason: str | None = None
+
+    def _resolve_anchor_ref(self, idx, spec, ref_xyz_i, device, dtype, align_residues=None):
+        if idx in self._anchor_ref:
+            return self._anchor_ref[idx]
+
+        anchor_xyz = _load_chain_residue_atom(
+            spec["chain_pdb"], spec["chain_id"], spec["target_residue"], spec["target_atom"]
+        ).to(device=device, dtype=dtype)
+
+        if spec["align"]:
+            align_xyz = _load_chain_atoms(
+                spec["chain_pdb"], spec["align_chain_id"], spec["align_atom_selection"], None,
+                residue_whitelist=align_residues,
+            ).to(device=device, dtype=dtype)
+            if align_xyz.shape[0] != ref_xyz_i.shape[0]:
+                raise ValueError(
+                    f"target_anchor_distance: motif_chains[{idx}] align_chain_id="
+                    f"{spec['align_chain_id']!r} has {align_xyz.shape[0]} atoms "
+                    f"but the design's motif reference has {ref_xyz_i.shape[0]} "
+                    "-- align_atom_selection must produce a 1:1 atom "
+                    "correspondence (same count and order) with the contig "
+                    "motif block"
+                )
+            R_align = _kabsch_ref_to_current_rotation(
+                align_xyz, ref_xyz_i.unsqueeze(0), self.eps
+            )
+            if R_align is None:
+                raise ValueError(
+                    f"target_anchor_distance: motif_chains[{idx}] offline "
+                    "alignment is degenerate (too few or co-linear align atoms)"
+                )
+            align_com = align_xyz.mean(dim=0)
+            anchor_xyz = (anchor_xyz - align_com) @ R_align[0] + ref_xyz_i.mean(dim=0)
+
+        self._anchor_ref[idx] = anchor_xyz
+        return anchor_xyz
+
+    def _transported_anchor(self, idx, spec, xyz, masks, metadata, device, dtype):
+        block_mask = _single_motif_block_mask(spec["motif_index"], masks, metadata, device)
+        if block_mask is None or block_mask.sum().item() < 3:
+            return None, None
+        current_xyz_i, ref_xyz_i = _motif_block_current_and_reference_xyz(
+            xyz, masks, metadata, block_mask
+        )
+        if current_xyz_i is None or ref_xyz_i is None or ref_xyz_i.shape[0] < 3:
+            return None, None
+        R = _kabsch_ref_to_current_rotation(ref_xyz_i, current_xyz_i, self.eps)
+        if R is None:
+            return None, None
+
+        anchor_ref = self._resolve_anchor_ref(
+            idx, spec, ref_xyz_i, device, dtype,
+            align_residues=_motif_block_res_ids(metadata, block_mask),
+        )
+        motif_ref_com = ref_xyz_i.mean(dim=0)
+        current_com_i = current_xyz_i.mean(dim=1)  # [D, 3]
+        # R is [D, 3, 3] -- genuinely different per design in the batch (each
+        # design has its own current pose). The offset must be rotated by
+        # EACH design's own R, not a single shared one -- broadcast [1, 1, 3]
+        # against [D, 3, 3] to get a per-design [D, 1, 3] result, mirroring
+        # MinimalOverlapPotential's own (chain_ref_xyz - motif_ref_com).unsqueeze(0) @ R
+        # pattern. A prior version of this line used R[0] (design 0's
+        # rotation only) for every design in the batch -- correct only by
+        # coincidence when D=1, and silently wrong for D>1.
+        anchor_offset = (anchor_ref - motif_ref_com).unsqueeze(0).unsqueeze(0)  # [1, 1, 3]
+        anchor_current = (anchor_offset @ R).squeeze(1) + current_com_i  # [D, 3]
+        return anchor_current, block_mask
+
+    def compute(self, xyz, masks, metadata):
+        self.skip_reason = None
+        device, dtype = xyz.device, xyz.dtype
+
+        anchors = []
+        for idx, spec in enumerate(self.motif_chains):
+            anchor_current, _ = self._transported_anchor(
+                idx, spec, xyz, masks, metadata, device, dtype
+            )
+            if anchor_current is None:
+                self.skip_reason = f"motif_chains_{idx}_coords_missing"
+                return xyz.new_zeros(())
+            anchors.append(anchor_current)
+
+        dist = (anchors[0] - anchors[1]).norm(dim=-1)
+        return -self.weight * ((dist - self.target_distance) ** 2).mean()
+
+    def guide_atom_mask(self, masks, metadata, device):
+        guide_mask = None
+        for spec in self.motif_chains:
+            block_mask = _single_motif_block_mask(spec["motif_index"], masks, metadata, device)
+            if block_mask is None:
+                continue
+            guide_mask = block_mask if guide_mask is None else (guide_mask | block_mask)
+        if guide_mask is None:
+            any_mask = next(iter(masks.values()))
+            return torch.zeros_like(any_mask, dtype=torch.bool, device=device)
+        return guide_mask
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        device = xyz.device
+        transformed = torch.zeros_like(atom_grad)
+        for spec in self.motif_chains:
+            block_mask = _single_motif_block_mask(spec["motif_index"], masks, metadata, device)
+            if block_mask is None or block_mask.sum().item() < 3:
+                continue
+            transformed[:, block_mask, :] = _project_gradient_to_rigid_body(
+                atom_grad[:, block_mask, :],
+                xyz[:, block_mask, :],
+                allow_translation=self.allow_translation,
+                allow_rotation=self.allow_rotation,
+            )
+        return transformed
+
+
 POTENTIAL_REGISTRY: dict[str, type[BasePotential]] = {
     "binder_ROG": BinderROG,
     "monomer_ROG": MonomerROG,
@@ -3710,6 +5500,13 @@ POTENTIAL_REGISTRY: dict[str, type[BasePotential]] = {
     "motif_com_distance": MotifCOMDistance,
     "motif_spherical_position": MotifSphericalPosition,
     "motif_radial_orientation": MotifRadialOrientationPotential,
+    "motif_forbidden_radial_orientation": MotifForbiddenRadialOrientation,
+    "motif_forbidden_radial_orientation_compact": MotifForbiddenRadialOrientationCompact,
+    "motif_pair_orientation": MotifPairOrientation,
+    "motif_pair_axis_dot": MotifPairAxisDot,
+    "minimal_overlap": MinimalOverlapPotential,
+    "target_anchor_distance": TargetAnchorDistance,
+    "minimal_clashes": MinimalOverlapPotential,
     "symmetry_motif_distance": SymmetryAwareMotifDistance,
     "symmetry_motif_bridge": SymmetryAwareMotifBridge,
     "symmetry_single_motif_bridge": SymmetryAwareSingleMotifBridge,

@@ -273,17 +273,28 @@ class ChunkedPairwiseEmbedder:
         # 1. Motif position embedding (if exists)
         if self.motif_pos_embedder is not None and "motif_pos" in f:
             motif_pos = f["motif_pos"]  # [L, 3]
-            is_motif = f["is_motif_atom_with_fixed_coord"]  # [L]
-            is_motif_idx = torch.where(is_motif)[0]
+            motif_id = f.get("motif_id")  # [L] int, -1 for non-motif; optional
+            # When motif_id is present (motif_pos_only cache path) use it as the
+            # sole gate so C_L is not encoded with is_motif_atom_with_fixed_coord.
+            if motif_id is not None:
+                is_motif_idx = torch.where(motif_id >= 0)[0]
+            else:
+                is_motif = f["is_motif_atom_with_fixed_coord"]  # [L]
+                is_motif_idx = torch.where(is_motif)[0]
             # For each query position
             for l in is_motif_idx:
                 key_indices = valid_indices[:, l, :]  # [B, k] - use clamped indices
                 key_pos = motif_pos[key_indices]  # [B, k, 3]
                 query_pos = motif_pos[l].unsqueeze(0).expand(B, -1)  # [B, 3]
 
-                # Valid mask: both query and keys must be motif
-                key_is_motif = is_motif[key_indices]  # [B, k]
-                valid_mask = key_is_motif.unsqueeze(-1).float()  # [B, k, 1]
+                if motif_id is not None:
+                    key_mid = motif_id[key_indices]  # [B, k]
+                    query_mid = motif_id[l]  # scalar
+                    same_motif = (key_mid == query_mid) & (query_mid >= 0) & (key_mid >= 0)
+                    valid_mask = same_motif.unsqueeze(-1).float()
+                else:
+                    key_is_motif = is_motif[key_indices]  # [B, k]
+                    valid_mask = key_is_motif.unsqueeze(-1).float()  # [B, k, 1]
 
                 if valid_mask.sum() > 0:
                     motif_pairs = self.motif_pos_embedder.compute_pairs_chunked(

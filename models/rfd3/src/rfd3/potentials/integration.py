@@ -87,6 +87,11 @@ class RFD3PotentialAdapter:
             floating_motif_refs,
             n_atoms=int(atom_to_token_map.shape[0]),
         )
+        _add_motif_atom_res_id_metadata(
+            self.metadata,
+            floating_motif_refs,
+            n_atoms=int(atom_to_token_map.shape[0]),
+        )
         if input_pos is not None:
             if input_pos.ndim == 3:
                 self.metadata["input_pos"] = input_pos[0].detach()
@@ -286,6 +291,45 @@ def _add_floating_motif_reference_metadata_from_refs(
 
     if torch.isfinite(reference_pos).any():
         metadata["floating_motif_reference_pos"] = reference_pos
+
+
+def _add_motif_atom_res_id_metadata(
+    metadata: dict,
+    floating_motif_refs,
+    n_atoms: int,
+) -> None:
+    """Carry each motif atom's original residue id (from src_component) into
+    metadata as a length-L int tensor ('motif_atom_res_id', -1 where unknown).
+
+    Lets a potential's offline align step (align=True) restrict an external
+    align/receptor chain to exactly the contig motif's residues. Without it,
+    MinimalOverlapPotential / TargetAnchorDistance / MotifPairAxisDot load the
+    WHOLE align_chain_id chain and require it to match the contig motif block's
+    atom count -- which fails whenever the align chain (e.g. a full-length
+    receptor-template chain) spans residues the contig trimmed away.
+    """
+    if not floating_motif_refs:
+        return
+
+    res_id = torch.full((n_atoms,), -1, dtype=torch.long)
+    for motif_ref in floating_motif_refs:
+        src_res = getattr(motif_ref, "source_res_ids", None)
+        if src_res is None:
+            continue
+        atom_idx = motif_ref.sample_atom_indices.detach().cpu().long()
+        src_res = src_res.detach().cpu().long()
+        n = min(atom_idx.numel(), src_res.numel())
+        if n == 0:
+            continue
+        atom_idx = atom_idx[:n]
+        src_res = src_res[:n]
+        valid = (atom_idx >= 0) & (atom_idx < n_atoms) & (src_res >= 0)
+        if not bool(valid.any()):
+            continue
+        res_id[atom_idx[valid]] = src_res[valid]
+
+    if bool((res_id >= 0).any()):
+        metadata["motif_atom_res_id"] = res_id
 
 
 def _ensure_floating_motifs_in_motif_mask(

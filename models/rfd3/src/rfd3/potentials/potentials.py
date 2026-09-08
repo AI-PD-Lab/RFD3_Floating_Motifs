@@ -5482,6 +5482,638 @@ class TargetAnchorDistance(BasePotential):
         return transformed
 
 
+
+
+# ---------------------------------------------------------------------------
+# ASU-aware symmetry potentials
+#
+# Under a symmetry sampler, apply_symmetry_to_xyz_atomwise rebuilds every copy
+# from the ASU each step, so gradient applied to a non-ASU copy is discarded and
+# non-ASU coordinates are pre-paste noise. These two derive their quantity from
+# the ASU, generate the other copies with the stored sym_transform, and restrict
+# the guide mask and gradient to the ASU. Helpers live in rfd3.potentials.sym_asu
+# and are group-agnostic (Cn, Dn, ...).
+# ---------------------------------------------------------------------------
+
+"""`symmetry_minimal_overlap` -- MinimalOverlapPotential adapted to symmetry.
+
+Same function as kleiter's `MinimalOverlapPotential`
+(/work/kleiter/RFD3_Floating_Motifs, potentials.py:5000), adapted the way every
+`SymmetryAware*` class in that file adapts its non-symmetric counterpart: iterate
+`_symmetry_subunit_motif_blocks` instead of `_motif_distance_blocks`, so ONE
+`motif_chains` spec is applied to every symmetry copy automatically rather than the
+caller enumerating `motif_index` 0..N-1.
+
+Everything else is that class's behaviour, kept verbatim:
+
+  1. Load the attached chain's atoms once from `chain_pdb`/`chain_id` (a receptor that
+     is never part of the diffused structure). With `align=True` + `align_chain_id`,
+     Kabsch-fit the align chain onto the motif's own reference atoms so the cloud ends
+     up in the design's reference frame; cache it.
+  2. Each step, transport that constant cloud with the SAME per-motif rigid transform
+     that tracks the motif's own atoms -- rotate about the motif's REFERENCE COM (not
+     the chain's own centroid, which would collapse the physical offset), then translate
+     to the motif's current COM:
+         current = (chain_ref - motif_ref_com) @ R_i + current_com_i
+  3. Accumulate soft steric overlap (`_pairwise_clash_overlap`)
+       (a) between every pair of transported chains  [receptor vs receptor], and
+       (b) between each chain and the rest of the generated structure, excluding that
+           chain's own parent motif  [receptor vs scaffold/bridge and other motifs].
+  4. Return `-weight * total` (guidance ascends, so overlap is minimised).
+  5. Gradient projected to pure rigid ROTATION per motif (no translation), so it only
+     changes orientation and never fights symmetry_motif_center_distance.
+
+Registered as `symmetry_minimal_overlap` / `symmetry_minimal_clashes`.
+"""
+
+
+
+from rfd3.potentials import sym_asu
+
+
+class SymmetryAwareMinimalOverlap(BasePotential):
+    """Minimal-overlap of motif-attached external chains, per symmetry copy.
+
+    Parameters mirror MinimalOverlapPotential, except `motif_chains` entries carry NO
+    `motif_index`: each entry is applied to every symmetry copy.
+
+    motif_chains : list of dict
+        {chain_pdb, chain_id, atom_selection, align, align_chain_id,
+         align_atom_selection, max_atoms}
+    clash_distance : float          overlap cutoff in Angstrom (kleiter uses 4.0)
+    protein_atom_filter : str       'CA' | 'backbone' | 'real' | 'all' | 'potential'
+    chain_chain_weight : float      weight on (a) receptor-receptor
+    chain_protein_weight : float    weight on (b) receptor-structure
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_chains: list | None = None,
+        clash_distance: float = 4.0,
+        protein_atom_filter: str = "CA",
+        chain_chain_weight: float = 1.0,
+        chain_protein_weight: float = 1.0,
+        neighbor_only: bool = True,
+        eps: float = 1e-6,
+        debug_log: bool = False,
+    ):
+        super().__init__(weight)
+        if not motif_chains:
+            raise ValueError(
+                "symmetry_minimal_overlap requires motif_chains=[{chain_pdb, chain_id, "
+                "...}]; unlike minimal_overlap the entries take no motif_index -- each "
+                "is applied to every symmetry copy."
+            )
+        self.motif_chains = [dict(s) for s in motif_chains]
+        for i, spec in enumerate(self.motif_chains):
+            missing = {"chain_pdb", "chain_id"} - set(spec)
+            if missing:
+                raise ValueError(
+                    f"symmetry_minimal_overlap: motif_chains[{i}] is missing {missing}"
+                )
+            if spec.get("align") and not spec.get("align_chain_id"):
+                raise ValueError(
+                    f"symmetry_minimal_overlap: motif_chains[{i}] sets align=True but "
+                    "is missing align_chain_id"
+                )
+        self.clash_distance = float(clash_distance)
+        self.protein_atom_filter = str(protein_atom_filter)
+        self.chain_chain_weight = float(chain_chain_weight)
+        self.chain_protein_weight = float(chain_protein_weight)
+        self.neighbor_only = bool(neighbor_only)
+        self.eps = float(eps)
+        self.debug_log = bool(debug_log)
+        self._cache: dict = {}
+        self.skip_reason = None
+
+    # ── reference cloud, cached (mirrors _resolve_chain_ref_xyz) ─────────────
+    def _chain_ref_xyz(self, idx, spec, ref_xyz_i, device, dtype, align_residues):
+        key = (idx, tuple(sorted(align_residues)) if align_residues else None)
+        if key in self._cache:
+            return self._cache[key].to(device=device, dtype=dtype)
+
+        chain = _load_chain_atoms(
+            spec["chain_pdb"],
+            spec["chain_id"],
+            spec.get("atom_selection", "CA"),
+            spec.get("max_atoms"),
+        ).to(device=device, dtype=dtype)
+
+        if spec.get("align"):
+            # Kabsch-fit the align chain (the binder, in the same file) onto this
+            # motif's reference atoms, then carry the attached chain along -- the
+            # automated version of MotifPairAxisDot's hand-done superposition.
+            align = _load_chain_atoms(
+                spec["chain_pdb"],
+                spec["align_chain_id"],
+                spec.get("align_atom_selection", "heavy"),
+                None,
+                residue_whitelist=set(align_residues) if align_residues else None,
+            ).to(device=device, dtype=dtype)
+            n = min(align.shape[0], ref_xyz_i.shape[0])
+            R = _kabsch_ref_to_current_rotation(
+                align[:n], ref_xyz_i[:n].unsqueeze(0), self.eps
+            )
+            if R is None:
+                return None
+            R = R[0]
+            chain = (chain - align[:n].mean(0)) @ R + ref_xyz_i[:n].mean(0)
+
+        self._cache[key] = chain.detach().cpu()
+        return chain
+
+    def compute(self, xyz, masks, metadata):
+        self.skip_reason = None
+        device, dtype = xyz.device, xyz.dtype
+
+        # ASU-only. apply_symmetry_to_xyz_atomwise rebuilds every copy from the ASU, so
+        # gradient on any other copy is discarded, and between pastes their coordinates
+        # are not exact symmetry images. Place the receptor from the ASU and GENERATE
+        # the rest with the run's own sym_transform -- group-agnostic (Cn, Dn, ...).
+        asu_m, why = sym_asu.asu_mask(masks, metadata, device)
+        if asu_m is None:
+            self.skip_reason = why or "no_motif_blocks"
+            return xyz.new_zeros(())
+        if why:
+            self.skip_reason = why
+
+        current_xyz_i, ref_xyz_i = _motif_block_current_and_reference_xyz(
+            xyz, masks, metadata, asu_m
+        )
+        if current_xyz_i is None or ref_xyz_i is None or ref_xyz_i.shape[0] < 3:
+            self.skip_reason = "asu_coords_missing"
+            return xyz.new_zeros(())
+        R = _kabsch_ref_to_current_rotation(ref_xyz_i, current_xyz_i, self.eps)
+        if R is None:
+            self.skip_reason = "asu_frame_degenerate"
+            return xyz.new_zeros(())
+
+        res_ids = _motif_block_res_ids(metadata, asu_m)
+        motif_ref_com = ref_xyz_i.mean(dim=0)        # pivot: motif's reference COM
+        current_com_i = current_xyz_i.mean(dim=1)    # [D, 3]
+
+        tfs = sym_asu.sym_transforms(metadata, device, dtype)
+        # Each generated receptor copy must exclude ITS OWN motif, not the ASU's:
+        # a receptor is bound to its own binder by design, but must not overlap any
+        # other copy's motif. subunit_masks and sym_transforms are both ordered by
+        # transform id, so index i pairs them.
+        sub_masks = sym_asu.subunit_masks(masks, metadata, device)
+        if tfs is not None and len(sub_masks) != len(tfs):
+            sub_masks = [asu_m] * (len(tfs) if tfs else 1)
+            self.skip_reason = "subunit_transform_count_mismatch"
+        current_chains: list[torch.Tensor] = []
+        own_motif_masks: list[torch.Tensor] = []
+        for idx, spec in enumerate(self.motif_chains):
+            chain_ref = self._chain_ref_xyz(
+                idx, spec, ref_xyz_i, device, dtype, res_ids
+            )
+            if chain_ref is None:
+                continue
+            asu_cloud = (
+                (chain_ref - motif_ref_com).unsqueeze(0) @ R
+            ) + current_com_i.unsqueeze(1)           # [D, N_chain, 3]
+            # points: rotation AND translation, matching the symmetriser's asu@R + t
+            copies = sym_asu.transform_points(asu_cloud, tfs) if tfs else [asu_cloud]
+            current_chains.extend(copies)
+            own_motif_masks.extend(
+                sub_masks[:len(copies)] if len(sub_masks) >= len(copies)
+                else [asu_m] * len(copies)
+            )
+
+        if not current_chains:
+            self.skip_reason = self.skip_reason or "no_active_chains"
+            return xyz.new_zeros(())
+
+        total = xyz.new_zeros(())
+        n_terms = 0
+
+        # (a) chain vs chain -- receptor against receptor, across symmetry copies
+        for i, j in sym_asu.pair_indices(len(current_chains), self.neighbor_only):
+            total = total + self.chain_chain_weight * _pairwise_clash_overlap(
+                current_chains[i], current_chains[j], self.clash_distance
+            )
+            n_terms += 1
+
+        # (b) chain vs the rest of the generated structure, own parent motif excluded
+        protein_mask = _atom_filter_mask(self.protein_atom_filter, masks, device)
+        for i, chain_xyz in enumerate(current_chains):
+            other_mask = protein_mask & ~own_motif_masks[i]
+            total = total + self.chain_protein_weight * _pairwise_clash_overlap(
+                chain_xyz, xyz[:, other_mask, :], self.clash_distance
+            )
+            n_terms += 1
+
+        if self.debug_log:
+            print(
+                "[symmetry_minimal_overlap] "
+                + repr({
+                    "n_copies": len(current_chains),
+                    "n_chains": len(current_chains),
+                    "total_overlap": round(float(total), 4),
+                    "n_terms": n_terms,
+                }),
+                file=sys.stderr,
+                flush=True,
+            )
+
+        return -self.weight * total
+
+    def guide_atom_mask(self, masks, metadata, device):
+        # ASU only -- gradient on any other copy is overwritten by the symmetry paste
+        blocks = sym_asu.asu_blocks_or_all(masks, metadata, device)
+        out = torch.zeros_like(blocks[0], dtype=torch.bool, device=device)
+        for b in blocks:
+            out |= b
+        return out
+
+    def instance_guide_masks(self, masks, metadata, device):
+        return sym_asu.asu_blocks_or_all(masks, metadata, device)
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        # rotation only (as MinimalOverlapPotential does) AND ASU only
+        return _rigidize_blocks_rotation(
+            atom_grad, sym_asu.asu_blocks_or_all(masks, metadata, xyz.device), xyz
+        )
+
+
+
+__all__ = ["SymmetryAwareMinimalOverlap"]
+
+
+"""`symmetry_motif_axis_dot` -- MotifPairAxisDot adapted to symmetry.
+
+Same mechanism as kleiter's `MotifPairAxisDot`
+(/work/kleiter/RFD3_Floating_Motifs, potentials.py:4557), adapted the way the other
+`SymmetryAware*` classes adapt their non-symmetric counterparts: iterate
+`_symmetry_subunit_motif_blocks` instead of a fixed (motif_i, motif_j) pair, so ONE
+axis spec covers every symmetry copy.
+
+Copied verbatim from that class:
+  * the receptor axis is a CONSTANT VECTOR IN THE MOTIF'S BODY FRAME -- the receptor is
+    never part of the diffused structure, but the motif is rigid, so given the Kabsch
+    rotation R_i from reference motif to current motif,
+        v_i = a_i @ R_i          (row convention: cur_centred ~ ref_centred @ R)
+    recovers the receptor axis without ever touching receptor atoms;
+  * `a` comes either directly (`motif_axis`) or from two receptor residues
+    (`motif_chain: {chain_pdb, chain_id, receptor_residues:[proximal, distal], ...}`),
+    with `align=True` rotating the raw `distal - proximal` vector into the motif body
+    frame by the offline Kabsch fit -- a VECTOR transforms by rotation alone, the
+    translation cancels when differencing two points;
+  * squared-error loss on a dot product, returned as `-weight * loss`;
+  * gradient projected to pure rigid ROTATION per motif (no translation), so it only
+    changes orientation and never fights symmetry_motif_center_distance.
+
+Why symmetry needs two terms
+----------------------------
+Under Cn about z, copy j's axis is the symmetry rotation applied to copy 0's:
+for a unit axis v = (x, y, z) and rotation angle t,
+
+    dot(v_i, v_j)  =  (1 - z^2) cos t  +  z^2
+
+so the inter-copy dot is a function of z ALONE. Driving it to 1 forces z^2 -> 1, i.e.
+the axis onto the symmetry axis -- all receptors parallel instead of splayed radially
+outward. But it is sign-blind (z and -z give the same dot), so it cannot distinguish
+"all up" from "all down".
+
+  * `target_dot`       -- inter-copy pairwise term. The faithful analogue of
+                          MotifPairAxisDot. Use 1.0 for "parallel, not splayed".
+  * `target_axis_dot`  -- per-copy alignment of v_i onto `axis` (default +z, the Cn
+                          axis). Use -1.0 for "all face DOWN", +1.0 for up. This is the
+                          term that picks the sign.
+
+Both may be used together; each may be disabled by leaving it None.
+For C4 specifically: adjacent copies give dot = z^2, opposite copies 2z^2 - 1.
+
+ASU-ONLY GRADIENT (important)
+----------------------------
+`apply_symmetry_to_xyz_atomwise` (symmetry_utils.py:384) rebuilds EVERY copy from the
+ASU each symmetrised step:
+
+    asu_xyz = X_L[:, entity_asu_mask, :]
+    sym_X_L[:, this_subunit, :] = asu_xyz @ R + t
+
+so gradient applied to a non-ASU copy is discarded wholesale at the next paste, and the
+non-ASU copies' *current* coordinates are pre-paste noise rather than exact symmetry
+images. Reading four independent Kabsch rotations off them therefore both measures the
+wrong thing and wastes 3/4 of the gradient.
+
+This potential instead derives the axis from the ASU alone and GENERATES the other
+copies' axes with the stored `sym_transform` rotations, so every inter-copy term is an
+exact function of the ASU and the entire gradient lands on the copy that survives.
+(Note: none of the fork's own SymmetryAware* potentials do this -- `is_sym_asu` is
+never referenced in potentials.py.)
+
+Registered as `symmetry_motif_axis_dot` / `symmetry_axis_dot`.
+"""
+
+
+
+from rfd3.potentials import sym_asu
+
+
+class SymmetryAwareMotifAxisDot(BasePotential):
+    """Orient every symmetry copy's attached-receptor axis.
+
+    Parameters
+    ----------
+    weight : float
+    motif_axis : list[float] | None
+        Receptor axis as a unit vector already in the motif's body frame. Mutually
+        exclusive with `motif_chain`.
+    motif_chain : dict | None
+        {chain_pdb, chain_id, receptor_residues: [proximal_resid, distal_resid],
+         atom_name='CA', align=False, align_chain_id, align_atom_selection='CA'}
+        Same shape as MotifPairAxisDot's entries, minus `motif_index` (symmetry applies
+        it to every copy).
+    target_dot : float | None
+        Inter-copy pairwise dot target. 1.0 = all axes parallel. None disables.
+    target_axis_dot : float | None
+        Per-copy dot of the axis against `axis`. -1.0 = all face down. None disables.
+    axis : list[float]
+        Reference direction for `target_axis_dot`; default [0,0,1], the Cn axis.
+    neighbor_only : bool
+        Pairwise term over adjacent copies only (0,1),(1,2),...,(N-1,0), matching
+        SymmetryAwareInterInstanceMotifDistance. False = all pairs.
+    pair_weight, axial_weight : float
+        Relative weights of the two terms.
+    """
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        motif_axis: list | None = None,
+        motif_chain: dict | None = None,
+        target_dot: float | None = None,
+        target_axis_dot: float | None = None,   # sign is arbitrary: flipping z
+                                                # maps +1<->-1 onto the same object,
+                                                # and target_dot=1 already aligns the
+                                                # axis. Set only to fix a convention.
+        axis: list | None = None,
+        neighbor_only: bool = True,
+        pair_weight: float = 1.0,
+        axial_weight: float = 1.0,
+        eps: float = 1e-6,
+        reduction: str = "mean",   # normalise by n_terms: C4 gives 8 terms
+                                   # (4 pairs + 4 axial) vs kleiter's single term, so
+                                   # "sum" would be ~8x their effective strength at the
+                                   # same weight. "mean" makes weight 500 comparable.
+        debug_log: bool = False,
+    ):
+        super().__init__(weight)
+        if (motif_axis is None) == (motif_chain is None):
+            raise ValueError(
+                "symmetry_motif_axis_dot requires exactly one of motif_axis=[x,y,z] "
+                "or motif_chain={chain_pdb, chain_id, receptor_residues:[prox, dist], "
+                "...}. Unlike motif_pair_axis_dot there is no motif_index and only ONE "
+                "entry -- symmetry applies it to every copy."
+            )
+        if target_dot is None and target_axis_dot is None:
+            raise ValueError(
+                "symmetry_motif_axis_dot: give at least one of target_dot (inter-copy "
+                "parallelism) or target_axis_dot (alignment onto `axis`, -1 = down)"
+            )
+        self.motif_axis = (
+            [float(c) for c in motif_axis[:3]] if motif_axis is not None else None
+        )
+        if motif_chain is not None:
+            missing = [
+                k for k in ("chain_pdb", "chain_id", "receptor_residues")
+                if k not in motif_chain
+            ]
+            if missing:
+                raise ValueError(
+                    f"symmetry_motif_axis_dot: motif_chain is missing {missing}"
+                )
+            res = motif_chain["receptor_residues"]
+            if len(res) != 2:
+                raise ValueError(
+                    "symmetry_motif_axis_dot: receptor_residues must be "
+                    "[proximal_resid, distal_resid]"
+                )
+            if motif_chain.get("align") and not motif_chain.get("align_chain_id"):
+                raise ValueError(
+                    "symmetry_motif_axis_dot: align=True needs align_chain_id"
+                )
+        self.motif_chain = dict(motif_chain) if motif_chain is not None else None
+        self.target_dot = None if target_dot is None else float(target_dot)
+        self.target_axis_dot = (
+            None if target_axis_dot is None else float(target_axis_dot)
+        )
+        self.axis = [float(c) for c in (axis if axis is not None else [0.0, 0.0, 1.0])]
+        self.neighbor_only = bool(neighbor_only)
+        self.pair_weight = float(pair_weight)
+        self.axial_weight = float(axial_weight)
+        self.eps = float(eps)
+        self.reduction = _validate_symmetry_reduction(reduction)
+        self.debug_log = bool(debug_log)
+        self._axis_cache = None
+        self.skip_reason = None
+
+    # ── body-frame axis, cached (mirrors MotifPairAxisDot._resolve_axis) ─────
+    def _resolve_axis(self, ref_xyz_i, device, dtype, align_residues=None):
+        if self.motif_axis is not None:
+            a = torch.tensor(self.motif_axis, device=device, dtype=dtype)
+            return a / a.norm().clamp_min(self.eps)
+        if self._axis_cache is not None:
+            return self._axis_cache.to(device=device, dtype=dtype)
+
+        spec = self.motif_chain
+        prox, dist = spec["receptor_residues"]
+        atom_name = str(spec.get("atom_name", "CA"))
+        proximal = _load_chain_residue_atom(
+            spec["chain_pdb"], spec["chain_id"], int(prox), atom_name
+        ).to(device=device, dtype=dtype)
+        distal = _load_chain_residue_atom(
+            spec["chain_pdb"], spec["chain_id"], int(dist), atom_name
+        ).to(device=device, dtype=dtype)
+        raw_vector = distal - proximal
+
+        if spec.get("align"):
+            align_xyz = _load_chain_atoms(
+                spec["chain_pdb"],
+                spec["align_chain_id"],
+                str(spec.get("align_atom_selection", "CA")),
+                None,
+                residue_whitelist=set(align_residues) if align_residues else None,
+            ).to(device=device, dtype=dtype)
+            n = min(align_xyz.shape[0], ref_xyz_i.shape[0])
+            if n < 3:
+                raise ValueError(
+                    "symmetry_motif_axis_dot: too few align atoms for a Kabsch fit"
+                )
+            R_align = _kabsch_ref_to_current_rotation(
+                align_xyz[:n], ref_xyz_i[:n].unsqueeze(0), self.eps
+            )
+            if R_align is None:
+                raise ValueError(
+                    "symmetry_motif_axis_dot: offline alignment is degenerate"
+                )
+            # A vector transforms by rotation alone -- translation cancels when
+            # differencing two points (verbatim from MotifPairAxisDot).
+            raw_vector = raw_vector @ R_align[0]
+
+        axis = raw_vector / raw_vector.norm().clamp_min(self.eps)
+        self._axis_cache = axis.detach().cpu()
+        return axis
+
+    @staticmethod
+    def _sym_rotations(metadata, device, dtype):
+        """Rotation matrices of every symmetry transform, ASU (identity) first."""
+        st = metadata.get("sym_transform")
+        if not st:
+            return None
+        mats = []
+        for k in sorted(st.keys(), key=lambda x: int(x)):
+            if int(k) == -1:            # FIXED_TRANSFORM_ID, not a symmetry copy
+                continue
+            R = st[k][0]
+            R = torch.as_tensor(R, device=device, dtype=dtype)
+            mats.append(R.reshape(3, 3))
+        return mats or None
+
+    def _asu_block(self, subunits, metadata, device):
+        """The subunit mask that overlaps is_sym_asu; None if unmarked."""
+        is_asu = metadata.get("is_sym_asu")
+        if is_asu is None:
+            return None
+        is_asu = is_asu.to(device=device, dtype=torch.bool)
+        for local_blocks in subunits:
+            if not local_blocks:
+                continue
+            m = torch.zeros_like(local_blocks[0], dtype=torch.bool, device=device)
+            for b in local_blocks:
+                m |= b
+            if bool((m & is_asu).any()):
+                return m
+        return None
+
+    def _pairs(self, n):
+        if n < 2:
+            return []
+        if self.neighbor_only:
+            return [(0, 1)] if n == 2 else [(i, (i + 1) % n) for i in range(n)]
+        return [(i, j) for i in range(n) for j in range(i + 1, n)]
+
+    def compute(self, xyz, masks, metadata):
+        self.skip_reason = None
+        subunits = _symmetry_subunit_motif_blocks(masks, metadata, xyz.device)
+        if not subunits:
+            self.skip_reason = "no_motif_blocks"
+            return xyz.new_zeros(())
+
+        device, dtype = xyz.device, xyz.dtype
+
+        # --- the ASU is the only copy whose gradient survives the symmetry paste
+        asu_mask, why = sym_asu.asu_mask(masks, metadata, device)
+        if why:
+            self.skip_reason = why
+        if asu_mask is None:
+            # unmarked ASU: fall back to the first subunit rather than silently
+            # scoring pre-paste noise across all copies
+            first = subunits[0]
+            asu_mask = torch.zeros_like(first[0], dtype=torch.bool, device=device)
+            for b in first:
+                asu_mask |= b
+            self.skip_reason = "is_sym_asu_absent_using_first_subunit"
+
+        current_xyz, ref_xyz = _motif_block_current_and_reference_xyz(
+            xyz, masks, metadata, asu_mask
+        )
+        if current_xyz is None or ref_xyz is None or ref_xyz.shape[0] < 3:
+            self.skip_reason = "asu_coords_missing"
+            return xyz.new_zeros(())
+        R = _kabsch_ref_to_current_rotation(ref_xyz, current_xyz, self.eps)
+        if R is None:
+            self.skip_reason = "asu_frame_degenerate"
+            return xyz.new_zeros(())
+
+        a = self._resolve_axis(
+            ref_xyz, device, dtype, _motif_block_res_ids(metadata, asu_mask)
+        )
+        # Row convention (MotifPairAxisDot): a vector in the reference frame -> a @ R
+        v_asu = torch.einsum("j,djk->dk", a, R)                       # [D, 3]
+        v_asu = v_asu / v_asu.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+
+        # --- GENERATE the other copies from the ASU with the symmetry rotations,
+        #     rather than reading their (pre-paste, non-symmetric) coordinates
+        tfs = sym_asu.sym_transforms(metadata, device, dtype)
+        if tfs:
+            vecs = sym_asu.transform_directions(v_asu, tfs)
+            vecs = [v / v.norm(dim=-1, keepdim=True).clamp_min(self.eps) for v in vecs]
+        else:
+            vecs = [v_asu]
+            self.skip_reason = self.skip_reason or "sym_transform_absent"
+
+        total = xyz.new_zeros(())
+        n_terms = 0
+        dbg = {}
+
+        # (a) inter-copy parallelism -- exact function of the ASU
+        if self.target_dot is not None and len(vecs) >= 2:
+            dots = []
+            for i, j in sym_asu.pair_indices(len(vecs), self.neighbor_only):
+                d = (vecs[i] * vecs[j]).sum(dim=-1).clamp(-1.0, 1.0)
+                total = total + self.pair_weight * (d - self.target_dot).pow(2).mean()
+                n_terms += 1
+                dots.append(round(float(d.mean()), 4))
+            dbg["pair_dots"] = dots
+
+        # (b) alignment onto the symmetry axis -- picks the sign (down vs up).
+        #     Scored on the ASU only; under Cn about `axis` every generated copy has
+        #     the same axis-component by construction, so one term is sufficient.
+        if self.target_axis_dot is not None:
+            ax = torch.tensor(self.axis, device=device, dtype=dtype)
+            ax = ax / ax.norm().clamp_min(self.eps)
+            # score every generated copy: under Cn about `axis` they share the
+            # component, but Dn's perpendicular 2-folds flip it, so one term is
+            # only sufficient for cyclic groups.
+            axd = []
+            for v in vecs:
+                d = (v * ax).sum(dim=-1).clamp(-1.0, 1.0)
+                total = total + self.axial_weight * (
+                    d - self.target_axis_dot
+                ).pow(2).mean()
+                n_terms += 1
+                axd.append(round(float(d.mean()), 4))
+            dbg["axis_dots"] = axd
+
+        if n_terms == 0:
+            return xyz.new_zeros(())
+
+        if self.debug_log:
+            dbg.update({"n_generated": len(vecs), "total": round(float(total), 4)})
+            print(f"[symmetry_axis_dot] {dbg!r}", file=sys.stderr, flush=True)
+
+        return _weighted_symmetry_loss(self.weight, total, n_terms, self.reduction)
+
+    def _asu_blocks_or_all(self, masks, metadata, device):
+        return sym_asu.asu_blocks_or_all(masks, metadata, device)
+
+    def guide_atom_mask(self, masks, metadata, device):
+        # ASU only: gradient on any other copy is overwritten by the symmetry paste
+        blocks = self._asu_blocks_or_all(masks, metadata, device)
+        out = torch.zeros_like(blocks[0], dtype=torch.bool, device=device)
+        for b in blocks:
+            out |= b
+        return out
+
+    def instance_guide_masks(self, masks, metadata, device):
+        return self._asu_blocks_or_all(masks, metadata, device)
+
+    def transform_atom_gradient(self, atom_grad, masks, metadata, xyz):
+        # rotation only (verbatim from MotifPairAxisDot) AND ASU only
+        return _rigidize_blocks_rotation(
+            atom_grad,
+            self._asu_blocks_or_all(masks, metadata, xyz.device),
+            xyz,
+        )
+
+
+
+__all__ = ["SymmetryAwareMotifAxisDot"]
+
+
 POTENTIAL_REGISTRY: dict[str, type[BasePotential]] = {
     "binder_ROG": BinderROG,
     "monomer_ROG": MonomerROG,
@@ -5519,4 +6151,8 @@ POTENTIAL_REGISTRY: dict[str, type[BasePotential]] = {
     "symmetry_motif_com_radial_orientation": SymmetryAwareMotifCOMRadialOrientation,
     "symmetry_motif_axis_position": SymmetryAwareMotifAxisPosition,
     "symmetry_motif_inter_instance_distance": SymmetryAwareInterInstanceMotifDistance,
+    "symmetry_minimal_overlap": SymmetryAwareMinimalOverlap,
+    "symmetry_minimal_clashes": SymmetryAwareMinimalOverlap,
+    "symmetry_motif_axis_dot": SymmetryAwareMotifAxisDot,
+    "symmetry_axis_dot": SymmetryAwareMotifAxisDot,
 }
